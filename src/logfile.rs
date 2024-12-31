@@ -4,7 +4,7 @@ use std::time::Instant;
 ///
 /// # Format
 ///
-/// A log file always starts and ends with the magic bytes ---
+/// A log file always starts and ends with the magic bytes (TODO)
 ///
 /// The first bytes after the magic bytes represent the creation timestamp of the log file.
 ///
