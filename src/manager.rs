@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::logfile::Logfile;
 
@@ -8,7 +8,7 @@ use crate::logfile::Logfile;
 pub struct Manager {
     options: ManagerOptions,
 
-    logfiles: BTreeMap<String, Logfile>,
+    log_files: BTreeMap<String, Logfile>,
 }
 
 pub struct ManagerOptions {
@@ -20,13 +20,22 @@ impl Manager {
     pub fn with_options(options: ManagerOptions) -> Self {
         Self {
             options,
-            logfiles: BTreeMap::new(),
+            log_files: BTreeMap::new(),
         }
     }
 
-    pub fn start(&self) -> Result<(), std::io::Error> {
-        // Load in all logfiles in the log directory
+    pub fn start(&mut self) -> Result<(), std::io::Error> {
+        // Load in all log files in the log directory
         let log_files = std::fs::read_dir(&self.options.log_dir)?;
+
+        for log_file in log_files {
+            let log_file = log_file?;
+            let path = log_file.path();
+            // TODO read the log file metadata
+            let logfile = Logfile::new(path.to_string_lossy().to_string());
+            self.log_files
+                .insert(path.to_string_lossy().to_string(), logfile);
+        }
 
         Ok(())
     }
