@@ -28,6 +28,7 @@ impl Logfile {
 }
 
 /// RecordID represents a record's location in a log file.
+#[derive(Debug, PartialEq, Eq)]
 pub struct RecordID {
     file_id: u64,
     file_offset: u64,
@@ -53,5 +54,18 @@ impl RecordID {
             file_id: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
             file_offset: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_record_id_serde() {
+        let id = RecordID::new(1, 100);
+        let serialized = id.serialize();
+        let deserialized = RecordID::deserialize(&serialized);
+        assert_eq!(id, deserialized);
     }
 }
