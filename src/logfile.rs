@@ -1,11 +1,5 @@
 use std::time::Instant;
 
-pub struct Logfile {
-    created_at: Instant,
-    sealed_at: Option<Instant>,
-    path: String,
-}
-
 /// Logfile represents a log file on disk.
 ///
 /// # Format
@@ -16,6 +10,12 @@ pub struct Logfile {
 ///
 /// The last bytes after the magic bytes represent the sealed time of the log file if it exists.
 /// This means that the log file is immutable and cannot be modified.
+pub struct Logfile {
+    created_at: Instant,
+    sealed_at: Option<Instant>,
+    path: String,
+}
+
 impl Logfile {
     pub fn new(path: String) -> Self {
         Self {
