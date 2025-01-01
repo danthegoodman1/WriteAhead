@@ -1,3 +1,4 @@
+use anyhow::Result;
 use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::Context;
@@ -46,19 +47,23 @@ impl WriteAhead {
         }
     }
 
-    pub fn start(&mut self) -> Result<(), std::io::Error> {
-        let log_files = std::fs::read_dir(&self.options.log_dir)?;
+    pub fn start(&mut self) -> Result<()> {
+        let log_files =
+            std::fs::read_dir(&self.options.log_dir).context("Failed to read log directory")?;
 
         for log_file in log_files {
-            let log_file = log_file?;
+            let log_file = log_file.context("Failed to get dir entry")?;
             let path = log_file.path();
             let file_id = path
                 .file_name()
-                .expect("Log file name is missing")
+                .context("Log file name is missing")
+                .unwrap()
                 .to_str()
-                .expect("Log file name is not a valid UTF-8 string")
+                .context("Log file name is not a valid UTF-8 string")
+                .unwrap()
                 .parse::<u64>()
-                .expect("Log file name is not a valid u64");
+                .context("Log file name is not a valid u64")
+                .unwrap();
 
             let logfile = Logfile::new(file_id);
             self.log_files.insert(file_id, logfile);
