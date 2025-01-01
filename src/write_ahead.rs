@@ -47,6 +47,8 @@ impl WriteAhead {
         }
     }
 
+    /// Start the write ahead log manager.
+    /// If this errors, you must crash.
     pub fn start(&mut self) -> Result<()> {
         let log_files =
             std::fs::read_dir(&self.options.log_dir).context("Failed to read log directory")?;
