@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
+use anyhow::Context;
+
 use crate::logfile::Logfile;
 
 /// Manager controls the log file rotation and modification.
@@ -50,19 +52,16 @@ impl WriteAhead {
         for log_file in log_files {
             let log_file = log_file?;
             let path = log_file.path();
-            let file_name = path
+            let file_id = path
                 .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.parse::<u64>().ok())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Invalid log file name - must be a number", // TODO make custom error type?
-                    )
-                })?;
+                .expect("Log file name is missing")
+                .to_str()
+                .expect("Log file name is not a valid UTF-8 string")
+                .parse::<u64>()
+                .expect("Log file name is not a valid u64");
 
-            let logfile = Logfile::new(file_name);
-            self.log_files.insert(file_name, logfile);
+            let logfile = Logfile::new(file_id);
+            self.log_files.insert(file_id, logfile);
         }
 
         Ok(())
