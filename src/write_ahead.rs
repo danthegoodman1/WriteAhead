@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use crate::logfile::Logfile;
 
@@ -11,9 +11,11 @@ pub struct WriteAhead {
     log_files: BTreeMap<u64, Logfile>,
 }
 
+#[derive(Debug)]
 pub struct WriteAheadOptions {
-    log_dir: String,
-    max_log_size: usize,
+    pub log_dir: String,
+    pub max_log_size: usize,
+    pub retention: RetentionOptions,
 }
 
 impl Default for WriteAheadOptions {
@@ -21,8 +23,17 @@ impl Default for WriteAheadOptions {
         Self {
             log_dir: "./write_ahead".to_string(),
             max_log_size: 1024 * 1024 * 1024, // 1GB
+            retention: RetentionOptions::default(),
         }
     }
+}
+
+#[derive(Default, Debug)]
+pub struct RetentionOptions {
+    /// The maximum total size of all log files. Set to `0` to disable.
+    pub max_total_size: usize,
+    /// The maximum age of the log file, determined by the sealed timestamp. Set to `0` to disable.
+    pub ttl: Duration,
 }
 
 impl WriteAhead {
