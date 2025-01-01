@@ -8,7 +8,7 @@ use crate::logfile::Logfile;
 pub struct WriteAhead {
     options: WriteAheadOptions,
 
-    log_files: BTreeMap<String, Logfile>,
+    log_files: BTreeMap<u64, Logfile>,
 }
 
 pub struct WriteAheadOptions {
@@ -51,7 +51,7 @@ impl WriteAhead {
                 })?;
 
             let logfile = Logfile::new(file_name);
-            self.log_files.insert(file_name.to_string(), logfile);
+            self.log_files.insert(file_name, logfile);
         }
 
         Ok(())
