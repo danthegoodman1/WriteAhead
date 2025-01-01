@@ -56,14 +56,11 @@ impl WriteAhead {
             let path = log_file.path();
             let file_id = path
                 .file_name()
-                .context("Log file name is missing")
-                .unwrap()
+                .context("Log file name is missing")?
                 .to_str()
-                .context("Log file name is not a valid UTF-8 string")
-                .unwrap()
+                .context("Log file name is not a valid UTF-8 string")?
                 .parse::<u64>()
-                .context("Log file name is not a valid u64")
-                .unwrap();
+                .context("Log file name is not a valid u64")?;
 
             let logfile = Logfile::new(file_id);
             self.log_files.insert(file_id, logfile);
