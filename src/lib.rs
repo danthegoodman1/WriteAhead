@@ -1,3 +1,3 @@
 pub mod logfile;
-pub mod manager;
 pub mod record;
+pub mod write_ahead;
