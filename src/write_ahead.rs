@@ -34,16 +34,24 @@ impl WriteAhead {
     }
 
     pub fn start(&mut self) -> Result<(), std::io::Error> {
-        // Load in all log files in the log directory
         let log_files = std::fs::read_dir(&self.options.log_dir)?;
 
         for log_file in log_files {
             let log_file = log_file?;
             let path = log_file.path();
-            // TODO read the log file metadata
-            let logfile = Logfile::new(path.to_string_lossy().to_string());
-            self.log_files
-                .insert(path.to_string_lossy().to_string(), logfile);
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid log file name - must be a number", // TODO make custom error type?
+                    )
+                })?;
+
+            let logfile = Logfile::new(file_name);
+            self.log_files.insert(file_name.to_string(), logfile);
         }
 
         Ok(())
