@@ -44,6 +44,7 @@ pub struct Logfile {
     id: u64,
     fd: File,
     iter_offset: u64,
+    file_length: u64,
 }
 
 const MAGIC_NUMBER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
@@ -73,6 +74,7 @@ impl Logfile {
             id,
             fd,
             iter_offset: 16,
+            file_length: 16,
         })
     }
 
@@ -97,6 +99,7 @@ impl Logfile {
 
     pub fn from_file(path: &Path) -> Result<Self> {
         let mut fd = File::open(path)?;
+        let file_length = fd.metadata()?.len();
         let id = Self::file_id_from_path(path)?;
 
         // Read the first 16 bytes of the file
@@ -143,6 +146,7 @@ impl Logfile {
             id,
             fd,
             iter_offset: 16,
+            file_length,
         })
     }
 
@@ -183,7 +187,7 @@ impl Logfile {
             .sync_all()
             .context("Failed to sync header and record")?;
 
-        // Return the starting offset of the record
+        self.file_length += buf.len() as u64;
         Ok(offset)
     }
 
@@ -255,6 +259,7 @@ impl Logfile {
             .context("Failed to write footer")?;
         self.fd.sync_all().context("Failed to sync footer")?;
 
+        self.file_length += 16;
         Ok(())
     }
 
@@ -274,12 +279,9 @@ impl Iterator for Logfile {
 
         // If file is sealed, check if we've reached the footer
         if self.sealed_at.is_some() {
-            // Get current file length
-            if let Ok(file_len) = self.fd.metadata().map(|m| m.len()) {
-                // Stop 16 bytes before the end if sealed
-                if offset >= file_len - 16 {
-                    return None;
-                }
+            // Use tracked file length instead of querying filesystem
+            if offset >= self.file_length - 16 {
+                return None;
             }
         }
 

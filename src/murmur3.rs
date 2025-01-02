@@ -100,13 +100,13 @@ mod tests {
     #[test]
     fn test_murmur3_known_values() {
         // These test values should be updated with known 128-bit hash values
-        let (h1, h2) = murmur3_128("test".as_bytes());
+        let (h1, _) = murmur3_128("test".as_bytes());
         assert_eq!(h1, -6017608668500074083);
 
-        let (h1, h2) = murmur3_128("xd".as_bytes());
+        let (h1, _) = murmur3_128("xd".as_bytes());
         assert_eq!(h1, 4507812186440344727);
 
-        let (h1, h2) = murmur3_128("primary_key".as_bytes());
+        let (h1, _) = murmur3_128("primary_key".as_bytes());
         assert_eq!(h1, -1632642444691073360);
     }
 }
