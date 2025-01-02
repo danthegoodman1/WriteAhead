@@ -1,11 +1,7 @@
 use anyhow::{Context, Result};
-use std::{
-    fs::File,
-    io::{Read, Seek, Write},
-    path::Path,
-};
+use std::path::Path;
 
-use crate::murmur3::murmur3_128;
+use crate::{fileio::FileIO, murmur3::murmur3_128};
 
 /// Logfile represents a log file on disk.
 ///
@@ -37,26 +33,24 @@ use crate::murmur3::murmur3_128;
 /// 0x00 is used as an escape character for 0xff. This is to prevent corruption of the file
 /// when 0xff is written to the file.
 #[derive(Debug)]
-pub struct Logfile {
+pub struct Logfile<F: FileIO> {
     pub sealed: bool,
     pub id: String,
     pub file_length: u64,
-    fd: File,
+    fd: F,
 }
 
 const MAGIC_NUMBER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
 
-impl Logfile {
+impl<F: FileIO> Logfile<F> {
     /// Creates a new logfile, deleting any existing file at the given path.
     ///
     /// The id MUST be unique per file!
-    pub fn new(id: &str, fd: File) -> Result<Self> {
+    pub fn new(id: &str, fd: F) -> Result<Self> {
         let mut header = [0u8; 8];
         header[0..8].copy_from_slice(&MAGIC_NUMBER);
 
-        let mut fd = fd;
-        fd.write_all(&header).context("Failed to write header")?;
-        fd.sync_all().context("Failed to sync header")?;
+        fd.write(0, &header).context("Failed to write header")?;
 
         Ok(Self {
             sealed: false,
@@ -88,13 +82,14 @@ impl Logfile {
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
-        let mut fd = File::open(path)?;
-        let file_length = fd.metadata()?.len();
+        let fd = F::open(path)?;
+        let file_length = fd.file_length();
         let id = Self::file_id_from_path(path)?;
 
         // Read the first 8 bytes of the file
-        let mut buffer = [0u8; 8];
-        fd.read_exact(&mut buffer)
+
+        let buffer = fd
+            .read(0, 8)
             .context("Failed to read first 8 bytes of logfile")?;
 
         // Check if the first 8 bytes are the magic number
@@ -104,14 +99,11 @@ impl Logfile {
 
         // Try to read the last 9 bytes (1 for sealed flag + 8 for magic number)
         let mut sealed = false;
-        let mut buffer = [0u8; 9];
-        if let Ok(metadata) = fd.metadata() {
-            if metadata.len() >= 17 {
-                // 8 header + at least 9 footer
-                fd.seek(std::io::SeekFrom::End(-9))?;
-                if fd.read_exact(&mut buffer).is_ok() && buffer[1..9] == MAGIC_NUMBER {
-                    sealed = buffer[0] == 1;
-                }
+        if file_length >= 17 {
+            // 8 header + at least 9 footer
+            let buffer = fd.read(file_length - 9, 9)?;
+            if buffer[1..9] == MAGIC_NUMBER {
+                sealed = buffer[0] == 1;
             }
         }
 
@@ -124,7 +116,11 @@ impl Logfile {
     }
 
     pub fn write_record(&mut self, record: &[u8]) -> Result<u64> {
-        let offset = self.fd.seek(std::io::SeekFrom::Current(0))?;
+        if self.sealed {
+            return Err(anyhow::anyhow!("Cannot write to sealed logfile"));
+        }
+
+        let offset = self.file_length;
 
         // Replace 0xff with 0x00 0xff, but scan from end to start to handle insertions correctly
         let mut record = record.to_vec();
@@ -155,26 +151,17 @@ impl Logfile {
         buf.extend_from_slice(&length.to_le_bytes());
         buf.extend_from_slice(&record);
 
-        self.fd.write_all(&buf).context("Failed to write record")?;
         self.fd
-            .sync_all()
-            .context("Failed to sync header and record")?;
+            .write(offset, &buf)
+            .context("Failed to write record")?;
 
         self.file_length += buf.len() as u64;
         Ok(offset)
     }
 
     pub fn read_record(&mut self, offset: &u64) -> Result<Vec<u8>> {
-        // Seek to the specified offset
-        self.fd
-            .seek(std::io::SeekFrom::Start(*offset))
-            .context("Failed to seek to record")?;
-
         // Read the hash and length (20 bytes total)
-        let mut header = [0u8; 20];
-        self.fd
-            .read_exact(&mut header)
-            .context("Failed to read record header")?;
+        let header = self.fd.read(*offset, 20)?;
 
         // Parse the header
         let hash1 = i64::from_le_bytes(header[0..8].try_into().unwrap());
@@ -182,10 +169,7 @@ impl Logfile {
         let length = u32::from_le_bytes(header[16..20].try_into().unwrap());
 
         // Read the actual record data
-        let mut record = vec![0u8; length as usize];
-        self.fd
-            .read_exact(&mut record)
-            .context("Failed to read record data")?;
+        let mut record = self.fd.read(*offset + 20, length as u64)?;
 
         // Verify the hash
         let (computed_hash1, computed_hash2) = murmur3_128(&record);
@@ -220,15 +204,14 @@ impl Logfile {
         footer[1..9].copy_from_slice(&MAGIC_NUMBER);
 
         self.fd
-            .write_all(&footer)
+            .write(self.file_length, &footer)
             .context("Failed to write footer")?;
-        self.fd.sync_all().context("Failed to sync footer")?;
 
         self.file_length += 9;
         Ok(())
     }
 
-    pub fn iter(&mut self) -> LogFileIterator<'_> {
+    pub fn iter(&mut self) -> LogFileIterator<F> {
         LogFileIterator {
             logfile: self,
             offset: 8,
@@ -240,12 +223,12 @@ impl Logfile {
     }
 }
 
-pub struct LogFileIterator<'a> {
-    logfile: &'a mut Logfile,
+pub struct LogFileIterator<'a, F: FileIO> {
+    logfile: &'a mut Logfile<F>,
     offset: u64,
 }
 
-impl<'a> LogFileIterator<'a> {
+impl<'a, F: FileIO> LogFileIterator<'a, F> {
     pub fn reset_iter(&mut self) {
         self.offset = 8;
     }
@@ -262,7 +245,7 @@ impl<'a> LogFileIterator<'a> {
 /// Iterator for the log file records
 ///
 /// If an error occurs, the iterator will panic
-impl<'a> Iterator for LogFileIterator<'a> {
+impl<'a, F: FileIO> Iterator for LogFileIterator<'a, F> {
     type Item = Result<Vec<u8>>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -294,26 +277,17 @@ impl<'a> Iterator for LogFileIterator<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::{fs::OpenOptions, path::PathBuf};
 
     use super::*;
 
-    #[test]
-    fn test_write_without_sealing() {
-        let path = PathBuf::from("/tmp/01.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-
-        let mut logfile = Logfile::new("01", fd).unwrap();
+    pub fn test_write_without_sealing<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile =
+            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
         let offset = logfile.write_record(b"hello").unwrap();
 
-        let mut logfile = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
         assert_eq!(logfile.id, "01");
         assert!(!logfile.sealed);
         assert_eq!(logfile.read_record(&offset).unwrap(), b"hello");
@@ -322,22 +296,13 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    #[test]
-    fn test_write_with_sealing() {
-        let path = PathBuf::from("/tmp/02.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-
-        let mut logfile = Logfile::new("02", fd).unwrap();
+    pub fn test_write_with_sealing<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile =
+            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
         let offset = logfile.write_record(b"hello").unwrap();
         logfile.seal().unwrap();
 
-        let mut logfile = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
         assert_eq!(logfile.id, "02");
         assert!(logfile.sealed);
         assert_eq!(logfile.read_record(&offset).unwrap(), b"hello");
@@ -346,27 +311,13 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    #[test]
-    fn test_corrupted_record() {
-        let path = PathBuf::from("/tmp/03.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-
-        let mut logfile = Logfile::new("03", fd).unwrap();
+    pub fn test_corrupted_record<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile =
+            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
         let offset = logfile.write_record(b"hello").unwrap();
 
         // Corrupt the record by modifying a single byte in the middle
-        logfile
-            .fd
-            .seek(std::io::SeekFrom::Start(offset + 22)) // Skip past hash, length, and position to middle of "hello"
-            .unwrap();
-        logfile.fd.write_all(&[b'x']).unwrap(); // Replace one byte with 'x'
-        logfile.fd.sync_all().unwrap();
+        logfile.fd.write(offset + 22, &[b'x']).unwrap(); // Replace one byte with 'x'
 
         // Attempting to read the corrupted record should fail due to hash mismatch
         assert!(logfile.read_record(&offset).is_err());
@@ -375,28 +326,14 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    #[test]
-    fn test_corrupted_record_sealed() {
-        let path = PathBuf::from("/tmp/04.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-
-        let mut logfile = Logfile::new("04", fd).unwrap();
+    pub fn test_corrupted_record_sealed<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile =
+            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
         let offset = logfile.write_record(b"hello").unwrap();
         logfile.seal().unwrap();
 
         // Corrupt the record by modifying a single byte in the middle
-        logfile
-            .fd
-            .seek(std::io::SeekFrom::Start(offset + 22))
-            .unwrap();
-        logfile.fd.write_all(&[b'x']).unwrap();
-        logfile.fd.sync_all().unwrap();
+        logfile.fd.write(offset + 22, &[b'x']).unwrap();
 
         // Attempting to read the corrupted record should fail due to hash mismatch
         assert!(logfile.read_record(&offset).is_err());
@@ -405,21 +342,17 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    #[test]
-    fn test_corrupted_file_header() {
-        let path = PathBuf::from("/tmp/05.log");
-        let mut fd = File::create(&path).unwrap();
-
+    pub fn test_corrupted_file_header<F: FileIO>(f: F, path: PathBuf) {
         // Write an invalid magic number
         let invalid_header = [0x00; 16];
-        fd.write_all(&invalid_header).unwrap();
-        fd.sync_all().unwrap();
+        f.write(0, &invalid_header).unwrap();
 
         // Attempting to open the file with invalid header should fail
-        let result = Logfile::from_file(&path);
+        let result: Result<Logfile<F>> = Logfile::from_file(&path);
         assert!(result.is_err());
         assert!(result
-            .unwrap_err()
+            .err()
+            .unwrap()
             .to_string()
             .contains("Invalid start magic number"));
 
@@ -427,19 +360,10 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    #[test]
-    fn test_100_records() {
-        let path = PathBuf::from("/tmp/06.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-
+    pub fn test_100_records<F: FileIO>(f: F, path: PathBuf) {
         // Create a new logfile and write 100 records
-        let mut logfile = Logfile::new("06", fd).unwrap();
+        let mut logfile =
+            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
         let mut offsets = Vec::with_capacity(100);
 
         for i in 0..100 {
@@ -452,7 +376,7 @@ mod tests {
         logfile.seal().unwrap();
 
         // Reopen the file and verify all records
-        let mut logfile = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
         for (offset, expected_record) in offsets {
             let record = logfile.read_record(&offset).unwrap();
             assert_eq!(
@@ -467,18 +391,9 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    #[test]
-    fn test_iterator() {
-        let path = PathBuf::from("/tmp/07.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-
-        let mut logfile = Logfile::new("07", fd).unwrap();
+    pub fn test_iterator<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile =
+            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
 
         // Add some records
         for i in 0..100 {
@@ -508,21 +423,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_write_magic_number_without_sealing_escape() {
-        let path = PathBuf::from("/tmp/08.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-
-        let mut logfile = Logfile::new("08", fd).unwrap();
+    pub fn test_write_magic_number_without_sealing_escape<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile =
+            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
         let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
 
-        let mut logfile = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
         assert_eq!(logfile.id, "08");
         assert!(!logfile.sealed);
         assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
@@ -531,22 +437,13 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    #[test]
-    fn test_write_magic_number_sealing_escape() {
-        let path = PathBuf::from("/tmp/09.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-
-        let mut logfile = Logfile::new("0   9", fd).unwrap();
+    pub fn test_write_magic_number_sealing_escape<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile =
+            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
         let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
         logfile.seal().unwrap();
 
-        let mut logfile = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
         assert_eq!(logfile.id, "09");
         assert!(logfile.sealed);
         assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
@@ -555,18 +452,9 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    #[test]
-    fn test_write_magic_number_without_sealing_escape_iterator() {
-        let path = PathBuf::from("/tmp/10.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-
-        let mut logfile = Logfile::new("10", fd).unwrap();
+    pub fn test_write_magic_number_without_sealing_escape_iterator<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile =
+            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
         logfile.write_record(&MAGIC_NUMBER).unwrap();
 
         let mut iter = logfile.iter();
@@ -574,7 +462,7 @@ mod tests {
         assert_eq!(record, MAGIC_NUMBER);
         assert!(iter.next().is_none());
 
-        let mut logfile = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
         assert_eq!(logfile.id, "10");
         assert!(!logfile.sealed);
 
@@ -587,18 +475,9 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    #[test]
-    fn test_write_magic_number_with_sealing_escape_iterator() {
-        let path = PathBuf::from("/tmp/11.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-
-        let mut logfile = Logfile::new("11", fd).unwrap();
+    pub fn test_write_magic_number_with_sealing_escape_iterator<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile =
+            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
         logfile.write_record(&MAGIC_NUMBER).unwrap();
 
         // First iteration
@@ -621,7 +500,7 @@ mod tests {
         }
 
         // Verify with a fresh file handle
-        let mut logfile = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
         assert_eq!(logfile.id, "11");
         assert!(logfile.sealed);
 

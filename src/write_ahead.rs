@@ -3,15 +3,15 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use anyhow::Context;
 
-use crate::logfile::Logfile;
+use crate::{fileio::FileIO, logfile::Logfile};
 
 /// Manager controls the log file rotation and modification.
 ///
 /// A manager is single threaded to ensure maximum throughput for disk operations.
-pub struct WriteAhead {
+pub struct WriteAhead<F: FileIO> {
     options: WriteAheadOptions,
 
-    log_files: BTreeMap<String, Logfile>,
+    log_files: BTreeMap<String, Logfile<F>>,
 }
 
 #[derive(Debug)]
@@ -39,7 +39,7 @@ pub struct RetentionOptions {
     pub ttl: Duration,
 }
 
-impl WriteAhead {
+impl<F: FileIO> WriteAhead<F> {
     pub fn with_options(options: WriteAheadOptions) -> Self {
         Self {
             options,
@@ -53,14 +53,14 @@ impl WriteAhead {
         let log_files =
             std::fs::read_dir(&self.options.log_dir).context("Failed to read log directory")?;
 
-        for log_file in log_files {
-            let log_file = log_file.context("Failed to get dir entry")?;
-            let path = log_file.path();
-            let file_id = Logfile::file_id_from_path(&path)?;
+        // for log_file in log_files {
+        //     let log_file = log_file.context("Failed to get dir entry")?;
+        //     let path = log_file.path();
+        //     let file_id = Logfile::file_id_from_path(&path)?;
 
-            // let logfile = Logfile::new(file_id);
-            // self.log_files.insert(file_id, logfile);
-        }
+        //     let logfile = Logfile::new(file_id, F::open(&path)?);
+        //     self.log_files.insert(file_id, logfile);
+        // }
 
         Ok(())
     }
