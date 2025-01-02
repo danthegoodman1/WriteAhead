@@ -13,12 +13,12 @@ impl SimpleFile {
 }
 
 impl FileIO for SimpleFile {
-    fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+    async fn open(path: &std::path::Path) -> anyhow::Result<Self> {
         let fd = File::open(path)?;
         Self::new(fd)
     }
 
-    fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
+    async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
         use std::io::{Read, Seek};
 
         let mut fd = &self.fd;
@@ -30,7 +30,7 @@ impl FileIO for SimpleFile {
         Ok(buffer)
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+    async fn write(&self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
         use std::io::{Seek, Write};
 
         let mut fd = &self.fd;
@@ -41,7 +41,7 @@ impl FileIO for SimpleFile {
         Ok(())
     }
 
-    fn file_length(&self) -> u64 {
+    async fn file_length(&self) -> u64 {
         self.fd.metadata().unwrap().len()
     }
 }

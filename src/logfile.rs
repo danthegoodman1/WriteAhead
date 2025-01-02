@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
+use futures::Stream;
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 
 use crate::{fileio::FileIO, murmur3::murmur3_128};
 
@@ -46,11 +49,13 @@ impl<F: FileIO> Logfile<F> {
     /// Creates a new logfile, deleting any existing file at the given path.
     ///
     /// The id MUST be unique per file!
-    pub fn new(id: &str, fd: F) -> Result<Self> {
+    pub async fn new(id: &str, fd: F) -> Result<Self> {
         let mut header = [0u8; 8];
         header[0..8].copy_from_slice(&MAGIC_NUMBER);
 
-        fd.write(0, &header).context("Failed to write header")?;
+        fd.write(0, &header)
+            .await
+            .context("Failed to write header")?;
 
         Ok(Self {
             sealed: false,
@@ -81,15 +86,16 @@ impl<F: FileIO> Logfile<F> {
         Ok(numeric_part)
     }
 
-    pub fn from_file(path: &Path) -> Result<Self> {
-        let fd = F::open(path)?;
-        let file_length = fd.file_length();
+    pub async fn from_file(path: &Path) -> Result<Self> {
+        let fd = F::open(path).await?;
+        let file_length = fd.file_length().await;
         let id = Self::file_id_from_path(path)?;
 
         // Read the first 8 bytes of the file
 
         let buffer = fd
             .read(0, 8)
+            .await
             .context("Failed to read first 8 bytes of logfile")?;
 
         // Check if the first 8 bytes are the magic number
@@ -101,7 +107,7 @@ impl<F: FileIO> Logfile<F> {
         let mut sealed = false;
         if file_length >= 17 {
             // 8 header + at least 9 footer
-            let buffer = fd.read(file_length - 9, 9)?;
+            let buffer = fd.read(file_length - 9, 9).await?;
             if buffer[1..9] == MAGIC_NUMBER {
                 sealed = buffer[0] == 1;
             }
@@ -115,7 +121,7 @@ impl<F: FileIO> Logfile<F> {
         })
     }
 
-    pub fn write_record(&mut self, record: &[u8]) -> Result<u64> {
+    pub async fn write_record(&mut self, record: &[u8]) -> Result<u64> {
         if self.sealed {
             return Err(anyhow::anyhow!("Cannot write to sealed logfile"));
         }
@@ -153,15 +159,16 @@ impl<F: FileIO> Logfile<F> {
 
         self.fd
             .write(offset, &buf)
+            .await
             .context("Failed to write record")?;
 
         self.file_length += buf.len() as u64;
         Ok(offset)
     }
 
-    pub fn read_record(&mut self, offset: &u64) -> Result<Vec<u8>> {
+    pub async fn read_record(&mut self, offset: &u64) -> Result<Vec<u8>> {
         // Read the hash and length (20 bytes total)
-        let header = self.fd.read(*offset, 20)?;
+        let header = self.fd.read(*offset, 20).await?;
 
         // Parse the header
         let hash1 = i64::from_le_bytes(header[0..8].try_into().unwrap());
@@ -169,7 +176,7 @@ impl<F: FileIO> Logfile<F> {
         let length = u32::from_le_bytes(header[16..20].try_into().unwrap());
 
         // Read the actual record data
-        let mut record = self.fd.read(*offset + 20, length as u64)?;
+        let mut record = self.fd.read(*offset + 20, length as u64).await?;
 
         // Verify the hash
         let (computed_hash1, computed_hash2) = murmur3_128(&record);
@@ -192,7 +199,7 @@ impl<F: FileIO> Logfile<F> {
         Ok(record)
     }
 
-    pub fn seal(&mut self) -> Result<()> {
+    pub async fn seal(&mut self) -> Result<()> {
         if self.sealed {
             return Err(anyhow::anyhow!("Logfile already sealed"));
         }
@@ -205,14 +212,15 @@ impl<F: FileIO> Logfile<F> {
 
         self.fd
             .write(self.file_length, &footer)
+            .await
             .context("Failed to write footer")?;
 
         self.file_length += 9;
         Ok(())
     }
 
-    pub fn iter(&mut self) -> LogFileIterator<F> {
-        LogFileIterator {
+    pub fn stream(&mut self) -> LogFileStream<F> {
+        LogFileStream {
             logfile: self,
             offset: 8,
         }
@@ -223,54 +231,51 @@ impl<F: FileIO> Logfile<F> {
     }
 }
 
-pub struct LogFileIterator<'a, F: FileIO> {
+pub struct LogFileStream<'a, F: FileIO> {
     logfile: &'a mut Logfile<F>,
     offset: u64,
 }
 
-impl<'a, F: FileIO> LogFileIterator<'a, F> {
-    pub fn reset_iter(&mut self) {
+impl<'a, F: FileIO> LogFileStream<'a, F> {
+    pub fn reset_stream(&mut self) {
         self.offset = 8;
     }
 
-    pub fn iter_offset(&self) -> u64 {
+    pub fn stream_offset(&self) -> u64 {
         self.offset
     }
 
-    pub fn set_iter_offset(&mut self, offset: u64) {
+    pub fn set_stream_offset(&mut self, offset: u64) {
         self.offset = offset;
     }
 }
 
-/// Iterator for the log file records
-///
-/// If an error occurs, the iterator will panic
-impl<'a, F: FileIO> Iterator for LogFileIterator<'a, F> {
+impl<'a, F: FileIO> Stream for LogFileStream<'a, F> {
     type Item = Result<Vec<u8>>;
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         let offset = self.offset;
 
         // If file is sealed, check if we've reached the footer
         if self.logfile.sealed {
             if offset >= self.logfile.file_length - 9 {
-                return None;
+                return Poll::Ready(None);
             }
         }
 
         // Try to read record at current offset
-        match self.logfile.read_record(&offset) {
+        match futures::executor::block_on(self.logfile.read_record(&offset)) {
             Ok(record) => {
                 self.offset += 20 + record.len() as u64;
-                Some(Ok(record))
+                Poll::Ready(Some(Ok(record)))
             }
             Err(e) => {
                 if let Some(err) = e.downcast_ref::<std::io::Error>() {
                     if err.kind() == std::io::ErrorKind::UnexpectedEof {
-                        return None;
+                        return Poll::Ready(None);
                     }
                 }
-                Some(Err(e))
+                Poll::Ready(Some(Err(e)))
             }
         }
     }
@@ -278,77 +283,82 @@ impl<'a, F: FileIO> Iterator for LogFileIterator<'a, F> {
 
 #[cfg(test)]
 pub mod tests {
+    use futures::stream::StreamExt;
     use std::path::PathBuf;
 
     use super::*;
 
-    pub fn test_write_without_sealing<F: FileIO>(f: F, path: PathBuf) {
-        let mut logfile =
-            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
-        let offset = logfile.write_record(b"hello").unwrap();
+    pub async fn test_write_without_sealing<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
+        let offset = logfile.write_record(b"hello").await.unwrap();
 
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "01");
         assert!(!logfile.sealed);
-        assert_eq!(logfile.read_record(&offset).unwrap(), b"hello");
+        assert_eq!(logfile.read_record(&offset).await.unwrap(), b"hello");
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
     }
 
-    pub fn test_write_with_sealing<F: FileIO>(f: F, path: PathBuf) {
-        let mut logfile =
-            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
-        let offset = logfile.write_record(b"hello").unwrap();
-        logfile.seal().unwrap();
+    pub async fn test_write_with_sealing<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
+        let offset = logfile.write_record(b"hello").await.unwrap();
+        logfile.seal().await.unwrap();
 
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "02");
         assert!(logfile.sealed);
-        assert_eq!(logfile.read_record(&offset).unwrap(), b"hello");
+        assert_eq!(logfile.read_record(&offset).await.unwrap(), b"hello");
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
     }
 
-    pub fn test_corrupted_record<F: FileIO>(f: F, path: PathBuf) {
-        let mut logfile =
-            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
-        let offset = logfile.write_record(b"hello").unwrap();
+    pub async fn test_corrupted_record<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
+        let offset = logfile.write_record(b"hello").await.unwrap();
 
         // Corrupt the record by modifying a single byte in the middle
-        logfile.fd.write(offset + 22, &[b'x']).unwrap(); // Replace one byte with 'x'
+        logfile.fd.write(offset + 22, &[b'x']).await.unwrap(); // Replace one byte with 'x'
 
         // Attempting to read the corrupted record should fail due to hash mismatch
-        assert!(logfile.read_record(&offset).is_err());
+        assert!(logfile.read_record(&offset).await.is_err());
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
     }
 
-    pub fn test_corrupted_record_sealed<F: FileIO>(f: F, path: PathBuf) {
-        let mut logfile =
-            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
-        let offset = logfile.write_record(b"hello").unwrap();
-        logfile.seal().unwrap();
+    pub async fn test_corrupted_record_sealed<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
+        let offset = logfile.write_record(b"hello").await.unwrap();
+        logfile.seal().await.unwrap();
 
         // Corrupt the record by modifying a single byte in the middle
-        logfile.fd.write(offset + 22, &[b'x']).unwrap();
+        logfile.fd.write(offset + 22, &[b'x']).await.unwrap();
 
         // Attempting to read the corrupted record should fail due to hash mismatch
-        assert!(logfile.read_record(&offset).is_err());
+        assert!(logfile.read_record(&offset).await.is_err());
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
     }
 
-    pub fn test_corrupted_file_header<F: FileIO>(f: F, path: PathBuf) {
+    pub async fn test_corrupted_file_header<F: FileIO>(f: F, path: PathBuf) {
         // Write an invalid magic number
         let invalid_header = [0x00; 16];
-        f.write(0, &invalid_header).unwrap();
+        f.write(0, &invalid_header).await.unwrap();
 
         // Attempting to open the file with invalid header should fail
-        let result: Result<Logfile<F>> = Logfile::from_file(&path);
+        let result: Result<Logfile<F>> = Logfile::from_file(&path).await;
         assert!(result.is_err());
         assert!(result
             .err()
@@ -360,25 +370,26 @@ pub mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    pub fn test_100_records<F: FileIO>(f: F, path: PathBuf) {
+    pub async fn test_100_records<F: FileIO>(f: F, path: PathBuf) {
         // Create a new logfile and write 100 records
-        let mut logfile =
-            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
         let mut offsets = Vec::with_capacity(100);
 
         for i in 0..100 {
             let record = format!("record_{}", i);
-            let offset = logfile.write_record(record.as_bytes()).unwrap();
+            let offset = logfile.write_record(record.as_bytes()).await.unwrap();
             offsets.push((offset, record));
         }
 
         // Seal the file
-        logfile.seal().unwrap();
+        logfile.seal().await.unwrap();
 
         // Reopen the file and verify all records
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         for (offset, expected_record) in offsets {
-            let record = logfile.read_record(&offset).unwrap();
+            let record = logfile.read_record(&offset).await.unwrap();
             assert_eq!(
                 String::from_utf8(record).unwrap(),
                 expected_record,
@@ -391,123 +402,135 @@ pub mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    pub fn test_iterator<F: FileIO>(f: F, path: PathBuf) {
-        let mut logfile =
-            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
+    pub async fn test_iterator<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
 
         // Add some records
         for i in 0..100 {
             logfile
                 .write_record(format!("record_{}", i).as_bytes())
+                .await
                 .unwrap();
         }
 
         // First iteration
         {
-            let mut iter = logfile.iter();
+            let mut iter = logfile.stream();
             for i in 0..100 {
-                let record = iter.next().unwrap().unwrap();
+                let record = iter.next().await.unwrap().unwrap();
                 assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
             }
-            assert!(iter.next().is_none());
+            assert!(iter.next().await.is_none());
         }
 
         // Second iteration - verify we can create a new iterator and read again
         {
-            let mut iter = logfile.iter();
+            let mut iter = logfile.stream();
             for i in 0..100 {
-                let record = iter.next().unwrap().unwrap();
+                let record = iter.next().await.unwrap().unwrap();
                 assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
             }
-            assert!(iter.next().is_none());
+            assert!(iter.next().await.is_none());
         }
     }
 
-    pub fn test_write_magic_number_without_sealing_escape<F: FileIO>(f: F, path: PathBuf) {
-        let mut logfile =
-            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
-        let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
+    pub async fn test_write_magic_number_without_sealing_escape<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
+        let offset = logfile.write_record(&MAGIC_NUMBER).await.unwrap();
 
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "08");
         assert!(!logfile.sealed);
-        assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
+        assert_eq!(logfile.read_record(&offset).await.unwrap(), &MAGIC_NUMBER);
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
     }
 
-    pub fn test_write_magic_number_sealing_escape<F: FileIO>(f: F, path: PathBuf) {
-        let mut logfile =
-            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
-        let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
-        logfile.seal().unwrap();
+    pub async fn test_write_magic_number_sealing_escape<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
+        let offset = logfile.write_record(&MAGIC_NUMBER).await.unwrap();
+        logfile.seal().await.unwrap();
 
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "09");
         assert!(logfile.sealed);
-        assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
+        assert_eq!(logfile.read_record(&offset).await.unwrap(), &MAGIC_NUMBER);
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
     }
 
-    pub fn test_write_magic_number_without_sealing_escape_iterator<F: FileIO>(f: F, path: PathBuf) {
-        let mut logfile =
-            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
-        logfile.write_record(&MAGIC_NUMBER).unwrap();
+    pub async fn test_write_magic_number_without_sealing_escape_iterator<F: FileIO>(
+        f: F,
+        path: PathBuf,
+    ) {
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
+        logfile.write_record(&MAGIC_NUMBER).await.unwrap();
 
-        let mut iter = logfile.iter();
-        let record = iter.next().unwrap().unwrap();
+        let mut iter = logfile.stream();
+        let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
-        assert!(iter.next().is_none());
+        assert!(iter.next().await.is_none());
 
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "10");
         assert!(!logfile.sealed);
 
-        let mut iter = logfile.iter();
-        let record = iter.next().unwrap().unwrap();
+        let mut iter = logfile.stream();
+        let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
-        assert!(iter.next().is_none());
+        assert!(iter.next().await.is_none());
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
     }
 
-    pub fn test_write_magic_number_with_sealing_escape_iterator<F: FileIO>(f: F, path: PathBuf) {
-        let mut logfile =
-            Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f).unwrap();
-        logfile.write_record(&MAGIC_NUMBER).unwrap();
+    pub async fn test_write_magic_number_with_sealing_escape_iterator<F: FileIO>(
+        f: F,
+        path: PathBuf,
+    ) {
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
+        logfile.write_record(&MAGIC_NUMBER).await.unwrap();
 
         // First iteration
         {
-            let mut iter = logfile.iter();
-            let record = iter.next().unwrap().unwrap();
+            let mut iter = logfile.stream();
+            let record = iter.next().await.unwrap().unwrap();
             assert_eq!(record, MAGIC_NUMBER);
-            assert!(iter.next().is_none());
+            assert!(iter.next().await.is_none());
         }
 
         // Seal the file
-        logfile.seal().unwrap();
+        logfile.seal().await.unwrap();
 
         // Second iteration after sealing
         {
-            let mut iter = logfile.iter();
-            let record = iter.next().unwrap().unwrap();
+            let mut iter = logfile.stream();
+            let record = iter.next().await.unwrap().unwrap();
             assert_eq!(record, MAGIC_NUMBER);
-            assert!(iter.next().is_none());
+            assert!(iter.next().await.is_none());
         }
 
         // Verify with a fresh file handle
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).unwrap();
+        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "11");
         assert!(logfile.sealed);
 
-        let mut iter = logfile.iter();
-        let record = iter.next().unwrap().unwrap();
+        let mut iter = logfile.stream();
+        let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
-        assert!(iter.next().is_none());
+        assert!(iter.next().await.is_none());
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();

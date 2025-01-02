@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.95"
+futures = "0.3.31"
 thiserror = "2.0.9"
 
 [dev-dependencies]
