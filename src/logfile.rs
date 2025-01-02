@@ -3,7 +3,6 @@ use std::{
     fs::File,
     io::{Read, Seek, Write},
     path::Path,
-    rc::Rc,
 };
 
 use crate::murmur3::murmur3_128;
