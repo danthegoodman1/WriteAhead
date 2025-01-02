@@ -38,6 +38,7 @@ pub struct Logfile {
     sealed_at: Option<SystemTime>,
     id: u64,
     fd: File,
+    iter_offset: u64,
 }
 
 const MAGIC_NUMBER: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
@@ -66,6 +67,7 @@ impl Logfile {
             sealed_at: None,
             id,
             fd,
+            iter_offset: 16,
         })
     }
 
@@ -135,6 +137,7 @@ impl Logfile {
             sealed_at,
             id,
             fd,
+            iter_offset: 16,
         })
     }
 
@@ -170,10 +173,10 @@ impl Logfile {
         Ok(offset)
     }
 
-    pub fn read_record(&mut self, offset: u64) -> Result<Vec<u8>> {
+    pub fn read_record(&mut self, offset: &u64) -> Result<Vec<u8>> {
         // Seek to the specified offset
         self.fd
-            .seek(std::io::SeekFrom::Start(offset))
+            .seek(std::io::SeekFrom::Start(*offset))
             .context("Failed to seek to record")?;
 
         // Read the hash and length (20 bytes total)
@@ -230,6 +233,52 @@ impl Logfile {
 
         Ok(())
     }
+
+    pub fn reset_iter(&mut self) {
+        self.iter_offset = 16;
+    }
+}
+
+/// Iterator for the log file records
+///
+/// If an error occurs, the iterator will panic
+impl Iterator for Logfile {
+    type Item = Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let offset = self.iter_offset;
+
+        // If file is sealed, check if we've reached the footer
+        if self.sealed_at.is_some() {
+            // Get current file length
+            if let Ok(file_len) = self.fd.metadata().map(|m| m.len()) {
+                // Stop 16 bytes before the end if sealed
+                if offset >= file_len - 16 {
+                    return None;
+                }
+            }
+        }
+
+        // Try to read record at current offset
+        match self.read_record(&offset) {
+            Ok(record) => {
+                // Update offset to point to next record
+                // 20 = header size (16 bytes hash + 4 bytes length)
+                self.iter_offset += 20 + record.len() as u64;
+                Some(Ok(record))
+            }
+            Err(e) => {
+                // If we hit EOF, return None to end iteration
+                if let Some(err) = e.downcast_ref::<std::io::Error>() {
+                    if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                        return None;
+                    }
+                }
+                // For other errors, return the error
+                Some(Err(e))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -249,7 +298,7 @@ mod tests {
         assert_eq!(logfile.id, 1);
         assert_eq!(logfile.created_at, created_at);
         assert_eq!(logfile.sealed_at, None);
-        assert_eq!(logfile.read_record(offset).unwrap(), b"hello");
+        assert_eq!(logfile.read_record(&offset).unwrap(), b"hello");
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
@@ -270,7 +319,7 @@ mod tests {
         assert_eq!(logfile.id, 2);
         assert_eq!(logfile.created_at, created_at);
         assert_eq!(logfile.sealed_at, Some(sealed_at));
-        assert_eq!(logfile.read_record(offset).unwrap(), b"hello");
+        assert_eq!(logfile.read_record(&offset).unwrap(), b"hello");
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
@@ -278,10 +327,10 @@ mod tests {
 
     #[test]
     fn test_corrupted_record() {
-        let path = PathBuf::from("/tmp/4.log");
+        let path = PathBuf::from("/tmp/3.log");
         let fd = File::create(&path).unwrap();
 
-        let mut logfile = Logfile::new(4, fd).unwrap();
+        let mut logfile = Logfile::new(3, fd).unwrap();
         let offset = logfile.write_record(b"hello").unwrap();
 
         // Corrupt the record by modifying a single byte in the middle
@@ -293,7 +342,7 @@ mod tests {
         logfile.fd.sync_all().unwrap();
 
         // Attempting to read the corrupted record should fail due to hash mismatch
-        assert!(logfile.read_record(offset).is_err());
+        assert!(logfile.read_record(&offset).is_err());
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
@@ -301,10 +350,10 @@ mod tests {
 
     #[test]
     fn test_corrupted_record_sealed() {
-        let path = PathBuf::from("/tmp/6.log");
+        let path = PathBuf::from("/tmp/4.log");
         let fd = File::create(&path).unwrap();
 
-        let mut logfile = Logfile::new(6, fd).unwrap();
+        let mut logfile = Logfile::new(4, fd).unwrap();
         let offset = logfile.write_record(b"hello").unwrap();
         logfile.seal().unwrap();
 
@@ -317,7 +366,7 @@ mod tests {
         logfile.fd.sync_all().unwrap();
 
         // Attempting to read the corrupted record should fail due to hash mismatch
-        assert!(logfile.read_record(offset).is_err());
+        assert!(logfile.read_record(&offset).is_err());
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
@@ -347,11 +396,11 @@ mod tests {
 
     #[test]
     fn test_100_records() {
-        let path = PathBuf::from("/tmp/100.log");
+        let path = PathBuf::from("/tmp/6.log");
         let fd = File::create(&path).unwrap();
 
         // Create a new logfile and write 100 records
-        let mut logfile = Logfile::new(100, fd).unwrap();
+        let mut logfile = Logfile::new(6, fd).unwrap();
         let mut offsets = Vec::with_capacity(100);
 
         for i in 0..100 {
@@ -366,13 +415,49 @@ mod tests {
         // Reopen the file and verify all records
         let mut logfile = Logfile::from_file(&path).unwrap();
         for (offset, expected_record) in offsets {
-            let record = logfile.read_record(offset).unwrap();
+            let record = logfile.read_record(&offset).unwrap();
             assert_eq!(
                 String::from_utf8(record).unwrap(),
                 expected_record,
                 "Record mismatch at offset {}",
                 offset
             );
+        }
+
+        // Clean up the test file
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_iterator() {
+        let path = PathBuf::from("/tmp/7.log");
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+
+        let mut logfile = Logfile::new(7, fd).unwrap();
+
+        // Add some records
+        for i in 0..100 {
+            logfile
+                .write_record(format!("record_{}", i).as_bytes())
+                .unwrap();
+        }
+
+        for i in 0..100 {
+            let record = logfile.next().unwrap().unwrap();
+            assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
+        }
+
+        // Reset the iterator and verify that we can read the same records again
+        logfile.reset_iter();
+        for i in 0..100 {
+            let record = logfile.next().unwrap().unwrap();
+            assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
         }
 
         // Clean up the test file
