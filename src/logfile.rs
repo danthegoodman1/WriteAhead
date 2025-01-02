@@ -506,131 +506,131 @@ mod tests {
             }
             assert!(iter.next().is_none());
         }
+    }
 
-        #[test]
-        fn test_write_magic_number_without_sealing_escape() {
-            let path = PathBuf::from("/tmp/08.log");
-            let fd = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&path)
-                .unwrap();
+    #[test]
+    fn test_write_magic_number_without_sealing_escape() {
+        let path = PathBuf::from("/tmp/08.log");
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
 
-            let mut logfile = Logfile::new("08", fd).unwrap();
-            let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
+        let mut logfile = Logfile::new("08", fd).unwrap();
+        let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
 
-            let mut logfile = Logfile::from_file(&path).unwrap();
-            assert_eq!(logfile.id, "08");
-            assert!(!logfile.sealed);
-            assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
+        let mut logfile = Logfile::from_file(&path).unwrap();
+        assert_eq!(logfile.id, "08");
+        assert!(!logfile.sealed);
+        assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
 
-            // Clean up the test file
-            std::fs::remove_file(&path).unwrap();
-        }
+        // Clean up the test file
+        std::fs::remove_file(&path).unwrap();
+    }
 
-        #[test]
-        fn test_write_magic_number_sealing_escape() {
-            let path = PathBuf::from("/tmp/09.log");
-            let fd = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&path)
-                .unwrap();
+    #[test]
+    fn test_write_magic_number_sealing_escape() {
+        let path = PathBuf::from("/tmp/09.log");
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
 
-            let mut logfile = Logfile::new("0   9", fd).unwrap();
-            let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
-            logfile.seal().unwrap();
+        let mut logfile = Logfile::new("0   9", fd).unwrap();
+        let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
+        logfile.seal().unwrap();
 
-            let mut logfile = Logfile::from_file(&path).unwrap();
-            assert_eq!(logfile.id, "09");
-            assert!(logfile.sealed);
-            assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
+        let mut logfile = Logfile::from_file(&path).unwrap();
+        assert_eq!(logfile.id, "09");
+        assert!(logfile.sealed);
+        assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
 
-            // Clean up the test file
-            std::fs::remove_file(&path).unwrap();
-        }
+        // Clean up the test file
+        std::fs::remove_file(&path).unwrap();
+    }
 
-        #[test]
-        fn test_write_magic_number_without_sealing_escape_iterator() {
-            let path = PathBuf::from("/tmp/10.log");
-            let fd = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&path)
-                .unwrap();
+    #[test]
+    fn test_write_magic_number_without_sealing_escape_iterator() {
+        let path = PathBuf::from("/tmp/10.log");
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
 
-            let mut logfile = Logfile::new("10", fd).unwrap();
-            logfile.write_record(&MAGIC_NUMBER).unwrap();
+        let mut logfile = Logfile::new("10", fd).unwrap();
+        logfile.write_record(&MAGIC_NUMBER).unwrap();
 
+        let mut iter = logfile.iter();
+        let record = iter.next().unwrap().unwrap();
+        assert_eq!(record, MAGIC_NUMBER);
+        assert!(iter.next().is_none());
+
+        let mut logfile = Logfile::from_file(&path).unwrap();
+        assert_eq!(logfile.id, "10");
+        assert!(!logfile.sealed);
+
+        let mut iter = logfile.iter();
+        let record = iter.next().unwrap().unwrap();
+        assert_eq!(record, MAGIC_NUMBER);
+        assert!(iter.next().is_none());
+
+        // Clean up the test file
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_write_magic_number_with_sealing_escape_iterator() {
+        let path = PathBuf::from("/tmp/11.log");
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+
+        let mut logfile = Logfile::new("11", fd).unwrap();
+        logfile.write_record(&MAGIC_NUMBER).unwrap();
+
+        // First iteration
+        {
             let mut iter = logfile.iter();
             let record = iter.next().unwrap().unwrap();
             assert_eq!(record, MAGIC_NUMBER);
             assert!(iter.next().is_none());
+        }
 
-            let mut logfile = Logfile::from_file(&path).unwrap();
-            assert_eq!(logfile.id, "10");
-            assert!(!logfile.sealed);
+        // Seal the file
+        logfile.seal().unwrap();
 
+        // Second iteration after sealing
+        {
             let mut iter = logfile.iter();
             let record = iter.next().unwrap().unwrap();
             assert_eq!(record, MAGIC_NUMBER);
             assert!(iter.next().is_none());
-
-            // Clean up the test file
-            std::fs::remove_file(&path).unwrap();
         }
 
-        #[test]
-        fn test_write_magic_number_with_sealing_escape_iterator() {
-            let path = PathBuf::from("/tmp/11.log");
-            let fd = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&path)
-                .unwrap();
+        // Verify with a fresh file handle
+        let mut logfile = Logfile::from_file(&path).unwrap();
+        assert_eq!(logfile.id, "11");
+        assert!(logfile.sealed);
 
-            let mut logfile = Logfile::new("11", fd).unwrap();
-            logfile.write_record(&MAGIC_NUMBER).unwrap();
+        let mut iter = logfile.iter();
+        let record = iter.next().unwrap().unwrap();
+        assert_eq!(record, MAGIC_NUMBER);
+        assert!(iter.next().is_none());
 
-            // First iteration
-            {
-                let mut iter = logfile.iter();
-                let record = iter.next().unwrap().unwrap();
-                assert_eq!(record, MAGIC_NUMBER);
-                assert!(iter.next().is_none());
-            }
-
-            // Seal the file
-            logfile.seal().unwrap();
-
-            // Second iteration after sealing
-            {
-                let mut iter = logfile.iter();
-                let record = iter.next().unwrap().unwrap();
-                assert_eq!(record, MAGIC_NUMBER);
-                assert!(iter.next().is_none());
-            }
-
-            // Verify with a fresh file handle
-            let mut logfile = Logfile::from_file(&path).unwrap();
-            assert_eq!(logfile.id, "11");
-            assert!(logfile.sealed);
-
-            let mut iter = logfile.iter();
-            let record = iter.next().unwrap().unwrap();
-            assert_eq!(record, MAGIC_NUMBER);
-            assert!(iter.next().is_none());
-
-            // Clean up the test file
-            std::fs::remove_file(&path).unwrap();
-        }
+        // Clean up the test file
+        std::fs::remove_file(&path).unwrap();
     }
 }
