@@ -278,7 +278,7 @@ impl<'a, F: FileIO> Iterator for LogFileIterator<'a, F> {
 
 #[cfg(test)]
 pub mod tests {
-    use std::{fs::OpenOptions, path::PathBuf};
+    use std::path::PathBuf;
 
     use super::*;
 
