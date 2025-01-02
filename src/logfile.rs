@@ -30,7 +30,8 @@ use crate::murmur3::murmur3_128;
 /// # Corruption protection
 ///
 /// A hash is created for each record, but not for the headers. That is because the headers
-/// really just convenience info
+/// really just convenience info. So record data is protected by the hash, but the headers
+/// are not.
 #[derive(Debug)]
 pub struct Logfile {
     created_at: SystemTime,
