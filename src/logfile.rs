@@ -117,17 +117,16 @@ impl Logfile {
             if metadata.len() >= 32 {
                 // Only try to read footer if file is long enough
                 fd.seek(std::io::SeekFrom::End(-16))?;
-                if fd.read_exact(&mut buffer).is_ok() && buffer[0..8] != MAGIC_NUMBER {
-                    return Err(anyhow::anyhow!("Invalid end magic number"));
+                if fd.read_exact(&mut buffer).is_ok() && buffer[0..8] == MAGIC_NUMBER {
+                    sealed_at = Some(
+                        UNIX_EPOCH
+                            + Duration::from_nanos(u64::from_le_bytes(
+                                buffer[8..16]
+                                    .try_into()
+                                    .context("Failed to read sealed_at timestamp")?,
+                            )),
+                    );
                 }
-                sealed_at = Some(
-                    UNIX_EPOCH
-                        + Duration::from_nanos(u64::from_le_bytes(
-                            buffer[8..16]
-                                .try_into()
-                                .context("Failed to read sealed_at timestamp")?,
-                        )),
-                );
             }
         }
 
@@ -278,29 +277,6 @@ mod tests {
     }
 
     #[test]
-    fn test_corrupted_sealed_file() {
-        let path = PathBuf::from("/tmp/3.log");
-        let fd = File::create(&path).unwrap();
-
-        // Create and seal a valid logfile
-        let mut logfile = Logfile::new(3, fd).unwrap();
-        logfile.write_record(b"hello").unwrap();
-        logfile.seal().unwrap();
-
-        // Corrupt the file by appending invalid data after the footer
-        let mut fd = OpenOptions::new().append(true).open(&path).unwrap();
-        fd.write_all(b"corrupted").unwrap();
-        fd.sync_all().unwrap();
-
-        // Attempting to open the corrupted file should fail
-        let res = Logfile::from_file(&path);
-        assert!(res.is_err());
-
-        // Clean up the test file
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
     fn test_corrupted_record() {
         let path = PathBuf::from("/tmp/4.log");
         let fd = File::create(&path).unwrap();
@@ -314,6 +290,30 @@ mod tests {
             .seek(std::io::SeekFrom::Start(offset + 22)) // Skip past hash, length, and position to middle of "hello"
             .unwrap();
         logfile.fd.write_all(&[b'x']).unwrap(); // Replace one byte with 'x'
+        logfile.fd.sync_all().unwrap();
+
+        // Attempting to read the corrupted record should fail due to hash mismatch
+        assert!(logfile.read_record(offset).is_err());
+
+        // Clean up the test file
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_corrupted_record_sealed() {
+        let path = PathBuf::from("/tmp/6.log");
+        let fd = File::create(&path).unwrap();
+
+        let mut logfile = Logfile::new(6, fd).unwrap();
+        let offset = logfile.write_record(b"hello").unwrap();
+        logfile.seal().unwrap();
+
+        // Corrupt the record by modifying a single byte in the middle
+        logfile
+            .fd
+            .seek(std::io::SeekFrom::Start(offset + 22))
+            .unwrap();
+        logfile.fd.write_all(&[b'x']).unwrap();
         logfile.fd.sync_all().unwrap();
 
         // Attempting to read the corrupted record should fail due to hash mismatch
