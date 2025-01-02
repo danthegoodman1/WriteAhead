@@ -11,7 +11,7 @@ use crate::logfile::Logfile;
 pub struct WriteAhead {
     options: WriteAheadOptions,
 
-    log_files: BTreeMap<u64, Logfile>,
+    log_files: BTreeMap<String, Logfile>,
 }
 
 #[derive(Debug)]

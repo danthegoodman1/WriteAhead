@@ -39,7 +39,7 @@ use crate::murmur3::murmur3_128;
 #[derive(Debug)]
 pub struct Logfile {
     pub sealed: bool,
-    pub id: u64,
+    pub id: String,
     pub file_length: u64,
     fd: File,
     iter_offset: u64,
@@ -51,7 +51,7 @@ impl Logfile {
     /// Creates a new logfile, deleting any existing file at the given path.
     ///
     /// The id MUST be unique per file!
-    pub fn new(id: u64, fd: File) -> Result<Self> {
+    pub fn new(id: &str, fd: File) -> Result<Self> {
         let mut header = [0u8; 8];
         header[0..8].copy_from_slice(&MAGIC_NUMBER);
 
@@ -61,14 +61,14 @@ impl Logfile {
 
         Ok(Self {
             sealed: false,
-            id,
+            id: id.to_string(),
             fd,
             iter_offset: 8,
             file_length: 8,
         })
     }
 
-    pub fn file_id_from_path(path: &Path) -> Result<u64> {
+    pub fn file_id_from_path(path: &Path) -> Result<String> {
         let filename = path
             .file_name()
             .context("Log file name is missing")?
@@ -82,9 +82,11 @@ impl Logfile {
             .take_while(|c| c.is_ascii_digit())
             .collect::<String>();
 
-        numeric_part
-            .parse::<u64>()
-            .context("Log file name does not contain a valid u64")
+        if numeric_part.is_empty() {
+            return Err(anyhow::anyhow!("Log file name does not contain a valid ID"));
+        }
+
+        Ok(numeric_part)
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
@@ -293,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_write_without_sealing() {
-        let path = PathBuf::from("/tmp/1.log");
+        let path = PathBuf::from("/tmp/01.log");
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -302,11 +304,11 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        let mut logfile = Logfile::new(1, fd).unwrap();
+        let mut logfile = Logfile::new("01", fd).unwrap();
         let offset = logfile.write_record(b"hello").unwrap();
 
         let mut logfile = Logfile::from_file(&path).unwrap();
-        assert_eq!(logfile.id, 1);
+        assert_eq!(logfile.id, "01");
         assert!(!logfile.sealed);
         assert_eq!(logfile.read_record(&offset).unwrap(), b"hello");
 
@@ -316,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_write_with_sealing() {
-        let path = PathBuf::from("/tmp/2.log");
+        let path = PathBuf::from("/tmp/02.log");
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -325,12 +327,12 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        let mut logfile = Logfile::new(2, fd).unwrap();
+        let mut logfile = Logfile::new("02", fd).unwrap();
         let offset = logfile.write_record(b"hello").unwrap();
         logfile.seal().unwrap();
 
         let mut logfile = Logfile::from_file(&path).unwrap();
-        assert_eq!(logfile.id, 2);
+        assert_eq!(logfile.id, "02");
         assert!(logfile.sealed);
         assert_eq!(logfile.read_record(&offset).unwrap(), b"hello");
 
@@ -340,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_corrupted_record() {
-        let path = PathBuf::from("/tmp/3.log");
+        let path = PathBuf::from("/tmp/03.log");
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -349,7 +351,7 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        let mut logfile = Logfile::new(3, fd).unwrap();
+        let mut logfile = Logfile::new("03", fd).unwrap();
         let offset = logfile.write_record(b"hello").unwrap();
 
         // Corrupt the record by modifying a single byte in the middle
@@ -369,7 +371,7 @@ mod tests {
 
     #[test]
     fn test_corrupted_record_sealed() {
-        let path = PathBuf::from("/tmp/4.log");
+        let path = PathBuf::from("/tmp/04.log");
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -378,7 +380,7 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        let mut logfile = Logfile::new(4, fd).unwrap();
+        let mut logfile = Logfile::new("04", fd).unwrap();
         let offset = logfile.write_record(b"hello").unwrap();
         logfile.seal().unwrap();
 
@@ -399,7 +401,7 @@ mod tests {
 
     #[test]
     fn test_corrupted_file_header() {
-        let path = PathBuf::from("/tmp/5.log");
+        let path = PathBuf::from("/tmp/05.log");
         let mut fd = File::create(&path).unwrap();
 
         // Write an invalid magic number
@@ -421,7 +423,7 @@ mod tests {
 
     #[test]
     fn test_100_records() {
-        let path = PathBuf::from("/tmp/6.log");
+        let path = PathBuf::from("/tmp/06.log");
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -431,7 +433,7 @@ mod tests {
             .unwrap();
 
         // Create a new logfile and write 100 records
-        let mut logfile = Logfile::new(6, fd).unwrap();
+        let mut logfile = Logfile::new("06", fd).unwrap();
         let mut offsets = Vec::with_capacity(100);
 
         for i in 0..100 {
@@ -461,7 +463,7 @@ mod tests {
 
     #[test]
     fn test_iterator() {
-        let path = PathBuf::from("/tmp/7.log");
+        let path = PathBuf::from("/tmp/07.log");
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -470,7 +472,7 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        let mut logfile = Logfile::new(7, fd).unwrap();
+        let mut logfile = Logfile::new("07", fd).unwrap();
 
         // Add some records
         for i in 0..100 {
@@ -500,7 +502,7 @@ mod tests {
 
     #[test]
     fn test_write_magic_number_without_sealing_escape() {
-        let path = PathBuf::from("/tmp/8.log");
+        let path = PathBuf::from("/tmp/08.log");
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -509,11 +511,11 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        let mut logfile = Logfile::new(8, fd).unwrap();
+        let mut logfile = Logfile::new("08", fd).unwrap();
         let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
 
         let mut logfile = Logfile::from_file(&path).unwrap();
-        assert_eq!(logfile.id, 8);
+        assert_eq!(logfile.id, "08");
         assert!(!logfile.sealed);
         assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
 
@@ -523,7 +525,7 @@ mod tests {
 
     #[test]
     fn test_write_magic_number_sealing_escape() {
-        let path = PathBuf::from("/tmp/9.log");
+        let path = PathBuf::from("/tmp/09.log");
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -532,12 +534,12 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        let mut logfile = Logfile::new(9, fd).unwrap();
+        let mut logfile = Logfile::new("0   9", fd).unwrap();
         let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
         logfile.seal().unwrap();
 
         let mut logfile = Logfile::from_file(&path).unwrap();
-        assert_eq!(logfile.id, 9);
+        assert_eq!(logfile.id, "09");
         assert!(logfile.sealed);
         assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
 
@@ -556,14 +558,14 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        let mut logfile = Logfile::new(10, fd).unwrap();
+        let mut logfile = Logfile::new("10", fd).unwrap();
         logfile.write_record(&MAGIC_NUMBER).unwrap();
 
         let record = logfile.next().unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
 
         let mut logfile = Logfile::from_file(&path).unwrap();
-        assert_eq!(logfile.id, 10);
+        assert_eq!(logfile.id, "10");
         assert!(!logfile.sealed);
 
         let record = logfile.next().unwrap().unwrap();
@@ -584,7 +586,7 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        let mut logfile = Logfile::new(11, fd).unwrap();
+        let mut logfile = Logfile::new("11", fd).unwrap();
         let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
 
         let record = logfile.next().unwrap().unwrap();
@@ -597,7 +599,7 @@ mod tests {
         assert_eq!(record, MAGIC_NUMBER);
 
         let mut logfile = Logfile::from_file(&path).unwrap();
-        assert_eq!(logfile.id, 11);
+        assert_eq!(logfile.id, "11");
         assert!(logfile.sealed);
 
         let record = logfile.next().unwrap().unwrap();
