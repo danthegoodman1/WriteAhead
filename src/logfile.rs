@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
 use std::{
-    fs::{File, OpenOptions},
-    io::{BufReader, Read, Seek, Write},
-    path::{Path, PathBuf},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    fs::File,
+    io::{Read, Seek, Write},
+    path::Path,
 };
 
 use crate::murmur3::murmur3_128;
@@ -288,6 +287,8 @@ impl Iterator for Logfile {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs::OpenOptions, path::PathBuf};
+
     use super::*;
 
     #[test]
