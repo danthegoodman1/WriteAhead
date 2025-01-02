@@ -32,6 +32,11 @@ use crate::murmur3::murmur3_128;
 /// A hash is created for each record, but not for the headers. That is because the headers
 /// really just convenience info. So record data is protected by the hash, but the headers
 /// are not.
+///
+/// # Escape 0xff
+///
+/// 0x00 is used as an escape character for 0xff. This is to prevent corruption of the file
+/// when 0xff is written to the file.
 #[derive(Debug)]
 pub struct Logfile {
     created_at: SystemTime,
@@ -41,7 +46,7 @@ pub struct Logfile {
     iter_offset: u64,
 }
 
-const MAGIC_NUMBER: [u8; 8] = [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42];
+const MAGIC_NUMBER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
 
 impl Logfile {
     /// Creates a new logfile, deleting any existing file at the given path.
@@ -142,8 +147,17 @@ impl Logfile {
     }
 
     pub fn write_record(&mut self, record: &[u8]) -> Result<u64> {
-        // Get the current offset BEFORE writing - this is where the record will start
         let offset = self.fd.seek(std::io::SeekFrom::Current(0))?;
+
+        // Replace 0xff with 0x00 0xff, but scan from end to start to handle insertions correctly
+        let mut record = record.to_vec();
+        let mut i = record.len();
+        while i > 0 {
+            i -= 1;
+            if record[i] == 0xff {
+                record.insert(i, 0x00);
+            }
+        }
 
         // Verify the record is no longer than max u32
         if record.len() > u32::MAX as usize {
@@ -154,7 +168,7 @@ impl Logfile {
         }
 
         // Generate a murmur3 hash of the record
-        let (hash1, hash2) = murmur3_128(record);
+        let (hash1, hash2) = murmur3_128(&record);
         let length = record.len() as u32;
 
         // Pre-allocate buffer with exact size (16 bytes for hash + 8 bytes for length + record length)
@@ -162,7 +176,7 @@ impl Logfile {
         buf.extend_from_slice(&hash1.to_le_bytes());
         buf.extend_from_slice(&hash2.to_le_bytes());
         buf.extend_from_slice(&length.to_le_bytes());
-        buf.extend_from_slice(record);
+        buf.extend_from_slice(&record);
 
         self.fd.write_all(&buf).context("Failed to write record")?;
         self.fd
@@ -202,6 +216,16 @@ impl Logfile {
             return Err(anyhow::anyhow!(
                 "Invalid hash for record, this file is corrupted"
             ));
+        }
+
+        // Replace 0x00 0xff with 0xff, scanning from end to start
+        let mut i = record.len();
+        while i > 0 {
+            i -= 1;
+            if i > 0 && record[i - 1] == 0x00 && record[i] == 0xff {
+                record.remove(i - 1);
+                i -= 1;
+            }
         }
 
         Ok(record)
@@ -378,7 +402,7 @@ mod tests {
         let mut fd = File::create(&path).unwrap();
 
         // Write an invalid magic number
-        let invalid_header = [0xFF; 16];
+        let invalid_header = [0x00; 16];
         fd.write_all(&invalid_header).unwrap();
         fd.sync_all().unwrap();
 
@@ -459,6 +483,49 @@ mod tests {
             let record = logfile.next().unwrap().unwrap();
             assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
         }
+
+        // Verify that we've reached the end of the file
+        assert!(logfile.next().is_none());
+
+        // Clean up the test file
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_write_magic_number_without_sealing_escape() {
+        let path = PathBuf::from("/tmp/8.log");
+        let fd = File::create(&path).unwrap();
+
+        let mut logfile = Logfile::new(8, fd).unwrap();
+        let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
+        let created_at = logfile.created_at;
+
+        let mut logfile = Logfile::from_file(&path).unwrap();
+        assert_eq!(logfile.id, 8);
+        assert_eq!(logfile.created_at, created_at);
+        assert_eq!(logfile.sealed_at, None);
+        assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
+
+        // Clean up the test file
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_write_magic_number_sealing_escape() {
+        let path = PathBuf::from("/tmp/9.log");
+        let fd = File::create(&path).unwrap();
+
+        let mut logfile = Logfile::new(9, fd).unwrap();
+        let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
+        let created_at = logfile.created_at;
+        logfile.seal().unwrap();
+        let sealed_at = logfile.sealed_at.unwrap();
+
+        let mut logfile = Logfile::from_file(&path).unwrap();
+        assert_eq!(logfile.id, 9);
+        assert_eq!(logfile.created_at, created_at);
+        assert_eq!(logfile.sealed_at, Some(sealed_at));
+        assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
