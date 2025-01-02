@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::{Read, Seek, Write},
     path::Path,
+    rc::Rc,
 };
 
 use crate::murmur3::murmur3_128;
@@ -42,7 +43,6 @@ pub struct Logfile {
     pub id: String,
     pub file_length: u64,
     fd: File,
-    iter_offset: u64,
 }
 
 const MAGIC_NUMBER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
@@ -63,7 +63,6 @@ impl Logfile {
             sealed: false,
             id: id.to_string(),
             fd,
-            iter_offset: 8,
             file_length: 8,
         })
     }
@@ -121,7 +120,6 @@ impl Logfile {
             sealed,
             id,
             fd,
-            iter_offset: 8,
             file_length,
         })
     }
@@ -231,16 +229,11 @@ impl Logfile {
         Ok(())
     }
 
-    pub fn reset_iter(&mut self) {
-        self.iter_offset = 8;
-    }
-
-    pub fn iter_offset(&self) -> u64 {
-        self.iter_offset
-    }
-
-    pub fn set_iter_offset(&mut self, offset: u64) {
-        self.iter_offset = offset;
+    pub fn iter(&mut self) -> LogFileIterator<'_> {
+        LogFileIterator {
+            logfile: self,
+            offset: 8,
+        }
     }
 
     pub fn file_length(&self) -> u64 {
@@ -248,39 +241,53 @@ impl Logfile {
     }
 }
 
+pub struct LogFileIterator<'a> {
+    logfile: &'a mut Logfile,
+    offset: u64,
+}
+
+impl<'a> LogFileIterator<'a> {
+    pub fn reset_iter(&mut self) {
+        self.offset = 8;
+    }
+
+    pub fn iter_offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn set_iter_offset(&mut self, offset: u64) {
+        self.offset = offset;
+    }
+}
+
 /// Iterator for the log file records
 ///
 /// If an error occurs, the iterator will panic
-impl Iterator for Logfile {
+impl<'a> Iterator for LogFileIterator<'a> {
     type Item = Result<Vec<u8>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let offset = self.iter_offset;
+        let offset = self.offset;
 
         // If file is sealed, check if we've reached the footer
-        if self.sealed {
-            // Use tracked file length instead of querying filesystem
-            if offset >= self.file_length - 9 {
+        if self.logfile.sealed {
+            if offset >= self.logfile.file_length - 9 {
                 return None;
             }
         }
 
         // Try to read record at current offset
-        match self.read_record(&offset) {
+        match self.logfile.read_record(&offset) {
             Ok(record) => {
-                // Update offset to point to next record
-                // 20 = header size (16 bytes hash + 4 bytes length)
-                self.iter_offset += 20 + record.len() as u64;
+                self.offset += 20 + record.len() as u64;
                 Some(Ok(record))
             }
             Err(e) => {
-                // If we hit EOF, return None to end iteration
                 if let Some(err) = e.downcast_ref::<std::io::Error>() {
                     if err.kind() == std::io::ErrorKind::UnexpectedEof {
                         return None;
                     }
                 }
-                // For other errors, return the error
                 Some(Err(e))
             }
         }
@@ -481,131 +488,150 @@ mod tests {
                 .unwrap();
         }
 
-        for i in 0..100 {
-            let record = logfile.next().unwrap().unwrap();
-            assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
+        // First iteration
+        {
+            let mut iter = logfile.iter();
+            for i in 0..100 {
+                let record = iter.next().unwrap().unwrap();
+                assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
+            }
+            assert!(iter.next().is_none());
         }
 
-        // Reset the iterator and verify that we can read the same records again
-        logfile.reset_iter();
-        for i in 0..100 {
-            let record = logfile.next().unwrap().unwrap();
-            assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
+        // Second iteration - verify we can create a new iterator and read again
+        {
+            let mut iter = logfile.iter();
+            for i in 0..100 {
+                let record = iter.next().unwrap().unwrap();
+                assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
+            }
+            assert!(iter.next().is_none());
         }
 
-        // Verify that we've reached the end of the file
-        assert!(logfile.next().is_none());
+        #[test]
+        fn test_write_magic_number_without_sealing_escape() {
+            let path = PathBuf::from("/tmp/08.log");
+            let fd = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
 
-        // Clean up the test file
-        std::fs::remove_file(&path).unwrap();
-    }
+            let mut logfile = Logfile::new("08", fd).unwrap();
+            let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
 
-    #[test]
-    fn test_write_magic_number_without_sealing_escape() {
-        let path = PathBuf::from("/tmp/08.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
+            let mut logfile = Logfile::from_file(&path).unwrap();
+            assert_eq!(logfile.id, "08");
+            assert!(!logfile.sealed);
+            assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
 
-        let mut logfile = Logfile::new("08", fd).unwrap();
-        let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
+            // Clean up the test file
+            std::fs::remove_file(&path).unwrap();
+        }
 
-        let mut logfile = Logfile::from_file(&path).unwrap();
-        assert_eq!(logfile.id, "08");
-        assert!(!logfile.sealed);
-        assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
+        #[test]
+        fn test_write_magic_number_sealing_escape() {
+            let path = PathBuf::from("/tmp/09.log");
+            let fd = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
 
-        // Clean up the test file
-        std::fs::remove_file(&path).unwrap();
-    }
+            let mut logfile = Logfile::new("0   9", fd).unwrap();
+            let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
+            logfile.seal().unwrap();
 
-    #[test]
-    fn test_write_magic_number_sealing_escape() {
-        let path = PathBuf::from("/tmp/09.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
+            let mut logfile = Logfile::from_file(&path).unwrap();
+            assert_eq!(logfile.id, "09");
+            assert!(logfile.sealed);
+            assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
 
-        let mut logfile = Logfile::new("0   9", fd).unwrap();
-        let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
-        logfile.seal().unwrap();
+            // Clean up the test file
+            std::fs::remove_file(&path).unwrap();
+        }
 
-        let mut logfile = Logfile::from_file(&path).unwrap();
-        assert_eq!(logfile.id, "09");
-        assert!(logfile.sealed);
-        assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
+        #[test]
+        fn test_write_magic_number_without_sealing_escape_iterator() {
+            let path = PathBuf::from("/tmp/10.log");
+            let fd = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
 
-        // Clean up the test file
-        std::fs::remove_file(&path).unwrap();
-    }
+            let mut logfile = Logfile::new("10", fd).unwrap();
+            logfile.write_record(&MAGIC_NUMBER).unwrap();
 
-    #[test]
-    fn test_write_magic_number_without_sealing_escape_iterator() {
-        let path = PathBuf::from("/tmp/10.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
+            let mut iter = logfile.iter();
+            let record = iter.next().unwrap().unwrap();
+            assert_eq!(record, MAGIC_NUMBER);
+            assert!(iter.next().is_none());
 
-        let mut logfile = Logfile::new("10", fd).unwrap();
-        logfile.write_record(&MAGIC_NUMBER).unwrap();
+            let mut logfile = Logfile::from_file(&path).unwrap();
+            assert_eq!(logfile.id, "10");
+            assert!(!logfile.sealed);
 
-        let record = logfile.next().unwrap().unwrap();
-        assert_eq!(record, MAGIC_NUMBER);
+            let mut iter = logfile.iter();
+            let record = iter.next().unwrap().unwrap();
+            assert_eq!(record, MAGIC_NUMBER);
+            assert!(iter.next().is_none());
 
-        let mut logfile = Logfile::from_file(&path).unwrap();
-        assert_eq!(logfile.id, "10");
-        assert!(!logfile.sealed);
+            // Clean up the test file
+            std::fs::remove_file(&path).unwrap();
+        }
 
-        let record = logfile.next().unwrap().unwrap();
-        assert_eq!(record, MAGIC_NUMBER);
+        #[test]
+        fn test_write_magic_number_with_sealing_escape_iterator() {
+            let path = PathBuf::from("/tmp/11.log");
+            let fd = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
 
-        // Clean up the test file
-        std::fs::remove_file(&path).unwrap();
-    }
+            let mut logfile = Logfile::new("11", fd).unwrap();
+            logfile.write_record(&MAGIC_NUMBER).unwrap();
 
-    #[test]
-    fn test_write_magic_number_with_sealing_escape_iterator() {
-        let path = PathBuf::from("/tmp/11.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
+            // First iteration
+            {
+                let mut iter = logfile.iter();
+                let record = iter.next().unwrap().unwrap();
+                assert_eq!(record, MAGIC_NUMBER);
+                assert!(iter.next().is_none());
+            }
 
-        let mut logfile = Logfile::new("11", fd).unwrap();
-        let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
+            // Seal the file
+            logfile.seal().unwrap();
 
-        let record = logfile.next().unwrap().unwrap();
-        assert_eq!(record, MAGIC_NUMBER);
+            // Second iteration after sealing
+            {
+                let mut iter = logfile.iter();
+                let record = iter.next().unwrap().unwrap();
+                assert_eq!(record, MAGIC_NUMBER);
+                assert!(iter.next().is_none());
+            }
 
-        logfile.seal().unwrap();
-        logfile.set_iter_offset(offset);
+            // Verify with a fresh file handle
+            let mut logfile = Logfile::from_file(&path).unwrap();
+            assert_eq!(logfile.id, "11");
+            assert!(logfile.sealed);
 
-        let record = logfile.next().unwrap().unwrap();
-        assert_eq!(record, MAGIC_NUMBER);
+            let mut iter = logfile.iter();
+            let record = iter.next().unwrap().unwrap();
+            assert_eq!(record, MAGIC_NUMBER);
+            assert!(iter.next().is_none());
 
-        let mut logfile = Logfile::from_file(&path).unwrap();
-        assert_eq!(logfile.id, "11");
-        assert!(logfile.sealed);
-
-        let record = logfile.next().unwrap().unwrap();
-        assert_eq!(record, MAGIC_NUMBER);
-
-        // Clean up the test file
-        std::fs::remove_file(&path).unwrap();
+            // Clean up the test file
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 }

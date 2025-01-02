@@ -1,3 +1,4 @@
+pub mod fileio;
 pub mod logfile;
 pub mod murmur3;
 pub mod record;
