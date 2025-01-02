@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use anyhow::Context;
 
@@ -16,7 +16,7 @@ pub struct WriteAhead {
 
 #[derive(Debug)]
 pub struct WriteAheadOptions {
-    pub log_dir: String,
+    pub log_dir: PathBuf,
     pub max_log_size: usize,
     pub retention: RetentionOptions,
 }
@@ -24,7 +24,7 @@ pub struct WriteAheadOptions {
 impl Default for WriteAheadOptions {
     fn default() -> Self {
         Self {
-            log_dir: "./write_ahead".to_string(),
+            log_dir: PathBuf::from("./write_ahead"),
             max_log_size: 1024 * 1024 * 1024, // 1GB
             retention: RetentionOptions::default(),
         }
@@ -56,16 +56,10 @@ impl WriteAhead {
         for log_file in log_files {
             let log_file = log_file.context("Failed to get dir entry")?;
             let path = log_file.path();
-            let file_id = path
-                .file_name()
-                .context("Log file name is missing")?
-                .to_str()
-                .context("Log file name is not a valid UTF-8 string")?
-                .parse::<u64>()
-                .context("Log file name is not a valid u64")?;
+            let file_id = Logfile::file_id_from_path(&path)?;
 
-            let logfile = Logfile::new(file_id);
-            self.log_files.insert(file_id, logfile);
+            // let logfile = Logfile::new(file_id);
+            // self.log_files.insert(file_id, logfile);
         }
 
         Ok(())
