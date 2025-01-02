@@ -39,11 +39,11 @@ use crate::murmur3::murmur3_128;
 /// when 0xff is written to the file.
 #[derive(Debug)]
 pub struct Logfile {
-    sealed: bool,
-    id: u64,
+    pub sealed: bool,
+    pub id: u64,
+    pub file_length: u64,
     fd: File,
     iter_offset: u64,
-    file_length: u64,
 }
 
 const MAGIC_NUMBER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
