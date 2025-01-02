@@ -145,7 +145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_iterator() {
+    async fn test_stream() {
         let path = PathBuf::from("/tmp/07.log");
         let fd = OpenOptions::new()
             .read(true)
@@ -156,7 +156,7 @@ mod tests {
             .unwrap();
         let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_iterator(f, path).await;
+        logfile::tests::test_stream(f, path).await;
     }
 
     #[tokio::test]

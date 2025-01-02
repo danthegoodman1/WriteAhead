@@ -402,7 +402,7 @@ pub mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    pub async fn test_iterator<F: FileIO>(f: F, path: PathBuf) {
+    pub async fn test_stream<F: FileIO>(f: F, path: PathBuf) {
         let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
             .await
             .unwrap();
