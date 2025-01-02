@@ -6,11 +6,13 @@ pub struct SimpleFile {
     pub fd: File,
 }
 
-impl FileIO for SimpleFile {
-    fn new(fd: std::fs::File) -> anyhow::Result<Self> {
+impl SimpleFile {
+    pub fn new(fd: std::fs::File) -> anyhow::Result<Self> {
         Ok(SimpleFile { fd })
     }
+}
 
+impl FileIO for SimpleFile {
     fn open(path: &std::path::Path) -> anyhow::Result<Self> {
         let fd = File::open(path)?;
         Self::new(fd)
