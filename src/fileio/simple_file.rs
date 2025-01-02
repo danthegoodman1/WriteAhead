@@ -54,8 +54,8 @@ mod tests {
 
     use std::{fs::OpenOptions, path::PathBuf};
 
-    #[test]
-    fn test_write_without_sealing() {
+    #[tokio::test]
+    async fn test_write_without_sealing() {
         let path = PathBuf::from("/tmp/01.log");
         let fd = OpenOptions::new()
             .read(true)
@@ -66,11 +66,11 @@ mod tests {
             .unwrap();
         let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_write_without_sealing(f, path);
+        logfile::tests::test_write_without_sealing(f, path).await;
     }
 
-    #[test]
-    fn test_write_with_sealing() {
+    #[tokio::test]
+    async fn test_write_with_sealing() {
         let path = PathBuf::from("/tmp/02.log");
         let fd = OpenOptions::new()
             .read(true)
@@ -81,11 +81,11 @@ mod tests {
             .unwrap();
         let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_write_with_sealing(f, path);
+        logfile::tests::test_write_with_sealing(f, path).await;
     }
 
-    #[test]
-    fn test_corrupted_record() {
+    #[tokio::test]
+    async fn test_corrupted_record() {
         let path = PathBuf::from("/tmp/03.log");
         let fd = OpenOptions::new()
             .read(true)
@@ -96,11 +96,11 @@ mod tests {
             .unwrap();
         let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_corrupted_record(f, path);
+        logfile::tests::test_corrupted_record(f, path).await;
     }
 
-    #[test]
-    fn test_corrupted_record_sealed() {
+    #[tokio::test]
+    async fn test_corrupted_record_sealed() {
         let path = PathBuf::from("/tmp/04.log");
         let fd = OpenOptions::new()
             .read(true)
@@ -111,11 +111,11 @@ mod tests {
             .unwrap();
         let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_corrupted_record_sealed(f, path);
+        logfile::tests::test_corrupted_record_sealed(f, path).await;
     }
 
-    #[test]
-    fn test_corrupted_file_header() {
+    #[tokio::test]
+    async fn test_corrupted_file_header() {
         let path = PathBuf::from("/tmp/05.log");
         let fd = OpenOptions::new()
             .read(true)
@@ -126,11 +126,11 @@ mod tests {
             .unwrap();
         let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_corrupted_file_header(f, path);
+        logfile::tests::test_corrupted_file_header(f, path).await;
     }
 
-    #[test]
-    fn test_100_records() {
+    #[tokio::test]
+    async fn test_100_records() {
         let path = PathBuf::from("/tmp/06.log");
         let fd = OpenOptions::new()
             .read(true)
@@ -141,11 +141,11 @@ mod tests {
             .unwrap();
         let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_100_records(f, path);
+        logfile::tests::test_100_records(f, path).await;
     }
 
-    #[test]
-    fn test_iterator() {
+    #[tokio::test]
+    async fn test_iterator() {
         let path = PathBuf::from("/tmp/07.log");
         let fd = OpenOptions::new()
             .read(true)
@@ -156,11 +156,11 @@ mod tests {
             .unwrap();
         let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_iterator(f, path);
+        logfile::tests::test_iterator(f, path).await;
     }
 
-    #[test]
-    fn test_write_magic_number_without_sealing_escape() {
+    #[tokio::test]
+    async fn test_write_magic_number_without_sealing_escape() {
         let path = PathBuf::from("/tmp/08.log");
         let fd = OpenOptions::new()
             .read(true)
@@ -171,11 +171,11 @@ mod tests {
             .unwrap();
         let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_write_magic_number_without_sealing_escape(f, path);
+        logfile::tests::test_write_magic_number_without_sealing_escape(f, path).await;
     }
 
-    #[test]
-    fn test_write_magic_number_sealing_escape() {
+    #[tokio::test]
+    async fn test_write_magic_number_sealing_escape() {
         let path = PathBuf::from("/tmp/09.log");
         let fd = OpenOptions::new()
             .read(true)
@@ -186,11 +186,11 @@ mod tests {
             .unwrap();
         let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_write_magic_number_sealing_escape(f, path);
+        logfile::tests::test_write_magic_number_sealing_escape(f, path).await;
     }
 
-    #[test]
-    fn test_write_magic_number_without_sealing_escape_iterator() {
+    #[tokio::test]
+    async fn test_write_magic_number_without_sealing_escape_iterator() {
         let path = PathBuf::from("/tmp/10.log");
         let fd = OpenOptions::new()
             .read(true)
@@ -201,11 +201,11 @@ mod tests {
             .unwrap();
         let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_write_magic_number_without_sealing_escape_iterator(f, path);
+        logfile::tests::test_write_magic_number_without_sealing_escape_iterator(f, path).await;
     }
 
-    #[test]
-    fn test_write_magic_number_with_sealing_escape_iterator() {
+    #[tokio::test]
+    async fn test_write_magic_number_with_sealing_escape_iterator() {
         let path = PathBuf::from("/tmp/11.log");
         let fd = OpenOptions::new()
             .read(true)
@@ -216,6 +216,6 @@ mod tests {
             .unwrap();
         let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_write_magic_number_with_sealing_escape_iterator(f, path);
+        logfile::tests::test_write_magic_number_with_sealing_escape_iterator(f, path).await;
     }
 }
