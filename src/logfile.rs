@@ -17,7 +17,7 @@ use crate::murmur3::murmur3_128;
 /// ## High level format
 ///
 /// ```text
-/// | 8 bytes (u64) - magic number | 8 bytes (u64) - created_at nanoseconds | N bytes - records | 8 bytes (u64) - sealed_at nanoseconds | 8 bytes (u64) - magic number |
+/// | 8 bytes (u64) - magic number | N bytes - records | 1 byte - sealed flag | 8 bytes (u64) - magic number |
 /// ```
 ///
 /// ## Record format
@@ -39,8 +39,7 @@ use crate::murmur3::murmur3_128;
 /// when 0xff is written to the file.
 #[derive(Debug)]
 pub struct Logfile {
-    created_at: SystemTime,
-    sealed_at: Option<SystemTime>,
+    sealed: bool,
     id: u64,
     fd: File,
     iter_offset: u64,
@@ -51,30 +50,22 @@ const MAGIC_NUMBER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
 
 impl Logfile {
     /// Creates a new logfile, deleting any existing file at the given path.
+    ///
+    /// The id MUST be unique per file!
     pub fn new(id: u64, fd: File) -> Result<Self> {
-        let created_at = SystemTime::now();
-
-        let mut header = [0u8; 16];
+        let mut header = [0u8; 8];
         header[0..8].copy_from_slice(&MAGIC_NUMBER);
-        header[8..16].copy_from_slice(
-            &created_at
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-                .to_le_bytes()[0..8],
-        );
 
         let mut fd = fd;
         fd.write_all(&header).context("Failed to write header")?;
         fd.sync_all().context("Failed to sync header")?;
 
         Ok(Self {
-            created_at,
-            sealed_at: None,
+            sealed: false,
             id,
             fd,
-            iter_offset: 16,
-            file_length: 16,
+            iter_offset: 8,
+            file_length: 8,
         })
     }
 
@@ -102,50 +93,34 @@ impl Logfile {
         let file_length = fd.metadata()?.len();
         let id = Self::file_id_from_path(path)?;
 
-        // Read the first 16 bytes of the file
-        let mut buffer: [u8; 16] = [0; 16];
+        // Read the first 8 bytes of the file
+        let mut buffer = [0u8; 8];
         fd.read_exact(&mut buffer)
-            .context("Failed to read first 16 bytes of logfile")?;
+            .context("Failed to read first 8 bytes of logfile")?;
 
         // Check if the first 8 bytes are the magic number
         if buffer[0..8] != MAGIC_NUMBER {
             return Err(anyhow::anyhow!("Invalid start magic number"));
         }
 
-        // Read the next 8 bytes as the created_at timestamp
-        let created_at = UNIX_EPOCH
-            + Duration::from_nanos(u64::from_le_bytes(
-                buffer[8..16]
-                    .try_into()
-                    .context("Failed to read created_at timestamp")?,
-            ));
-
-        // Try to read the last 16 bytes, but don't fail if they don't exist
-        let mut sealed_at = None;
-        let mut buffer: [u8; 16] = [0; 16];
+        // Try to read the last 9 bytes (1 for sealed flag + 8 for magic number)
+        let mut sealed = false;
+        let mut buffer = [0u8; 9];
         if let Ok(metadata) = fd.metadata() {
-            if metadata.len() >= 32 {
-                // Only try to read footer if file is long enough
-                fd.seek(std::io::SeekFrom::End(-16))?;
-                if fd.read_exact(&mut buffer).is_ok() && buffer[0..8] == MAGIC_NUMBER {
-                    sealed_at = Some(
-                        UNIX_EPOCH
-                            + Duration::from_nanos(u64::from_le_bytes(
-                                buffer[8..16]
-                                    .try_into()
-                                    .context("Failed to read sealed_at timestamp")?,
-                            )),
-                    );
+            if metadata.len() >= 17 {
+                // 8 header + at least 9 footer
+                fd.seek(std::io::SeekFrom::End(-9))?;
+                if fd.read_exact(&mut buffer).is_ok() && buffer[1..9] == MAGIC_NUMBER {
+                    sealed = buffer[0] == 1;
                 }
             }
         }
 
         Ok(Self {
-            created_at,
-            sealed_at,
+            sealed,
             id,
             fd,
-            iter_offset: 16,
+            iter_offset: 8,
             file_length,
         })
     }
@@ -236,35 +211,27 @@ impl Logfile {
     }
 
     pub fn seal(&mut self) -> Result<()> {
-        if let Some(_) = self.sealed_at {
+        if self.sealed {
             return Err(anyhow::anyhow!("Logfile already sealed"));
         }
 
-        self.sealed_at = Some(SystemTime::now());
+        self.sealed = true;
 
-        let mut footer = [0u8; 16];
-        footer[0..8].copy_from_slice(&MAGIC_NUMBER);
-        footer[8..16].copy_from_slice(
-            &self
-                .sealed_at
-                .unwrap()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-                .to_le_bytes()[0..8],
-        );
+        let mut footer = [0u8; 9];
+        footer[0] = 1; // sealed flag
+        footer[1..9].copy_from_slice(&MAGIC_NUMBER);
 
         self.fd
             .write_all(&footer)
             .context("Failed to write footer")?;
         self.fd.sync_all().context("Failed to sync footer")?;
 
-        self.file_length += 16;
+        self.file_length += 9;
         Ok(())
     }
 
     pub fn reset_iter(&mut self) {
-        self.iter_offset = 16;
+        self.iter_offset = 8;
     }
 
     pub fn iter_offset(&self) -> u64 {
@@ -290,9 +257,9 @@ impl Iterator for Logfile {
         let offset = self.iter_offset;
 
         // If file is sealed, check if we've reached the footer
-        if self.sealed_at.is_some() {
+        if self.sealed {
             // Use tracked file length instead of querying filesystem
-            if offset >= self.file_length - 16 {
+            if offset >= self.file_length - 9 {
                 return None;
             }
         }
@@ -336,12 +303,10 @@ mod tests {
 
         let mut logfile = Logfile::new(1, fd).unwrap();
         let offset = logfile.write_record(b"hello").unwrap();
-        let created_at = logfile.created_at;
 
         let mut logfile = Logfile::from_file(&path).unwrap();
         assert_eq!(logfile.id, 1);
-        assert_eq!(logfile.created_at, created_at);
-        assert_eq!(logfile.sealed_at, None);
+        assert!(!logfile.sealed);
         assert_eq!(logfile.read_record(&offset).unwrap(), b"hello");
 
         // Clean up the test file
@@ -362,13 +327,10 @@ mod tests {
         let mut logfile = Logfile::new(2, fd).unwrap();
         let offset = logfile.write_record(b"hello").unwrap();
         logfile.seal().unwrap();
-        let created_at = logfile.created_at;
-        let sealed_at = logfile.sealed_at.unwrap();
 
         let mut logfile = Logfile::from_file(&path).unwrap();
         assert_eq!(logfile.id, 2);
-        assert_eq!(logfile.created_at, created_at);
-        assert_eq!(logfile.sealed_at, Some(sealed_at));
+        assert!(logfile.sealed);
         assert_eq!(logfile.read_record(&offset).unwrap(), b"hello");
 
         // Clean up the test file
@@ -548,12 +510,10 @@ mod tests {
 
         let mut logfile = Logfile::new(8, fd).unwrap();
         let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
-        let created_at = logfile.created_at;
 
         let mut logfile = Logfile::from_file(&path).unwrap();
         assert_eq!(logfile.id, 8);
-        assert_eq!(logfile.created_at, created_at);
-        assert_eq!(logfile.sealed_at, None);
+        assert!(!logfile.sealed);
         assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
 
         // Clean up the test file
@@ -573,14 +533,11 @@ mod tests {
 
         let mut logfile = Logfile::new(9, fd).unwrap();
         let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
-        let created_at = logfile.created_at;
         logfile.seal().unwrap();
-        let sealed_at = logfile.sealed_at.unwrap();
 
         let mut logfile = Logfile::from_file(&path).unwrap();
         assert_eq!(logfile.id, 9);
-        assert_eq!(logfile.created_at, created_at);
-        assert_eq!(logfile.sealed_at, Some(sealed_at));
+        assert!(logfile.sealed);
         assert_eq!(logfile.read_record(&offset).unwrap(), &MAGIC_NUMBER);
 
         // Clean up the test file
@@ -599,16 +556,14 @@ mod tests {
             .unwrap();
 
         let mut logfile = Logfile::new(10, fd).unwrap();
-        let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
-        let created_at = logfile.created_at;
+        logfile.write_record(&MAGIC_NUMBER).unwrap();
 
         let record = logfile.next().unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
 
         let mut logfile = Logfile::from_file(&path).unwrap();
         assert_eq!(logfile.id, 10);
-        assert_eq!(logfile.created_at, created_at);
-        assert_eq!(logfile.sealed_at, None);
+        assert!(!logfile.sealed);
 
         let record = logfile.next().unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
@@ -619,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_write_magic_number_with_sealing_escape_iterator() {
-        let path = PathBuf::from("/tmp/10.log");
+        let path = PathBuf::from("/tmp/11.log");
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -628,25 +583,21 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        let mut logfile = Logfile::new(10, fd).unwrap();
+        let mut logfile = Logfile::new(11, fd).unwrap();
         let offset = logfile.write_record(&MAGIC_NUMBER).unwrap();
-        let created_at = logfile.created_at;
 
         let record = logfile.next().unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
 
         logfile.seal().unwrap();
-        let sealed_at = logfile.sealed_at.unwrap();
-
         logfile.set_iter_offset(offset);
 
         let record = logfile.next().unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
 
         let mut logfile = Logfile::from_file(&path).unwrap();
-        assert_eq!(logfile.id, 10);
-        assert_eq!(logfile.created_at, created_at);
-        assert_eq!(logfile.sealed_at, Some(sealed_at));
+        assert_eq!(logfile.id, 11);
+        assert!(logfile.sealed);
 
         let record = logfile.next().unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
