@@ -17,7 +17,7 @@ use crate::murmur3::murmur3_128;
 /// ## High level format
 ///
 /// ```text
-/// | 8 bytes (u64) - magic number | 8 bytes (u64) - created_at nanoseconds | N bytes - records | 8 bytes (u64) - sealed_at | 2 bytes (u16) - version number | 8 bytes (u64) - magic number |
+/// | 8 bytes (u64) - magic number | 8 bytes (u64) - created_at nanoseconds | N bytes - records | 8 bytes (u64) - sealed_at nanoseconds | 8 bytes (u64) - magic number |
 /// ```
 ///
 /// ## Record format
