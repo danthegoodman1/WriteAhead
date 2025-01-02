@@ -37,15 +37,22 @@ macro_rules! create_aligned_page {
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
+    use crate::fileio::FileIO;
+
     use super::AlignedBuffer;
     use io_uring::{opcode, IoUring};
+    use once_cell::sync::OnceCell;
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
+    use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
     // Convenience 4k (4096)
     create_aligned_page!(Page4K, 4096);
+
+    /// Gloal ring for use with [crate::fileio::FileIO::open]
+    pub static GLOBAL_RING: OnceCell<Arc<Mutex<IoUring>>> = OnceCell::new();
 
     pub struct IOUringDevice<const BLOCK_SIZE: usize> {
         fd: Option<std::fs::File>,
@@ -53,7 +60,10 @@ mod linux_impl {
     }
 
     impl<const BLOCK_SIZE: usize> IOUringDevice<BLOCK_SIZE> {
-        pub fn new(device_path: &str, ring: Arc<Mutex<IoUring>>) -> std::io::Result<Self> {
+        pub fn new(
+            device_path: &Path,
+            ring: Arc<tokio::sync::Mutex<IoUring>>,
+        ) -> std::io::Result<Self> {
             let fd = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -176,10 +186,31 @@ mod linux_impl {
             }
         }
     }
-}
 
-#[cfg(target_os = "linux")]
-pub use linux_impl::*;
+    use anyhow::Result;
+
+    impl<const BLOCK_SIZE: usize> FileIO for IOUringDevice<BLOCK_SIZE> {
+        async fn open(path: &Path) -> Result<Self> {
+            // Check if the once cell is already initialized
+            match GLOBAL_RING.get() {
+                Some(ring) => Ok(Self::new(path, ring.clone())?),
+                None => Err(anyhow::anyhow!("Global ring not initialized, initialize")),
+            }
+        }
+
+        async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
+            todo!()
+        }
+
+        async fn write(&self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+            todo!()
+        }
+
+        async fn file_length(&self) -> u64 {
+            todo!()
+        }
+    }
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
@@ -188,7 +219,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use std::sync::Arc;
+    use std::{path::Path, sync::Arc};
 
     const BLOCK_SIZE: usize = 4096;
 
@@ -202,7 +233,7 @@ mod tests {
         let temp_path = temp_file.path().to_str().unwrap();
 
         // Create a new device instance
-        let mut device = IOUringDevice::<BLOCK_SIZE>::new(temp_path, ring)?;
+        let mut device = IOUringDevice::<BLOCK_SIZE>::new(&Path::new(temp_path), ring)?;
 
         // Test data
         let mut write_data = [0u8; BLOCK_SIZE];
@@ -255,7 +286,7 @@ mod tests {
         let temp_path = temp_file.path().to_str().unwrap();
 
         // Create a new device instance
-        let mut device = IOUringDevice::<BLOCK_SIZE>::new(temp_path, ring)?;
+        let mut device = IOUringDevice::<BLOCK_SIZE>::new(&Path::new(temp_path), ring)?;
 
         // Test data
         let mut write_data = [0u8; BLOCK_SIZE];

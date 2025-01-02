@@ -543,6 +543,7 @@ dependencies = [
  "futures",
  "io-uring",
  "libc",
+ "once_cell",
  "tempfile",
  "thiserror",
  "tokio",
