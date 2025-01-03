@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use futures::Stream;
 use std::path::Path;
 use std::pin::Pin;
@@ -45,6 +45,24 @@ pub struct Logfile<F: FileIO> {
 
 const MAGIC_NUMBER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
 
+#[derive(Debug, thiserror::Error)]
+pub enum LogfileError {
+    #[error("Logfile is corrupted")]
+    Corrupted,
+
+    #[error("Partial write detected, you should trim this file, or recover from a replica")]
+    PartialWrite,
+
+    #[error("Cannot write to sealed logfile")]
+    WriteToSealed,
+
+    #[error("Invalid start magic number")]
+    InvalidMagicNumber,
+
+    #[error("Record is too large, must be less than {}", u32::MAX)]
+    RecordTooLarge,
+}
+
 impl<F: FileIO> Logfile<F> {
     /// Creates a new logfile, deleting any existing file at the given path.
     ///
@@ -80,7 +98,7 @@ impl<F: FileIO> Logfile<F> {
             .collect::<String>();
 
         if numeric_part.is_empty() {
-            return Err(anyhow::anyhow!("Log file name does not contain a valid ID"));
+            return Err(anyhow!(LogfileError::InvalidMagicNumber));
         }
 
         Ok(numeric_part)
@@ -100,7 +118,7 @@ impl<F: FileIO> Logfile<F> {
 
         // Check if the first 8 bytes are the magic number
         if buffer[0..8] != MAGIC_NUMBER {
-            return Err(anyhow::anyhow!("Invalid start magic number"));
+            return Err(anyhow!(LogfileError::InvalidMagicNumber));
         }
 
         // Try to read the last 9 bytes (1 for sealed flag + 8 for magic number)
@@ -123,7 +141,11 @@ impl<F: FileIO> Logfile<F> {
 
     pub async fn write_record(&mut self, record: &[u8]) -> Result<u64> {
         if self.sealed {
-            return Err(anyhow::anyhow!("Cannot write to sealed logfile"));
+            return Err(anyhow!(LogfileError::WriteToSealed));
+        }
+
+        if record.len() > u32::MAX as usize {
+            return Err(anyhow!(LogfileError::RecordTooLarge));
         }
 
         let offset = self.file_length;
@@ -140,10 +162,7 @@ impl<F: FileIO> Logfile<F> {
 
         // Verify the record is no longer than max u32
         if record.len() > u32::MAX as usize {
-            return Err(anyhow::anyhow!(
-                "Record is too large, must be less than {}",
-                u32::MAX
-            ));
+            return Err(anyhow!(LogfileError::RecordTooLarge));
         }
 
         // Generate a murmur3 hash of the record
@@ -191,9 +210,7 @@ impl<F: FileIO> Logfile<F> {
 
         // Verify that the file is long enough to contain the record
         if *offset + 20 + length as u64 > self.file_length {
-            return Err(anyhow::anyhow!(
-                "Record is too large, partial write detected, you should trim this file, or recover from a replica"
-            ));
+            return Err(anyhow!(LogfileError::PartialWrite));
         }
 
         // Read the actual record data
@@ -202,9 +219,7 @@ impl<F: FileIO> Logfile<F> {
         // Verify the hash
         let (computed_hash1, computed_hash2) = murmur3_128(&record);
         if computed_hash1 != hash1 || computed_hash2 != hash2 {
-            return Err(anyhow::anyhow!(
-                "Invalid hash for record, this file is corrupted"
-            ));
+            return Err(anyhow!(LogfileError::Corrupted));
         }
 
         // Replace 0x00 0xff with 0xff, scanning from end to start
@@ -222,7 +237,7 @@ impl<F: FileIO> Logfile<F> {
 
     pub async fn seal(&mut self) -> Result<()> {
         if self.sealed {
-            return Err(anyhow::anyhow!("Logfile already sealed"));
+            return Err(anyhow!(LogfileError::WriteToSealed));
         }
 
         self.sealed = true;
@@ -331,6 +346,20 @@ pub mod tests {
         let offset = logfile.write_record(b"hello").await.unwrap();
         logfile.seal().await.unwrap();
 
+        // Try to write after sealing
+        let result = logfile.write_record(b"world").await;
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<LogfileError>(),
+            Some(LogfileError::WriteToSealed)
+        ));
+
+        // Try to seal again
+        let result = logfile.seal().await;
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<LogfileError>(),
+            Some(LogfileError::WriteToSealed)
+        ));
+
         let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "02");
         assert!(logfile.sealed);
@@ -346,11 +375,14 @@ pub mod tests {
             .unwrap();
         let offset = logfile.write_record(b"hello").await.unwrap();
 
-        // Corrupt the record by modifying a single byte in the middle
-        logfile.fd.write(offset + 22, &[b'x']).await.unwrap(); // Replace one byte with 'x'
+        // Corrupt the record
+        logfile.fd.write(offset + 22, &[b'x']).await.unwrap();
 
-        // Attempting to read the corrupted record should fail due to hash mismatch
-        assert!(logfile.read_record(&offset).await.is_err());
+        let result = logfile.read_record(&offset).await;
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<LogfileError>(),
+            Some(LogfileError::Corrupted)
+        ));
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
@@ -374,18 +406,17 @@ pub mod tests {
     }
 
     pub async fn test_corrupted_file_header<F: FileIO>(f: F, path: PathBuf) {
-        // Write an invalid magic number
         let invalid_header = [0x00; 16];
         f.write(0, &invalid_header).await.unwrap();
 
-        // Attempting to open the file with invalid header should fail
-        let result: Result<Logfile<F>> = Logfile::from_file(&path).await;
+        let result = Logfile::<F>::from_file(&path).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Invalid start magic number"));
+
+        if let Err(e) = result {
+            assert!(e.downcast_ref::<LogfileError>().is_some());
+        } else {
+            panic!("Expected an error");
+        }
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
@@ -552,6 +583,42 @@ pub mod tests {
         let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
         assert!(iter.next().await.is_none());
+
+        // Clean up the test file
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    pub async fn test_partial_write<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
+        let offset = logfile.write_record(b"hello").await.unwrap();
+
+        // Simulate a partial write by truncating the file
+        logfile.file_length -= 1;
+
+        let result = logfile.read_record(&offset).await;
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<LogfileError>(),
+            Some(LogfileError::PartialWrite)
+        ));
+
+        // ... cleanup ...
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    pub async fn test_write_too_large_record<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
+        let result = logfile
+            .write_record(&vec![0; (u32::MAX as usize) + 1])
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<LogfileError>(),
+            Some(LogfileError::RecordTooLarge)
+        ));
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();

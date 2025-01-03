@@ -48,7 +48,8 @@ impl FileIO for SimpleFile {
 
 #[cfg(test)]
 mod tests {
-    use crate::logfile::{self, Logfile};
+
+    use crate::logfile;
 
     use super::*;
 
@@ -217,5 +218,20 @@ mod tests {
         let f = SimpleFile::new(fd).unwrap();
 
         logfile::tests::test_write_magic_number_with_sealing_escape_iterator(f, path).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_too_large_record() {
+        let path = PathBuf::from("/tmp/12.log");
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let f = SimpleFile::new(fd).unwrap();
+
+        logfile::tests::test_write_too_large_record(f, path).await;
     }
 }
