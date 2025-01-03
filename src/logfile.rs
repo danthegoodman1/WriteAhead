@@ -168,12 +168,35 @@ impl<F: FileIO> Logfile<F> {
 
     pub async fn read_record(&mut self, offset: &u64) -> Result<Vec<u8>> {
         // Read the hash and length (20 bytes total)
-        let header = self.fd.read(*offset, 20).await?;
+        let header = self
+            .fd
+            .read(*offset, 20)
+            .await
+            .context("Failed to read record header, is the file corrupted?")?;
 
         // Parse the header
-        let hash1 = i64::from_le_bytes(header[0..8].try_into().unwrap());
-        let hash2 = i64::from_le_bytes(header[8..16].try_into().unwrap());
-        let length = u32::from_le_bytes(header[16..20].try_into().unwrap());
+        let hash1 = i64::from_le_bytes(
+            header[0..8]
+                .try_into()
+                .context("Failed to parse record hash1")?,
+        );
+        let hash2 = i64::from_le_bytes(
+            header[8..16]
+                .try_into()
+                .context("Failed to parse record hash2")?,
+        );
+        let length = u32::from_le_bytes(
+            header[16..20]
+                .try_into()
+                .context("Failed to parse record length")?,
+        );
+
+        // Verify that the file is long enough to contain the record
+        if *offset + 20 + length as u64 > self.file_length {
+            return Err(anyhow::anyhow!(
+                "Record is too large, partial write detected, you should trim this file, or recover from a replica"
+            ));
+        }
 
         // Read the actual record data
         let mut record = self.fd.read(*offset + 20, length as u64).await?;
