@@ -4,6 +4,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
+use tracing::{debug, trace};
 
 use crate::{fileio::FileIO, murmur3::murmur3_128};
 
@@ -41,7 +42,7 @@ pub struct Logfile<F: FileIO> {
     pub sealed: bool,
     pub id: String,
     pub file_length: u64,
-    fd: F,
+    fio: F,
 }
 
 const MAGIC_NUMBER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
@@ -60,6 +61,9 @@ pub enum LogfileError {
     #[error("Invalid start magic number")]
     InvalidMagicNumber,
 
+    #[error("Invalid offset {0}")]
+    InvalidOffset(u64),
+
     #[error("Record is too large, must be less than {}", u32::MAX)]
     RecordTooLarge,
 }
@@ -68,19 +72,19 @@ impl<F: FileIO> Logfile<F> {
     /// Creates a new logfile, deleting any existing file at the given path.
     ///
     /// The id MUST be unique per file!
-    pub async fn new(id: &str, fd: F) -> Result<Self> {
+    pub async fn new(id: &str, fio: F) -> Result<Self> {
         let mut header = [0u8; 8];
         header[0..8].copy_from_slice(&MAGIC_NUMBER);
 
-        let mut fd = fd;
-        fd.write(0, &header)
+        let mut fio = fio;
+        fio.write(0, &header)
             .await
             .context("Failed to write header")?;
 
         Ok(Self {
             sealed: false,
             id: id.to_string(),
-            fd,
+            fio,
             file_length: 8,
         })
     }
@@ -136,7 +140,7 @@ impl<F: FileIO> Logfile<F> {
         Ok(Self {
             sealed,
             id,
-            fd,
+            fio: fd,
             file_length,
         })
     }
@@ -178,7 +182,7 @@ impl<F: FileIO> Logfile<F> {
         buf.extend_from_slice(&length.to_le_bytes());
         buf.extend_from_slice(&record);
 
-        self.fd
+        self.fio
             .write(offset, &buf)
             .await
             .context("Failed to write record")?;
@@ -188,8 +192,18 @@ impl<F: FileIO> Logfile<F> {
     }
 
     pub async fn read_record(&self, offset: &u64) -> Result<Vec<u8>> {
+        // Verify that the header is not trying to be read
+        if *offset < 8 || (self.sealed && *offset >= self.file_length - 9) {
+            return Err(anyhow!(LogfileError::InvalidOffset(*offset)));
+        }
+        trace!(
+            "Reading record at offset {} sealed: {}",
+            *offset,
+            self.sealed
+        );
+
         // Read the hash and length (20 bytes total)
-        let header = self.fd.read(*offset, 20).await.context(
+        let header = self.fio.read(*offset, 20).await.context(
             "Failed to read record header, is the file corrupted, or a partial write occurred?",
         )?;
 
@@ -216,7 +230,7 @@ impl<F: FileIO> Logfile<F> {
         }
 
         // Read the actual record data
-        let mut record = self.fd.read(*offset + 20, length as u64).await?;
+        let mut record = self.fio.read(*offset + 20, length as u64).await?;
 
         // Verify the hash
         let (computed_hash1, computed_hash2) = murmur3_128(&record);
@@ -248,7 +262,7 @@ impl<F: FileIO> Logfile<F> {
         footer[0] = 1; // sealed flag
         footer[1..9].copy_from_slice(&MAGIC_NUMBER);
 
-        self.fd
+        self.fio
             .write(self.file_length, &footer)
             .await
             .context("Failed to write footer")?;
@@ -387,7 +401,7 @@ pub mod tests {
         let offset = logfile.write_record(b"hello").await.unwrap();
 
         // Corrupt the record
-        logfile.fd.write(offset + 22, &[b'x']).await.unwrap();
+        logfile.fio.write(offset + 22, &[b'x']).await.unwrap();
 
         let result = logfile.read_record(&offset).await;
         assert!(matches!(
@@ -407,7 +421,7 @@ pub mod tests {
         logfile.seal().await.unwrap();
 
         // Corrupt the record by modifying a single byte in the middle
-        logfile.fd.write(offset + 22, &[b'x']).await.unwrap();
+        logfile.fio.write(offset + 22, &[b'x']).await.unwrap();
 
         // Attempting to read the corrupted record should fail due to hash mismatch
         assert!(logfile.read_record(&offset).await.is_err());

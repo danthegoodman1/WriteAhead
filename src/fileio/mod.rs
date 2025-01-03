@@ -9,9 +9,9 @@ use std::future::Future;
 ///
 /// Abstracting this to a trait has a few benefits:
 ///
-/// 1. Can easily integrate into any storage system
+/// 1. Can easily integrate into any storage system, like io_uring for linux
 /// 2. Allows developers to create custom implementations with various use-case specific optimizations such as pre-fetching for iterators and batching
-/// 3. Allows for platform-specific storage systems, like io_uring for linux
+/// 3. Allows for customization like write-through caching, or prefetching for iterators
 pub trait FileIO
 where
     Self: Sized + Send + Sync,

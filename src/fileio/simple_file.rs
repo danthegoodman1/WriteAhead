@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 
 use super::FileIO;
 
@@ -14,7 +14,13 @@ impl SimpleFile {
 
 impl FileIO for SimpleFile {
     async fn open(path: &std::path::Path) -> anyhow::Result<Self> {
-        let fd = File::open(path)?;
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
         Self::new(fd)
     }
 
