@@ -164,14 +164,20 @@ fn padded_u64_string(id: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use io_uring::IoUring;
+    use tokio::sync::Mutex;
     use tracing::Level;
     use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, Layer};
 
+    use crate::fileio::io_uring::{IOUringFile, GLOBAL_RING};
     use crate::fileio::simple_file::SimpleFile;
 
     use super::*;
 
     static LOGGER_ONCE: Once = Once::new();
+    static URING_ONCE: Once = Once::new();
 
     fn create_logger() {
         LOGGER_ONCE.call_once(|| {
@@ -183,11 +189,17 @@ mod tests {
                     .with_span_events(FmtSpan::CLOSE)
                     .with_target(false)
                     .with_filter(
-                        tracing_subscriber::filter::Targets::new().with_default(Level::TRACE),
+                        tracing_subscriber::filter::Targets::new().with_default(Level::DEBUG),
                     ),
             );
 
             tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
+
+        URING_ONCE.call_once(|| {
+            if GLOBAL_RING.get().is_none() {
+                let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            }
         });
     }
 
@@ -260,5 +272,81 @@ mod tests {
         }
 
         std::fs::remove_dir_all("./test_logs/test_write_ahead_rotate_log_file").unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_ahead_large_data_simple() {
+        let _ = std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_simple");
+        create_logger();
+        let mut opts = WriteAheadOptions::default();
+        opts.log_dir = PathBuf::from("./test_logs/test_write_ahead_large_data_simple");
+
+        let mut write_ahead = WriteAhead::<SimpleFile>::with_options(opts);
+        write_ahead.start().await.unwrap();
+
+        let mut records = Vec::new();
+
+        let start = std::time::Instant::now();
+        for i in 0..10000 {
+            let record = write_ahead
+                .write(format!("Hello, world! {}", i).as_bytes())
+                .await
+                .unwrap();
+            records.push(record);
+        }
+        let end = std::time::Instant::now();
+        debug!("Write time taken: {:?}", end.duration_since(start));
+
+        // Read back the records
+        let start = std::time::Instant::now();
+        for i in 0..10000 {
+            let record = write_ahead
+                .read(records[i].file_id, records[i].file_offset)
+                .await
+                .unwrap();
+            assert_eq!(record, format!("Hello, world! {}", i).as_bytes());
+        }
+        let end = std::time::Instant::now();
+        debug!("Read time taken: {:?}", end.duration_since(start));
+
+        std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_simple").unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_ahead_large_data_uring() {
+        let _ = std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_uring");
+        create_logger();
+        let mut opts = WriteAheadOptions::default();
+        opts.log_dir = PathBuf::from("./test_logs/test_write_ahead_large_data_uring");
+
+        let mut write_ahead = WriteAhead::<IOUringFile>::with_options(opts);
+        write_ahead.start().await.unwrap();
+
+        let mut records = Vec::new();
+
+        let start = std::time::Instant::now();
+        for i in 0..10000 {
+            let record = write_ahead
+                .write(format!("Hello, world! {}", i).as_bytes())
+                .await
+                .unwrap();
+            records.push(record);
+        }
+        let end = std::time::Instant::now();
+        debug!("Write time taken: {:?}", end.duration_since(start));
+
+        // Read back the records
+        let start = std::time::Instant::now();
+        for i in 0..10000 {
+            let record = write_ahead
+                .read(records[i].file_id, records[i].file_offset)
+                .await
+                .unwrap();
+            assert_eq!(record, format!("Hello, world! {}", i).as_bytes());
+        }
+        let end = std::time::Instant::now();
+        debug!("Read time taken: {:?}", end.duration_since(start));
+
+        std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_uring").unwrap();
     }
 }

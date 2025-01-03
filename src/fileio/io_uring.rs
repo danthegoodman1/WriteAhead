@@ -4,7 +4,6 @@ mod linux_impl {
 
     use io_uring::{opcode, IoUring};
     use once_cell::sync::OnceCell;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     use std::path::Path;
     use std::sync::Arc;
@@ -132,6 +131,9 @@ mod linux_impl {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+pub use linux_impl::*;
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
