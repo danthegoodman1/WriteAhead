@@ -18,7 +18,7 @@ where
 {
     fn open(path: &Path) -> impl Future<Output = Result<Self>> + Send;
     fn read(&self, offset: u64, size: u64) -> impl Future<Output = Result<Vec<u8>>> + Send;
-    fn write(&self, offset: u64, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
+    fn write(&mut self, offset: u64, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
     fn file_length(&self) -> impl Future<Output = u64> + Send;
 }
 

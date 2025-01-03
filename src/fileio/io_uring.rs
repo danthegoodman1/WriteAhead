@@ -1,45 +1,7 @@
-// Trait for aligned pages to implement
-#[cfg(target_os = "linux")]
-pub trait AlignedBuffer {
-    fn as_ptr(&self) -> *const u8;
-    fn as_mut_ptr(&mut self) -> *mut u8;
-    fn len(&self) -> usize;
-}
-
-/**
- * Macro to create an aligned page type for a given size
- *
- * This macro creates a new struct with the given name and alignment,
- * and implements the AlignedBuffer trait for it.
- *
- * You might need to import the AlignedBuffer trait to use this macro.
- */
-#[macro_export]
-#[cfg(target_os = "linux")]
-macro_rules! create_aligned_page {
-    ($name:ident, $alignment:expr) => {
-        #[repr(align($alignment))]
-        pub struct $name<const N: usize>(pub [u8; N]);
-
-        impl<const N: usize> AlignedBuffer for $name<N> {
-            fn as_ptr(&self) -> *const u8 {
-                self.0.as_ptr()
-            }
-            fn as_mut_ptr(&mut self) -> *mut u8 {
-                self.0.as_mut_ptr()
-            }
-            fn len(&self) -> usize {
-                self.0.len()
-            }
-        }
-    };
-}
-
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use crate::fileio::FileIO;
 
-    use super::AlignedBuffer;
     use io_uring::{opcode, IoUring};
     use once_cell::sync::OnceCell;
     use std::os::unix::fs::OpenOptionsExt;
@@ -48,18 +10,15 @@ mod linux_impl {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    // Convenience 4k (4096)
-    create_aligned_page!(Page4K, 4096);
-
     /// Gloal ring for use with [crate::fileio::FileIO::open]
     pub static GLOBAL_RING: OnceCell<Arc<Mutex<IoUring>>> = OnceCell::new();
 
-    pub struct IOUringDevice<const BLOCK_SIZE: usize> {
+    pub struct IOUringFile {
         fd: Option<std::fs::File>,
         ring: Arc<Mutex<IoUring>>,
     }
 
-    impl<const BLOCK_SIZE: usize> IOUringDevice<BLOCK_SIZE> {
+    impl IOUringFile {
         pub fn new(
             device_path: &Path,
             ring: Arc<tokio::sync::Mutex<IoUring>>,
@@ -68,18 +27,13 @@ mod linux_impl {
                 .read(true)
                 .write(true)
                 .create(true)
-                .custom_flags(libc::O_DIRECT)
                 .open(device_path)?;
 
             Ok(Self { fd: Some(fd), ring })
         }
 
         /// Reads a block from the device into the given buffer.
-        pub async fn read_block<T: AlignedBuffer>(
-            &mut self,
-            offset: u64,
-            buffer: &mut T,
-        ) -> std::io::Result<()> {
+        pub async fn read_block(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
             let fd = io_uring::types::Fd(self.fd.as_ref().unwrap().as_raw_fd());
 
             let read_e = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as _)
@@ -109,11 +63,7 @@ mod linux_impl {
         }
 
         /// Writes a block to the device from the given buffer.
-        pub async fn write_block<T: AlignedBuffer>(
-            &mut self,
-            offset: u64,
-            buffer: &T,
-        ) -> std::io::Result<()> {
+        pub async fn write_block(&self, offset: u64, buffer: &[u8]) -> std::io::Result<()> {
             let fd = io_uring::types::Fd(self.fd.as_ref().unwrap().as_raw_fd());
 
             let write_e = opcode::Write::new(fd, buffer.as_ptr(), buffer.len() as _)
@@ -141,45 +91,9 @@ mod linux_impl {
 
             Ok(())
         }
-
-        /// Deallocates the block at the given offset using `FALLOC_FL_PUNCH_HOLE`, which creates a hole in the file
-        /// and releases the associated storage space. On SSDs this triggers the TRIM command for better performance
-        /// and wear leveling.
-        pub async fn trim_block(&mut self, offset: u64) -> std::io::Result<()> {
-            let fd = io_uring::types::Fd(self.fd.as_ref().unwrap().as_raw_fd());
-
-            // FALLOC_FL_PUNCH_HOLE (0x02) | FALLOC_FL_KEEP_SIZE (0x01)
-            const PUNCH_HOLE: i32 = 0x02 | 0x01;
-
-            let trim_e = opcode::Fallocate::new(fd, BLOCK_SIZE as u64)
-                .offset(offset)
-                .mode(PUNCH_HOLE)
-                .build()
-                .user_data(0x44);
-
-            // Lock the ring for this operation
-            let mut ring = self.ring.lock().await;
-
-            unsafe {
-                ring.submission()
-                    .push(&trim_e)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            }
-
-            ring.submit_and_wait(1)?;
-
-            // Process completion
-            while let Some(cqe) = ring.completion().next() {
-                if cqe.result() < 0 {
-                    return Err(std::io::Error::from_raw_os_error(-cqe.result()));
-                }
-            }
-
-            Ok(())
-        }
     }
 
-    impl<const BLOCK_SIZE: usize> Drop for IOUringDevice<BLOCK_SIZE> {
+    impl Drop for IOUringFile {
         fn drop(&mut self) {
             if let Some(fd) = self.fd.take() {
                 drop(fd);
@@ -189,7 +103,7 @@ mod linux_impl {
 
     use anyhow::Result;
 
-    impl<const BLOCK_SIZE: usize> FileIO for IOUringDevice<BLOCK_SIZE> {
+    impl FileIO for IOUringFile {
         async fn open(path: &Path) -> Result<Self> {
             // Check if the once cell is already initialized
             match GLOBAL_RING.get() {
@@ -199,15 +113,22 @@ mod linux_impl {
         }
 
         async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
-            todo!()
+            let mut buffer = vec![0u8; size as usize];
+            self.read_block(offset, &mut buffer).await?;
+            Ok(buffer)
         }
 
-        async fn write(&self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
-            todo!()
+        async fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+            self.write_block(offset, data).await?;
+            Ok(())
         }
 
         async fn file_length(&self) -> u64 {
-            todo!()
+            self.fd
+                .as_ref()
+                .and_then(|f| f.metadata().ok())
+                .map(|m| m.len())
+                .unwrap_or(0)
         }
     }
 }
@@ -215,16 +136,25 @@ mod linux_impl {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use io_uring::IoUring;
-    use linux_impl::{IOUringDevice, Page4K};
+    use linux_impl::{IOUringFile, GLOBAL_RING};
+    use std::sync::Mutex as StdMutex;
     use tokio::sync::Mutex;
 
+    static TEST_MUTEX: StdMutex<()> = StdMutex::new(());
+
+    use crate::logfile;
+
     use super::*;
-    use std::{path::Path, sync::Arc};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     const BLOCK_SIZE: usize = 4096;
 
     #[tokio::test]
     async fn test_io_uring_read_write() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a shared io_uring instance
         // Create a shared io_uring instance
         let ring = Arc::new(Mutex::new(IoUring::new(128)?));
 
@@ -233,47 +163,34 @@ mod tests {
         let temp_path = temp_file.path().to_str().unwrap();
 
         // Create a new device instance
-        let mut device = IOUringDevice::<BLOCK_SIZE>::new(&Path::new(temp_path), ring)?;
+        let mut device = IOUringFile::new(&Path::new(temp_path), ring)?;
 
         // Test data
         let mut write_data = [0u8; BLOCK_SIZE];
         let hello = b"Hello, world!\n";
         write_data[..hello.len()].copy_from_slice(hello);
-        let write_page = Page4K(write_data);
 
         // Write test
-        device.write_block(0, &write_page).await?;
+        device.write_block(0, &write_data).await?;
 
         // Read test
-        let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
+        let mut read_buffer = [0u8; BLOCK_SIZE];
         device.read_block(0, &mut read_buffer).await?;
 
         // Verify the contents
-        assert_eq!(&read_buffer.0[..hello.len()], hello);
-        println!("Read data: {:?}", &read_buffer.0[..hello.len()]);
+        assert_eq!(&read_buffer[..hello.len()], hello);
+        println!("Read data: {:?}", &read_buffer[..hello.len()]);
         // As a string
         println!(
             "Read data (string): {}",
-            String::from_utf8_lossy(&read_buffer.0[..hello.len()])
+            String::from_utf8_lossy(&read_buffer[..hello.len()])
         );
-
-        // Try trimming the block
-        device.trim_block(0).await?;
-
-        // Read the block again
-        let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
-        device.read_block(0, &mut read_buffer).await?;
-
-        // Verify the contents are zeroed
-        assert_eq!(&read_buffer.0, &[0u8; BLOCK_SIZE]);
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_io_uring_sqpoll() -> Result<(), Box<dyn std::error::Error>> {
-        create_aligned_page!(Page4K, 4096); // test creating an aliged page with a macro
-
         // Create a shared io_uring instance with SQPOLL enabled
         let ring = Arc::new(Mutex::new(
             IoUring::builder()
@@ -286,24 +203,181 @@ mod tests {
         let temp_path = temp_file.path().to_str().unwrap();
 
         // Create a new device instance
-        let mut device = IOUringDevice::<BLOCK_SIZE>::new(&Path::new(temp_path), ring)?;
+        let mut device = IOUringFile::new(&Path::new(temp_path), ring)?;
 
         // Test data
         let mut write_data = [0u8; BLOCK_SIZE];
         let test_data = b"Testing SQPOLL mode!\n";
         write_data[..test_data.len()].copy_from_slice(test_data);
-        let write_page = Page4K(write_data);
 
         // Write test
-        device.write_block(0, &write_page).await?;
+        device.write_block(0, &write_data).await?;
 
         // Read test
-        let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
+        let mut read_buffer = [0u8; BLOCK_SIZE];
         device.read_block(0, &mut read_buffer).await?;
 
         // Verify the contents
-        assert_eq!(&read_buffer.0[..test_data.len()], test_data);
+        assert_eq!(&read_buffer[..test_data.len()], test_data);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_without_sealing() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
+
+        let path = PathBuf::from("/tmp/01.log");
+        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
+
+        logfile::tests::test_write_without_sealing(f, path).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_with_sealing() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
+
+        let path = PathBuf::from("/tmp/02.log");
+        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
+
+        logfile::tests::test_write_with_sealing(f, path).await;
+    }
+
+    #[tokio::test]
+    async fn test_corrupted_record() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
+
+        let path = PathBuf::from("/tmp/03.log");
+        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
+
+        logfile::tests::test_corrupted_record(f, path).await;
+    }
+
+    #[tokio::test]
+    async fn test_corrupted_record_sealed() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
+
+        let path = PathBuf::from("/tmp/04.log");
+        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
+
+        logfile::tests::test_corrupted_record_sealed(f, path).await;
+    }
+
+    #[tokio::test]
+    async fn test_corrupted_file_header() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
+
+        let path = PathBuf::from("/tmp/05.log");
+        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
+
+        logfile::tests::test_corrupted_file_header(f, path).await;
+    }
+
+    #[tokio::test]
+    async fn test_100_records() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
+
+        let path = PathBuf::from("/tmp/06.log");
+        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
+
+        logfile::tests::test_100_records(f, path).await;
+    }
+
+    // FIXME
+    #[tokio::test]
+    async fn test_stream() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
+
+        let path = PathBuf::from("/tmp/07.log");
+        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
+
+        logfile::tests::test_stream(f, path).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_magic_number_without_sealing_escape() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
+
+        let path = PathBuf::from("/tmp/08.log");
+        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
+
+        logfile::tests::test_write_magic_number_without_sealing_escape(f, path).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_magic_number_sealing_escape() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
+
+        let path = PathBuf::from("/tmp/09.log");
+        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
+
+        logfile::tests::test_write_magic_number_sealing_escape(f, path).await;
+    }
+
+    // FIXME
+    #[tokio::test]
+    async fn test_write_magic_number_without_sealing_escape_iterator() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
+
+        let path = PathBuf::from("/tmp/10.log");
+        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
+
+        logfile::tests::test_write_magic_number_without_sealing_escape_iterator(f, path).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_magic_number_with_sealing_escape_iterator() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
+
+        let path = PathBuf::from("/tmp/11.log");
+        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
+
+        logfile::tests::test_write_magic_number_with_sealing_escape_iterator(f, path).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_too_large_record() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
+
+        let path = PathBuf::from("/tmp/12.log");
+        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
+
+        logfile::tests::test_write_too_large_record(f, path).await;
     }
 }

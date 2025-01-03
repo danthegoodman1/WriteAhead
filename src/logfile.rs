@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
-use futures::Stream;
+use futures::{pin_mut, FutureExt, Stream};
+use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
@@ -71,6 +72,7 @@ impl<F: FileIO> Logfile<F> {
         let mut header = [0u8; 8];
         header[0..8].copy_from_slice(&MAGIC_NUMBER);
 
+        let mut fd = fd;
         fd.write(0, &header)
             .await
             .context("Failed to write header")?;
@@ -185,7 +187,7 @@ impl<F: FileIO> Logfile<F> {
         Ok(offset)
     }
 
-    pub async fn read_record(&mut self, offset: &u64) -> Result<Vec<u8>> {
+    pub async fn read_record(&self, offset: &u64) -> Result<Vec<u8>> {
         // Read the hash and length (20 bytes total)
         let header = self.fd.read(*offset, 20).await.context(
             "Failed to read record header, is the file corrupted, or a partial write occurred?",
@@ -284,36 +286,45 @@ impl<'a, F: FileIO> LogFileStream<'a, F> {
     pub fn set_stream_offset(&mut self, offset: u64) {
         self.offset = offset;
     }
+
+    async fn read_and_move_offset(&mut self, offset: u64) -> Result<Vec<u8>> {
+        let record = self.logfile.read_record(&offset).await?;
+        self.offset += 20 + record.len() as u64;
+        Ok(record)
+    }
 }
 
 impl<'a, F: FileIO> Stream for LogFileStream<'a, F> {
     type Item = Result<Vec<u8>>;
 
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        // If we've reached the end of the file (or the footer if sealed)
+        let end_offset = if self.logfile.sealed {
+            self.logfile.file_length - 9 // Account for the 9-byte footer
+        } else {
+            self.logfile.file_length
+        };
+
+        // Add this check to ensure we have enough bytes remaining for at least a record header
+        if self.offset >= end_offset || end_offset - self.offset < 20 {
+            return Poll::Ready(None);
+        }
+
+        // Create a future to read the record
         let offset = self.offset;
+        let future = self.read_and_move_offset(offset).boxed();
+        pin_mut!(future);
 
-        // If file is sealed, check if we've reached the footer
-        if self.logfile.sealed {
-            if offset >= self.logfile.file_length - 9 {
-                return Poll::Ready(None);
-            }
-        }
+        // Poll the future
+        let result = match future.poll(cx) {
+            Poll::Ready(result) => match result {
+                Ok(record) => Poll::Ready(Some(Ok(record))),
+                Err(e) => Poll::Ready(Some(Err(e))),
+            },
+            Poll::Pending => Poll::Pending,
+        };
 
-        // Try to read record at current offset
-        match futures::executor::block_on(self.logfile.read_record(&offset)) {
-            Ok(record) => {
-                self.offset += 20 + record.len() as u64;
-                Poll::Ready(Some(Ok(record)))
-            }
-            Err(e) => {
-                if let Some(err) = e.downcast_ref::<std::io::Error>() {
-                    if err.kind() == std::io::ErrorKind::UnexpectedEof {
-                        return Poll::Ready(None);
-                    }
-                }
-                Poll::Ready(Some(Err(e)))
-            }
-        }
+        result
     }
 }
 
@@ -407,6 +418,7 @@ pub mod tests {
 
     pub async fn test_corrupted_file_header<F: FileIO>(f: F, path: PathBuf) {
         let invalid_header = [0x00; 16];
+        let mut f = f;
         f.write(0, &invalid_header).await.unwrap();
 
         let result = Logfile::<F>::from_file(&path).await;
@@ -528,10 +540,14 @@ pub mod tests {
             .unwrap();
         logfile.write_record(&MAGIC_NUMBER).await.unwrap();
 
+        let file_length = logfile.file_length.clone();
         let mut iter = logfile.stream();
         let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
-        assert!(iter.next().await.is_none());
+        println!("offset: {} file length: {}", iter.offset, file_length);
+        let res = iter.next().await;
+        println!("res: {:?}", res);
+        assert!(res.is_none());
 
         let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "10");
