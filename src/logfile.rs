@@ -313,7 +313,7 @@ impl<'a, F: FileIO> Stream for LogFileStream<'a, F> {
         // Create a future to read the record
         let offset = self.offset;
         let future = self.read_and_move_offset(offset);
-        pin_mut!(future);
+        pin_mut!(future); // Pin the future so we can poll it
 
         // Poll the future
         let result = match future.poll(cx) {
