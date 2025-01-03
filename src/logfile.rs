@@ -168,11 +168,9 @@ impl<F: FileIO> Logfile<F> {
 
     pub async fn read_record(&mut self, offset: &u64) -> Result<Vec<u8>> {
         // Read the hash and length (20 bytes total)
-        let header = self
-            .fd
-            .read(*offset, 20)
-            .await
-            .context("Failed to read record header, is the file corrupted?")?;
+        let header = self.fd.read(*offset, 20).await.context(
+            "Failed to read record header, is the file corrupted, or a partial write occurred?",
+        )?;
 
         // Parse the header
         let hash1 = i64::from_le_bytes(
