@@ -185,7 +185,7 @@ mod tests {
         let temp_path = temp_file.path().to_str().unwrap();
 
         // Create a new device instance
-        let mut device = IOUringFile::new(&Path::new(temp_path), ring)?;
+        let device = IOUringFile::new(&Path::new(temp_path), ring)?;
 
         // Test data
         let mut write_data = [0u8; BLOCK_SIZE];
@@ -225,7 +225,7 @@ mod tests {
         let temp_path = temp_file.path().to_str().unwrap();
 
         // Create a new device instance
-        let mut device = IOUringFile::new(&Path::new(temp_path), ring)?;
+        let device = IOUringFile::new(&Path::new(temp_path), ring)?;
 
         // Test data
         let mut write_data = [0u8; BLOCK_SIZE];
@@ -249,7 +249,7 @@ mod tests {
     async fn test_write_without_sealing() {
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
-            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
         let path = PathBuf::from("/tmp/01.log");
@@ -262,7 +262,7 @@ mod tests {
     async fn test_write_with_sealing() {
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
-            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
         let path = PathBuf::from("/tmp/02.log");
@@ -275,7 +275,7 @@ mod tests {
     async fn test_corrupted_record() {
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
-            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
         let path = PathBuf::from("/tmp/03.log");
@@ -288,7 +288,7 @@ mod tests {
     async fn test_corrupted_record_sealed() {
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
-            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
         let path = PathBuf::from("/tmp/04.log");
@@ -301,7 +301,7 @@ mod tests {
     async fn test_corrupted_file_header() {
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
-            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
         let path = PathBuf::from("/tmp/05.log");
@@ -314,7 +314,7 @@ mod tests {
     async fn test_100_records() {
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
-            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
         let path = PathBuf::from("/tmp/06.log");
@@ -328,7 +328,7 @@ mod tests {
     async fn test_stream() {
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
-            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
         let path = PathBuf::from("/tmp/07.log");
@@ -341,7 +341,7 @@ mod tests {
     async fn test_write_magic_number_without_sealing_escape() {
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
-            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
         let path = PathBuf::from("/tmp/08.log");
@@ -354,7 +354,7 @@ mod tests {
     async fn test_write_magic_number_sealing_escape() {
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
-            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
         let path = PathBuf::from("/tmp/09.log");
@@ -368,7 +368,7 @@ mod tests {
     async fn test_write_magic_number_without_sealing_escape_iterator() {
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
-            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
         let path = PathBuf::from("/tmp/10.log");
@@ -381,7 +381,7 @@ mod tests {
     async fn test_write_magic_number_with_sealing_escape_iterator() {
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
-            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
         let path = PathBuf::from("/tmp/11.log");
@@ -394,7 +394,7 @@ mod tests {
     async fn test_write_too_large_record() {
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
-            GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
         let path = PathBuf::from("/tmp/12.log");
