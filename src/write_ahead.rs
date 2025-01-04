@@ -507,7 +507,7 @@ impl<'a, F: FileIO> WriteAheadStream<'a, F> {
     }
 
     // Helper to get next stream when current one is exhausted
-    fn advance_to_next_stream(&mut self) -> Option<()> {
+    fn advance_to_next_stream(&'a mut self) -> Option<()> {
         // If we have an active stream, drop it
         self.current_stream = None;
 
