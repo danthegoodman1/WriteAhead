@@ -296,6 +296,14 @@ impl<F: FileIO> Logfile<F> {
         }
     }
 
+    pub fn stream_from_offset(&mut self, offset: u64) -> LogFileStream<F> {
+        let offset = if offset < 8 { 8 } else { offset };
+        LogFileStream {
+            logfile: self,
+            offset,
+        }
+    }
+
     pub fn file_length(&self) -> u64 {
         self.file_length
     }
