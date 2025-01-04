@@ -77,7 +77,7 @@ impl<F: FileIO> Logfile<F> {
         header[0..8].copy_from_slice(&MAGIC_NUMBER);
 
         let mut fio = fio;
-        fio.write(0, &header)
+        fio.write(0, &[&header])
             .await
             .context("Failed to write header")?;
 
@@ -145,50 +145,64 @@ impl<F: FileIO> Logfile<F> {
         })
     }
 
-    pub async fn write_record(&mut self, record: &[u8]) -> Result<u64> {
+    pub async fn write_records(&mut self, records: &[&[u8]]) -> Result<Vec<u64>> {
         if self.sealed {
             return Err(anyhow!(LogfileError::WriteToSealed));
         }
 
-        if record.len() > u32::MAX as usize {
-            return Err(anyhow!(LogfileError::RecordTooLarge));
-        }
+        let mut offsets = Vec::with_capacity(records.len());
+        let mut processed_records = Vec::with_capacity(records.len());
+        let mut current_offset = self.file_length;
 
-        let offset = self.file_length;
-
-        // Replace 0xff with 0x00 0xff, but scan from end to start to handle insertions correctly
-        let mut record = record.to_vec();
-        let mut i = record.len();
-        while i > 0 {
-            i -= 1;
-            if record[i] == 0xff {
-                record.insert(i, 0x00);
+        for record in records {
+            if record.len() > u32::MAX as usize {
+                return Err(anyhow!(LogfileError::RecordTooLarge));
             }
+
+            // Replace 0xff with 0x00 0xff, but scan from end to start to handle insertions correctly
+            let mut processed = record.to_vec();
+            let mut i = processed.len();
+            while i > 0 {
+                i -= 1;
+                if processed[i] == 0xff {
+                    processed.insert(i, 0x00);
+                }
+            }
+
+            // Verify the record is no longer than max u32 after escaping
+            if processed.len() > u32::MAX as usize {
+                return Err(anyhow!(LogfileError::RecordTooLarge));
+            }
+
+            // Generate a murmur3 hash of the record
+            let (hash1, hash2) = murmur3_128(&processed);
+            let length = processed.len() as u32;
+
+            // Pre-allocate buffer with exact size (16 bytes for hash + 4 bytes for length + record length)
+            let mut buf = Vec::with_capacity(20 + processed.len());
+            buf.extend_from_slice(&hash1.to_le_bytes());
+            buf.extend_from_slice(&hash2.to_le_bytes());
+            buf.extend_from_slice(&length.to_le_bytes());
+            buf.extend_from_slice(&processed);
+
+            offsets.push(current_offset);
+            current_offset += buf.len() as u64;
+            processed_records.push(buf);
         }
 
-        // Verify the record is no longer than max u32
-        if record.len() > u32::MAX as usize {
-            return Err(anyhow!(LogfileError::RecordTooLarge));
-        }
+        // TODO: Maybe use a mutex just to ensure single access to the writer?
 
-        // Generate a murmur3 hash of the record
-        let (hash1, hash2) = murmur3_128(&record);
-        let length = record.len() as u32;
+        // Convert processed records to slice references
+        let record_refs: Vec<&[u8]> = processed_records.iter().map(|r| r.as_slice()).collect();
 
-        // Pre-allocate buffer with exact size (16 bytes for hash + 8 bytes for length + record length)
-        let mut buf = Vec::with_capacity(24 + record.len());
-        buf.extend_from_slice(&hash1.to_le_bytes());
-        buf.extend_from_slice(&hash2.to_le_bytes());
-        buf.extend_from_slice(&length.to_le_bytes());
-        buf.extend_from_slice(&record);
-
+        // Write all records in one operation
         self.fio
-            .write(offset, &buf)
+            .write(self.file_length, &record_refs)
             .await
-            .context("Failed to write record")?;
+            .context("Failed to write records")?;
 
-        self.file_length += buf.len() as u64;
-        Ok(offset)
+        self.file_length = current_offset;
+        Ok(offsets)
     }
 
     pub async fn read_record(&self, offset: &u64) -> Result<Vec<u8>> {
@@ -263,7 +277,7 @@ impl<F: FileIO> Logfile<F> {
         footer[1..9].copy_from_slice(&MAGIC_NUMBER);
 
         self.fio
-            .write(self.file_length, &footer)
+            .write(self.file_length, &[&footer])
             .await
             .context("Failed to write footer")?;
 
@@ -353,12 +367,12 @@ pub mod tests {
         let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
             .await
             .unwrap();
-        let offset = logfile.write_record(b"hello").await.unwrap();
+        let offsets = logfile.write_records(&[b"hello"]).await.unwrap();
 
         let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "01");
         assert!(!logfile.sealed);
-        assert_eq!(logfile.read_record(&offset).await.unwrap(), b"hello");
+        assert_eq!(logfile.read_record(&offsets[0]).await.unwrap(), b"hello");
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
@@ -368,11 +382,11 @@ pub mod tests {
         let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
             .await
             .unwrap();
-        let offset = logfile.write_record(b"hello").await.unwrap();
+        let offsets = logfile.write_records(&[b"hello"]).await.unwrap();
         logfile.seal().await.unwrap();
 
         // Try to write after sealing
-        let result = logfile.write_record(b"world").await;
+        let result = logfile.write_records(&[b"world"]).await;
         assert!(matches!(
             result.unwrap_err().downcast_ref::<LogfileError>(),
             Some(LogfileError::WriteToSealed)
@@ -388,7 +402,7 @@ pub mod tests {
         let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "02");
         assert!(logfile.sealed);
-        assert_eq!(logfile.read_record(&offset).await.unwrap(), b"hello");
+        assert_eq!(logfile.read_record(&offsets[0]).await.unwrap(), b"hello");
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
@@ -398,12 +412,16 @@ pub mod tests {
         let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
             .await
             .unwrap();
-        let offset = logfile.write_record(b"hello").await.unwrap();
+        let offsets = logfile.write_records(&[b"hello"]).await.unwrap();
 
         // Corrupt the record
-        logfile.fio.write(offset + 22, &[b'x']).await.unwrap();
+        logfile
+            .fio
+            .write(offsets[0] + 22, &[&[b'x']])
+            .await
+            .unwrap();
 
-        let result = logfile.read_record(&offset).await;
+        let result = logfile.read_record(&offsets[0]).await;
         assert!(matches!(
             result.unwrap_err().downcast_ref::<LogfileError>(),
             Some(LogfileError::Corrupted)
@@ -417,14 +435,18 @@ pub mod tests {
         let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
             .await
             .unwrap();
-        let offset = logfile.write_record(b"hello").await.unwrap();
+        let offsets = logfile.write_records(&[b"hello"]).await.unwrap();
         logfile.seal().await.unwrap();
 
         // Corrupt the record by modifying a single byte in the middle
-        logfile.fio.write(offset + 22, &[b'x']).await.unwrap();
+        logfile
+            .fio
+            .write(offsets[0] + 22, &[&[b'x']])
+            .await
+            .unwrap();
 
         // Attempting to read the corrupted record should fail due to hash mismatch
-        assert!(logfile.read_record(&offset).await.is_err());
+        assert!(logfile.read_record(&offsets[0]).await.is_err());
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
@@ -433,7 +455,7 @@ pub mod tests {
     pub async fn test_corrupted_file_header<F: FileIO>(f: F, path: PathBuf) {
         let invalid_header = [0x00; 16];
         let mut f = f;
-        f.write(0, &invalid_header).await.unwrap();
+        f.write(0, &[&invalid_header]).await.unwrap();
 
         let result = Logfile::<F>::from_file(&path).await;
         assert!(result.is_err());
@@ -453,24 +475,26 @@ pub mod tests {
         let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
             .await
             .unwrap();
-        let mut offsets = Vec::with_capacity(100);
 
-        for i in 0..100 {
-            let record = format!("record_{}", i);
-            let offset = logfile.write_record(record.as_bytes()).await.unwrap();
-            offsets.push((offset, record));
-        }
+        // Prepare records
+        let records: Vec<Vec<u8>> = (0..100)
+            .map(|i| format!("record_{}", i).into_bytes())
+            .collect();
+        let record_refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+
+        // Write all records at once
+        let offsets = logfile.write_records(&record_refs).await.unwrap();
 
         // Seal the file
         logfile.seal().await.unwrap();
 
         // Reopen the file and verify all records
         let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
-        for (offset, expected_record) in offsets {
-            let record = logfile.read_record(&offset).await.unwrap();
+        for (i, offset) in offsets.iter().enumerate() {
+            let record = logfile.read_record(offset).await.unwrap();
             assert_eq!(
                 String::from_utf8(record).unwrap(),
-                expected_record,
+                format!("record_{}", i),
                 "Record mismatch at offset {}",
                 offset
             );
@@ -488,7 +512,7 @@ pub mod tests {
         // Add some records
         for i in 0..100 {
             logfile
-                .write_record(format!("record_{}", i).as_bytes())
+                .write_records(&[format!("record_{}", i).as_bytes()])
                 .await
                 .unwrap();
         }
@@ -518,12 +542,15 @@ pub mod tests {
         let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
             .await
             .unwrap();
-        let offset = logfile.write_record(&MAGIC_NUMBER).await.unwrap();
+        let offsets = logfile.write_records(&[&MAGIC_NUMBER]).await.unwrap();
 
         let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "08");
         assert!(!logfile.sealed);
-        assert_eq!(logfile.read_record(&offset).await.unwrap(), &MAGIC_NUMBER);
+        assert_eq!(
+            logfile.read_record(&offsets[0]).await.unwrap(),
+            &MAGIC_NUMBER
+        );
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
@@ -533,13 +560,16 @@ pub mod tests {
         let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
             .await
             .unwrap();
-        let offset = logfile.write_record(&MAGIC_NUMBER).await.unwrap();
+        let offsets = logfile.write_records(&[&MAGIC_NUMBER]).await.unwrap();
         logfile.seal().await.unwrap();
 
         let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "09");
         assert!(logfile.sealed);
-        assert_eq!(logfile.read_record(&offset).await.unwrap(), &MAGIC_NUMBER);
+        assert_eq!(
+            logfile.read_record(&offsets[0]).await.unwrap(),
+            &MAGIC_NUMBER
+        );
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();
@@ -552,7 +582,7 @@ pub mod tests {
         let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
             .await
             .unwrap();
-        logfile.write_record(&MAGIC_NUMBER).await.unwrap();
+        logfile.write_records(&[&MAGIC_NUMBER]).await.unwrap();
 
         let file_length = logfile.file_length.clone();
         let mut iter = logfile.stream();
@@ -583,7 +613,7 @@ pub mod tests {
         let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
             .await
             .unwrap();
-        logfile.write_record(&MAGIC_NUMBER).await.unwrap();
+        logfile.write_records(&[&MAGIC_NUMBER]).await.unwrap();
 
         // First iteration
         {
@@ -622,12 +652,13 @@ pub mod tests {
         let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
             .await
             .unwrap();
-        let offset = logfile.write_record(b"hello").await.unwrap();
+        let data: Vec<u8> = b"hello".to_vec();
+        let offset = logfile.write_records(&[&data]).await.unwrap();
 
         // Simulate a partial write by truncating the file
         logfile.file_length -= 1;
 
-        let result = logfile.read_record(&offset).await;
+        let result = logfile.read_record(&offset[0]).await;
         assert!(matches!(
             result.unwrap_err().downcast_ref::<LogfileError>(),
             Some(LogfileError::PartialWrite)
@@ -641,14 +672,33 @@ pub mod tests {
         let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
             .await
             .unwrap();
-        let result = logfile
-            .write_record(&vec![0; (u32::MAX as usize) + 1])
-            .await;
+        let data: Vec<u8> = vec![0; (u32::MAX as usize) + 1];
+        let result = logfile.write_records(&[&data]).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err().downcast_ref::<LogfileError>(),
             Some(LogfileError::RecordTooLarge)
         ));
+
+        // Clean up the test file
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // Add a new test for bulk writes
+    pub async fn test_bulk_writes<F: FileIO>(f: F, path: PathBuf) {
+        let mut logfile = Logfile::new(&Logfile::<F>::file_id_from_path(&path).unwrap(), f)
+            .await
+            .unwrap();
+
+        // Prepare multiple records
+        let records: Vec<&[u8]> = vec![b"first", b"second", b"third"];
+        let offsets = logfile.write_records(&records).await.unwrap();
+
+        // Verify each record
+        assert_eq!(offsets.len(), 3);
+        assert_eq!(logfile.read_record(&offsets[0]).await.unwrap(), b"first");
+        assert_eq!(logfile.read_record(&offsets[1]).await.unwrap(), b"second");
+        assert_eq!(logfile.read_record(&offsets[2]).await.unwrap(), b"third");
 
         // Clean up the test file
         std::fs::remove_file(&path).unwrap();

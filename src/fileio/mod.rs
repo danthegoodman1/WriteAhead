@@ -14,11 +14,11 @@ use std::future::Future;
 /// 3. Allows for customization like write-through caching, or prefetching for iterators
 pub trait FileIO
 where
-    Self: Sized + Send + Sync,
+    Self: Sized + Send + Sync + std::fmt::Debug,
 {
     fn open(path: &Path) -> impl Future<Output = Result<Self>> + Send;
     fn read(&self, offset: u64, size: u64) -> impl Future<Output = Result<Vec<u8>>> + Send;
-    fn write(&mut self, offset: u64, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
+    fn write(&mut self, offset: u64, data: &[&[u8]]) -> impl Future<Output = Result<()>> + Send;
     fn file_length(&self) -> impl Future<Output = u64> + Send;
 }
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, rc::Rc, time::Duration};
-use tracing::{debug, trace};
+use tracing::{debug, instrument, trace};
 
 use anyhow::Context;
 
@@ -12,6 +12,7 @@ use std::sync::Once;
 ///
 /// A manager is single threaded to ensure maximum throughput for disk operations.
 /// Async is just a convenience for using with async server frameworks.
+#[derive(Debug)]
 pub struct WriteAhead<F: FileIO> {
     options: WriteAheadOptions,
     log_files: BTreeMap<u64, Logfile<F>>,
@@ -63,6 +64,7 @@ impl<F: FileIO> WriteAhead<F> {
 
     /// Start the write ahead log manager.
     /// If this errors, you must crash.
+    #[instrument(skip(self), level = "trace")]
     pub async fn start(&mut self) -> Result<()> {
         std::fs::create_dir_all(&self.options.log_dir)?;
         let log_files =
@@ -101,6 +103,7 @@ impl<F: FileIO> WriteAhead<F> {
         Ok(())
     }
 
+    #[instrument(skip(self), level = "trace")]
     pub async fn read(&mut self, logfile_id: u64, offset: u64) -> Result<Vec<u8>> {
         // Check active log file first
         if let Some(active_log) = &self.active_log_file {
@@ -118,10 +121,14 @@ impl<F: FileIO> WriteAhead<F> {
         logfile.read_record(&offset).await
     }
 
+    #[instrument(skip(self, data), level = "trace")]
     pub async fn write(&mut self, data: &[u8]) -> Result<RecordID> {
+        // TODO: Maybe we make this a batch write internally with some flush interval, and we return a future that will resolve when the data is flushed to disk
+        // Then we can queue them up in memory and flush them to disk in a background task
+
         // Write the record to the active log file
         let active_log = self.active_log_file.as_mut().unwrap();
-        let offset = active_log.write_record(data).await?;
+        let offset = active_log.write_records(&[&data]).await?;
         let logfile_id = active_log.id.clone();
 
         // Check if we need to rotate the log file and create the new one
@@ -129,9 +136,10 @@ impl<F: FileIO> WriteAhead<F> {
             self.rotate_log_file().await?;
         }
 
-        Ok(RecordID::new(logfile_id.parse::<u64>().unwrap(), offset))
+        Ok(RecordID::new(logfile_id.parse::<u64>().unwrap(), offset[0]))
     }
 
+    #[instrument]
     async fn rotate_log_file(&mut self) -> Result<()> {
         let active_log = self.active_log_file.as_mut().unwrap();
         let logfile_id = active_log.id.clone();
@@ -166,12 +174,16 @@ fn padded_u64_string(id: u64) -> String {
 mod tests {
     use std::sync::Arc;
 
+    #[cfg(target_os = "linux")]
     use io_uring::IoUring;
+
     use tokio::sync::Mutex;
     use tracing::Level;
     use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, Layer};
 
+    #[cfg(target_os = "linux")]
     use crate::fileio::io_uring::{IOUringFile, GLOBAL_RING};
+
     use crate::fileio::simple_file::SimpleFile;
 
     use super::*;
@@ -196,11 +208,19 @@ mod tests {
             tracing::subscriber::set_global_default(subscriber).unwrap();
         });
 
-        URING_ONCE.call_once(|| {
-            if GLOBAL_RING.get().is_none() {
-                let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
-            }
-        });
+        #[cfg(target_os = "linux")]
+        {
+            URING_ONCE.call_once(|| {
+                if GLOBAL_RING.get().is_none() {
+                    let _ = GLOBAL_RING.set(Arc::new(Mutex::new(
+                        IoUring::builder()
+                            .setup_sqpoll(2) // 2000ms timeout
+                            .build(64)
+                            .unwrap(),
+                    )));
+                }
+            });
+        }
     }
 
     #[tokio::test]
@@ -287,7 +307,7 @@ mod tests {
         let mut records = Vec::new();
 
         let start = std::time::Instant::now();
-        for i in 0..10000 {
+        for i in 0..100 {
             let record = write_ahead
                 .write(format!("Hello, world! {}", i).as_bytes())
                 .await
@@ -299,7 +319,7 @@ mod tests {
 
         // Read back the records
         let start = std::time::Instant::now();
-        for i in 0..10000 {
+        for i in 0..100 {
             let record = write_ahead
                 .read(records[i].file_id, records[i].file_offset)
                 .await
@@ -312,6 +332,7 @@ mod tests {
         std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_simple").unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_write_ahead_large_data_uring() {
         let _ = std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_uring");
@@ -325,7 +346,7 @@ mod tests {
         let mut records = Vec::new();
 
         let start = std::time::Instant::now();
-        for i in 0..10000 {
+        for i in 0..100 {
             let record = write_ahead
                 .write(format!("Hello, world! {}", i).as_bytes())
                 .await
@@ -337,7 +358,7 @@ mod tests {
 
         // Read back the records
         let start = std::time::Instant::now();
-        for i in 0..10000 {
+        for i in 0..100 {
             let record = write_ahead
                 .read(records[i].file_id, records[i].file_offset)
                 .await

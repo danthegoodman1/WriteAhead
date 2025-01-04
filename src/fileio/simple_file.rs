@@ -1,7 +1,10 @@
 use std::fs::{File, OpenOptions};
 
+use tracing::instrument;
+
 use super::FileIO;
 
+#[derive(Debug)]
 pub struct SimpleFile {
     pub fd: File,
 }
@@ -18,12 +21,12 @@ impl FileIO for SimpleFile {
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
             .open(&path)
             .unwrap();
         Self::new(fd)
     }
 
+    #[instrument(skip(self), level = "trace")]
     async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
         use std::io::{Read, Seek};
 
@@ -36,12 +39,22 @@ impl FileIO for SimpleFile {
         Ok(buffer)
     }
 
-    async fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+    #[instrument(skip(self, data), level = "trace")]
+    async fn write(&mut self, offset: u64, data: &[&[u8]]) -> anyhow::Result<()> {
         use std::io::{Seek, Write};
+
+        // Calculate total length and pre-allocate buffer
+        let total_len = data.iter().map(|chunk| chunk.len()).sum();
+        let mut buffer = Vec::with_capacity(total_len);
+
+        // Concatenate all chunks
+        for chunk in data {
+            buffer.extend_from_slice(chunk);
+        }
 
         let mut fd = &self.fd;
         fd.seek(std::io::SeekFrom::Start(offset))?;
-        fd.write_all(data)?;
+        fd.write_all(&buffer)?;
         fd.sync_all()?;
 
         Ok(())

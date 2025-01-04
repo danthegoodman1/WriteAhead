@@ -8,6 +8,7 @@ mod linux_impl {
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+    use tracing::instrument;
 
     /// Gloal ring for use with [crate::fileio::FileIO::open]
     pub static GLOBAL_RING: OnceCell<Arc<Mutex<IoUring>>> = OnceCell::new();
@@ -15,6 +16,12 @@ mod linux_impl {
     pub struct IOUringFile {
         fd: Option<std::fs::File>,
         ring: Arc<Mutex<IoUring>>,
+    }
+
+    impl std::fmt::Debug for IOUringFile {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "IOUringFile {{ fd: {:?} }}", self.fd)
+        }
     }
 
     impl IOUringFile {
@@ -32,6 +39,7 @@ mod linux_impl {
         }
 
         /// Reads a block from the device into the given buffer.
+        #[instrument(skip(self, buffer), level = "trace")]
         pub async fn read_block(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
             let fd = io_uring::types::Fd(self.fd.as_ref().unwrap().as_raw_fd());
 
@@ -61,30 +69,41 @@ mod linux_impl {
             Ok(())
         }
 
-        /// Writes a block to the device from the given buffer.
-        pub async fn write_block(&self, offset: u64, buffer: &[u8]) -> std::io::Result<()> {
+        /// Writes multiple blocks to the device in a single submission
+        #[instrument(skip(self, chunks), level = "trace")]
+        pub async fn write_blocks(&self, offset: u64, chunks: &[&[u8]]) -> std::io::Result<()> {
             let fd = io_uring::types::Fd(self.fd.as_ref().unwrap().as_raw_fd());
-
-            let write_e = opcode::Write::new(fd, buffer.as_ptr(), buffer.len() as _)
-                .offset(offset)
-                .build()
-                .user_data(0x43);
-
-            // Lock the ring for this operation
             let mut ring = self.ring.lock().await;
 
-            unsafe {
-                ring.submission()
-                    .push(&write_e)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            // Submit all write operations at once
+            let mut current_offset = offset;
+            for (i, chunk) in chunks.iter().enumerate() {
+                let write_e = opcode::Write::new(fd, chunk.as_ptr(), chunk.len() as _)
+                    .offset(current_offset)
+                    .build()
+                    .user_data(i as u64);
+
+                unsafe {
+                    ring.submission()
+                        .push(&write_e)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                }
+
+                current_offset += chunk.len() as u64;
             }
 
-            ring.submit_and_wait(1)?;
+            // Submit and wait for all operations to complete
+            ring.submit_and_wait(chunks.len())?;
 
-            // Process completion
+            // Process all completions
+            let mut completed = 0;
             while let Some(cqe) = ring.completion().next() {
                 if cqe.result() < 0 {
                     return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+                }
+                completed += 1;
+                if completed == chunks.len() {
+                    break;
                 }
             }
 
@@ -117,8 +136,9 @@ mod linux_impl {
             Ok(buffer)
         }
 
-        async fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
-            self.write_block(offset, data).await?;
+        #[instrument(skip(self, data), level = "trace")]
+        async fn write(&mut self, offset: u64, data: &[&[u8]]) -> anyhow::Result<()> {
+            self.write_blocks(offset, data).await?;
             Ok(())
         }
 
@@ -173,7 +193,7 @@ mod tests {
         write_data[..hello.len()].copy_from_slice(hello);
 
         // Write test
-        device.write_block(0, &write_data).await?;
+        device.write_blocks(0, &[&write_data]).await?;
 
         // Read test
         let mut read_buffer = [0u8; BLOCK_SIZE];
@@ -213,7 +233,7 @@ mod tests {
         write_data[..test_data.len()].copy_from_slice(test_data);
 
         // Write test
-        device.write_block(0, &write_data).await?;
+        device.write_blocks(0, &[&write_data]).await?;
 
         // Read test
         let mut read_buffer = [0u8; BLOCK_SIZE];
