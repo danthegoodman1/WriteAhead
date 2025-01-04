@@ -190,8 +190,6 @@ impl<F: FileIO> Logfile<F> {
             processed_records.push(buf);
         }
 
-        // TODO: Maybe use a mutex just to ensure single access to the writer?
-
         // Convert processed records to slice references
         let record_refs: Vec<&[u8]> = processed_records.iter().map(|r| r.as_slice()).collect();
 
