@@ -1,12 +1,13 @@
 use anyhow::Result;
-use std::{collections::BTreeMap, marker::PhantomData, path::PathBuf, time::Duration};
+use futures::Stream;
+use std::{collections::BTreeMap, marker::PhantomData, path::PathBuf, pin::Pin, time::Duration};
 use tracing::{debug, instrument, trace};
 
 use anyhow::Context;
 
 use crate::{
     fileio::{FileReader, FileWriter},
-    logfile::{file_id_from_path, LogFileWriter, Logfile, WriterCommand},
+    logfile::{file_id_from_path, LogFileStream, LogFileWriter, Logfile, WriterCommand},
     record::RecordID,
 };
 
@@ -142,7 +143,7 @@ impl<WriteF: FileWriter + 'static, ReadF: FileReader + 'static> WriteAhead<Write
         Ok(result)
     }
 
-    #[instrument]
+    #[instrument(skip(self), level = "trace")]
     async fn rotate_log_file(&mut self) -> Result<()> {
         let active_log = self.active_log_file.as_mut().unwrap();
         let logfile_id = self.active_log_id.unwrap();
@@ -168,11 +169,125 @@ impl<WriteF: FileWriter + 'static, ReadF: FileReader + 'static> WriteAhead<Write
 
         Ok(())
     }
+
+    /// Creates a stream that will read all records from all log files sequentially
+    pub async fn create_stream(&self) -> WriteAheadStream<ReadF> {
+        return self.create_stream_from(0, 8).await.unwrap();
+    }
+
+    /// Creates a stream starting from a specific position
+    pub async fn create_stream_from(
+        &self,
+        logfile_id: u64,
+        offset: u64,
+    ) -> Option<WriteAheadStream<ReadF>> {
+        // Create a clone of the log files, starting from logfile_id
+        let keys: Vec<u64> = self
+            .log_files
+            .range(logfile_id..) // Get iterator starting from logfile_id
+            .map(|(k, _)| *k)
+            .collect();
+
+        let mut tree_clone = BTreeMap::new();
+        for key in keys {
+            tree_clone.insert(
+                key,
+                LogFileStream::new(
+                    Logfile::from_file(
+                        &self
+                            .options
+                            .log_dir
+                            .join(format!("{}.log", padded_u64_string(key))),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+            );
+        }
+        WriteAheadStream::from_position(tree_clone, logfile_id, offset)
+    }
 }
 
 fn padded_u64_string(id: u64) -> String {
     format!("{:010}", id)
 }
+
+pub struct WriteAheadStream<F: FileReader> {
+    logfiles: BTreeMap<u64, LogFileStream<F>>,
+    active_log_id: u64,
+    current_stream: LogFileStream<F>,
+}
+
+impl<F: FileReader> WriteAheadStream<F> {
+    /// Creates a new WriteAheadStream starting from the beginning of all log files
+    pub fn new(mut logfiles: BTreeMap<u64, LogFileStream<F>>) -> Self {
+        let active_log_id = *logfiles.keys().next().unwrap_or(&0);
+        let current_stream = logfiles.remove(&active_log_id).unwrap();
+
+        Self {
+            logfiles,
+            active_log_id,
+            current_stream,
+        }
+    }
+
+    /// Creates a new WriteAheadStream starting from a specific log file and offset
+    pub fn from_position(
+        mut logfiles: BTreeMap<u64, LogFileStream<F>>,
+        logfile_id: u64,
+        offset: u64,
+    ) -> Option<Self> {
+        if !logfiles.contains_key(&logfile_id) {
+            return None;
+        }
+
+        let mut stream = logfiles.remove(&logfile_id).unwrap();
+        stream.set_stream_offset(offset.max(8)); // Ensure we start after magic number
+
+        Some(Self {
+            logfiles,
+            active_log_id: logfile_id,
+            current_stream: stream,
+        })
+    }
+}
+
+use std::task::{Context as TaskContext, Poll};
+
+impl<F: FileReader> Stream for WriteAheadStream<F> {
+    type Item = Result<Vec<u8>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            // Try to read from current stream
+            match Pin::new(&mut self.current_stream).poll_next(cx) {
+                Poll::Ready(Some(result)) => {
+                    return Poll::Ready(Some(result));
+                }
+                Poll::Ready(None) => {
+                    // Current stream is exhausted, try to move to next logfile
+                    let next_id = self
+                        .logfiles
+                        .range((self.active_log_id + 1)..)
+                        .next()
+                        .map(|(k, _)| *k);
+                    match next_id {
+                        Some(id) => {
+                            // Create new stream for next logfile
+                            self.active_log_id = id;
+                            self.current_stream = self.logfiles.remove(&id).unwrap();
+                            continue; // Try reading from new stream
+                        }
+                        None => return Poll::Ready(None), // No more logfiles
+                    }
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl<F: FileReader> Unpin for WriteAheadStream<F> {}
 
 #[cfg(test)]
 mod tests {
@@ -190,6 +305,8 @@ mod tests {
 
     use crate::fileio::simple_file::SimpleFile;
     use std::sync::Once;
+
+    use futures::stream::StreamExt;
 
     use super::*;
 
@@ -283,7 +400,7 @@ mod tests {
 
         let mut records = Vec::new();
 
-        // Write 1000 records
+        // Write 10 records
         for i in 0..10 {
             let record = write_ahead
                 .write_batch(vec![format!("Hello, world! {}", i).as_bytes().to_vec()])
@@ -466,5 +583,36 @@ mod tests {
         debug!("Read time taken: {:?}", end.duration_since(start));
 
         std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_uring_batch").unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_ahead_stream() {
+        let _ = std::fs::remove_dir_all("./test_logs/test_write_ahead_stream");
+        create_logger();
+
+        let mut opts = WriteAheadOptions::default();
+        opts.max_file_size = 128; // 1KB
+        opts.log_dir = PathBuf::from("./test_logs/test_write_ahead_stream");
+
+        let mut write_ahead = WriteAhead::<SimpleFile, SimpleFile>::with_options(opts);
+        write_ahead.start().await.unwrap();
+
+        let mut records = Vec::new();
+
+        // Write 100 records
+        for i in 0..100 {
+            let record = write_ahead
+                .write_batch(vec![format!("Hello, world! {}", i).as_bytes().to_vec()])
+                .await
+                .unwrap();
+            records.push(record);
+        }
+
+        // Read it back with the stream
+        let mut stream = write_ahead.create_stream().await;
+        for i in 0..100 {
+            let record = stream.next().await.unwrap().unwrap();
+            assert_eq!(record, format!("Hello, world! {}", i).as_bytes());
+        }
     }
 }

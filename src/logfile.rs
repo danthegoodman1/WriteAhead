@@ -431,6 +431,7 @@ impl<F: FileReader> Stream for LogFileStream<F> {
 
         let future = this.read_and_move_offset(this.offset);
         pin_mut!(future);
+
         match future.poll(cx) {
             Poll::Ready(Ok(record)) => Poll::Ready(Some(Ok(record))),
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
@@ -445,6 +446,13 @@ impl<F: FileReader> LogFileStream<F> {
         Self {
             logfile,
             offset: 8, // Start after magic number
+        }
+    }
+
+    pub fn new_with_offset(logfile: Logfile<F>, offset: u64) -> Self {
+        Self {
+            logfile,
+            offset: if offset < 8 { 8 } else { offset },
         }
     }
 }

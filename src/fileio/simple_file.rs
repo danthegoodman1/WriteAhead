@@ -1,4 +1,5 @@
 use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, Write};
 
 use tracing::instrument;
 
@@ -28,8 +29,6 @@ impl FileWriter for SimpleFile {
 
     #[instrument(skip(self), level = "trace")]
     async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
-        use std::io::{Read, Seek};
-
         let mut fd = &self.fd;
         fd.seek(std::io::SeekFrom::Start(offset))?;
 
@@ -41,8 +40,6 @@ impl FileWriter for SimpleFile {
 
     #[instrument(skip(self, data), level = "trace")]
     fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
-        use std::io::{Seek, Write};
-
         let mut fd = &self.fd;
         fd.seek(std::io::SeekFrom::Start(offset))?;
         fd.write_all(data)?;
@@ -69,8 +66,6 @@ impl FileReader for SimpleFile {
 
     #[instrument(skip(self), level = "trace")]
     async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
-        use std::io::{Read, Seek};
-
         let mut fd = &self.fd;
         fd.seek(std::io::SeekFrom::Start(offset))?;
 
@@ -92,7 +87,7 @@ mod tests {
 
     use super::*;
 
-    use std::{fs::OpenOptions, path::PathBuf};
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn test_write_without_sealing() {
