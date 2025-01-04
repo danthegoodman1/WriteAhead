@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
-use tracing::{debug, trace};
+use tracing::{debug, instrument, trace};
 
 use crate::{fileio::FileIO, murmur3::murmur3_128};
 
@@ -98,11 +98,7 @@ impl<F: FileIO> Logfile<F> {
     ///
     /// The id MUST be unique per file!
     pub async fn new(path: &Path) -> Result<Self> {
-        let mut fio = F::open(path).await?;
-        let mut header = [0u8; 8];
-        header[0..8].copy_from_slice(&MAGIC_NUMBER);
-
-        fio.write(0, &header).unwrap();
+        let fio = F::open(path).await?;
 
         let id = file_id_from_path(path)?;
 
@@ -115,17 +111,6 @@ impl<F: FileIO> Logfile<F> {
 
         Ok(logfile)
     }
-
-    // pub async fn launch(path: &Path, fio: F) -> Result<mpsc::Sender<LogfileMessage>> {
-    //     let logfile = Self::new(path, fio).await?;
-    //     let (tx, rx) = mpsc::channel(100);
-    //     thread::spawn(move || logfile.actor_loop(rx));
-    //     Ok(tx)
-    // }
-
-    // async fn actor_loop(mut self, chan: mpsc::Receiver<LogfileMessage>) {
-    //     loop {}
-    // }
 
     pub async fn from_file(path: &Path) -> Result<Self> {
         let fd = F::open(path).await?;
@@ -260,8 +245,8 @@ pub enum WriterCommand {
 
 #[derive(Debug)]
 pub struct WriteResponse {
-    offsets: Vec<u64>,
-    file_length: u64,
+    pub offsets: Vec<u64>,
+    pub file_length: u64,
 }
 
 #[derive(Debug)]
@@ -275,7 +260,12 @@ pub struct LogFileWriter<F: FileIO> {
 
 impl<F: FileIO + 'static> LogFileWriter<F> {
     async fn new(path: &Path, recv: flume::Receiver<WriterCommand>) -> Result<Self> {
-        let fio = F::open(path).await?;
+        let mut fio = F::open(path).await?;
+        let mut header = [0u8; 8];
+        header[0..8].copy_from_slice(&MAGIC_NUMBER);
+
+        fio.write(0, &header).unwrap();
+
         let file_length = fio.file_length().await;
         let id = file_id_from_path(path)?;
         Ok(Self {
@@ -287,6 +277,7 @@ impl<F: FileIO + 'static> LogFileWriter<F> {
         })
     }
 
+    #[instrument(level = "debug")]
     pub async fn launch(path: &Path) -> Result<flume::Sender<WriterCommand>> {
         let (tx, rx) = flume::unbounded();
         let logfile = Self::new(path, rx).await?;

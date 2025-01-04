@@ -23,5 +23,5 @@ where
 }
 // TODO: break this up into reader and writer traits, so can impl io_uring reader, but sync writer
 
-// pub mod io_uring;
+pub mod io_uring;
 pub mod simple_file;
