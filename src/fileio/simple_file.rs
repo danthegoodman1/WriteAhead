@@ -51,7 +51,7 @@ impl FileWriter for SimpleFile {
         Ok(())
     }
 
-    async fn file_length(&self) -> u64 {
+    fn file_length(&self) -> u64 {
         self.fd.metadata().unwrap().len()
     }
 }
@@ -153,10 +153,10 @@ mod tests {
             .await;
     }
 
-    // #[tokio::test]
-    // async fn test_stream() {
-    //     let path = PathBuf::from("/tmp/07.log");
+    #[tokio::test]
+    async fn test_stream() {
+        let path = PathBuf::from("/tmp/10.log");
 
-    //     logfile::tests::test_stream::<SimpleFile>(path).await;
-    // }
+        logfile::tests::test_stream::<SimpleFile, SimpleFile>(path).await;
+    }
 }

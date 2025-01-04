@@ -290,17 +290,17 @@ mod tests {
     }
 
     // FIXME
-    // #[tokio::test]
-    // async fn test_stream() {
-    //     let _guard = TEST_MUTEX.lock().unwrap();
-    //     if GLOBAL_RING.get().is_none() {
-    //         let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
-    //     }
+    #[tokio::test]
+    async fn test_stream() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        if GLOBAL_RING.get().is_none() {
+            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
+        }
 
-    //     let path = PathBuf::from("/tmp/07.log");
+        let path = PathBuf::from("/tmp/10.log");
 
-    //     logfile::tests::test_stream::<IOUringFile>(path).await;
-    // }
+        logfile::tests::test_stream::<SimpleFile, IOUringFile>(path).await;
+    }
 
     #[tokio::test]
     async fn test_write_magic_number_without_sealing_escape() {

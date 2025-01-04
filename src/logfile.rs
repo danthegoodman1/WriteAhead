@@ -115,7 +115,7 @@ impl<F: FileReader> Logfile<F> {
 
     pub async fn from_file(path: &Path) -> Result<Self> {
         let fd = F::open(path).await?;
-        let file_length = fd.file_length().await;
+        let file_length = fd.file_length();
         let id = file_id_from_path(path)?;
 
         // Read the first 8 bytes of the file
@@ -256,7 +256,7 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
 
         fio.write(0, &header).unwrap();
 
-        let file_length = fio.file_length().await;
+        let file_length = fio.file_length();
         let id = file_id_from_path(path)?;
         Ok(Self {
             id,
@@ -421,35 +421,35 @@ impl<F: FileReader> Stream for LogFileStream<F> {
     type Item = Result<Vec<u8>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        // If we've reached the end of the file (or the footer if sealed)
-        let end_offset = if self.logfile.sealed {
-            self.logfile.file_length() - 9 // Account for the 9-byte footer
-        } else {
-            self.logfile.file_length()
-        };
+        let this = self.get_mut();
 
-        // Add this check to ensure we have enough bytes remaining for at least a record header
-        if self.offset >= end_offset || end_offset - self.offset < 20 {
+        if this.logfile.sealed && this.offset >= this.logfile.file_length() - 9 {
+            return Poll::Ready(None);
+        } else if this.offset >= this.logfile.file_length() {
             return Poll::Ready(None);
         }
 
-        // Create a future to read the record
-        let offset = self.offset;
-        let future = self.read_and_move_offset(offset);
-        pin_mut!(future); // Pin the future so we can poll it
-
-        // Poll the future
-        let result = match future.poll(cx) {
-            Poll::Ready(result) => match result {
-                Ok(record) => Poll::Ready(Some(Ok(record))),
-                Err(e) => Poll::Ready(Some(Err(e))),
-            },
+        let future = this.read_and_move_offset(this.offset);
+        pin_mut!(future);
+        match future.poll(cx) {
+            Poll::Ready(Ok(record)) => Poll::Ready(Some(Ok(record))),
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
             Poll::Pending => Poll::Pending,
-        };
-
-        result
+        }
     }
 }
+
+impl<F: FileReader> LogFileStream<F> {
+    // Add constructor
+    pub fn new(logfile: Logfile<F>) -> Self {
+        Self {
+            logfile,
+            offset: 8, // Start after magic number
+        }
+    }
+}
+
+impl<F: FileReader> Unpin for LogFileStream<F> {}
 
 #[cfg(test)]
 pub mod tests {
@@ -699,27 +699,30 @@ pub mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    // pub async fn test_stream<F: FileIO + 'static>(path: PathBuf) {
-    //     let writer = LogFileWriter::<F>::launch(&path).await.unwrap();
+    pub async fn test_stream<WriteF: FileWriter + 'static, ReadF: FileReader + 'static>(
+        path: PathBuf,
+    ) {
+        let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
 
-    //     // Write 100 records
-    //     let records: Vec<Vec<u8>> = (0..100)
-    //         .map(|i| format!("record_{}", i).into_bytes())
-    //         .collect();
+        // Write 10 records
+        let records: Vec<Vec<u8>> = (0..10)
+            .map(|i| format!("record_{}", i).into_bytes())
+            .collect();
 
-    //     let (tx, rx) = flume::unbounded();
-    //     writer.send(LogfileMessage::Write(tx, records)).unwrap();
-    //     rx.recv().unwrap().unwrap();
+        let (tx, rx) = flume::unbounded();
+        writer.send(WriterCommand::Write(tx, records)).unwrap();
+        rx.recv().unwrap().unwrap();
 
-    //     // Test streaming
-    //     let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
-    //     let mut iter = logfile.stream();
-    //     for i in 0..100 {
-    //         let record = iter.next().await.unwrap().unwrap();
-    //         assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
-    //     }
-    //     assert!(iter.next().await.is_none());
+        // Test streaming
+        let logfile: Logfile<ReadF> = Logfile::from_file(&path).await.unwrap();
+        let mut stream = LogFileStream::new(logfile);
+        for i in 0..10 {
+            let record = stream.next().await.unwrap().unwrap();
+            assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
+        }
+        let next_val = stream.next().await;
+        assert!(next_val.is_none());
 
-    //     std::fs::remove_file(&path).unwrap();
-    // }
+        std::fs::remove_file(&path).unwrap();
+    }
 }
