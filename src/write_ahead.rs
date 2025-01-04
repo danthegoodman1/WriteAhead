@@ -137,6 +137,24 @@ impl<F: FileIO> WriteAhead<F> {
         Ok(RecordID::new(logfile_id.parse::<u64>().unwrap(), offset[0]))
     }
 
+    #[instrument(skip(self, data), level = "trace")]
+    pub async fn write_batch(&mut self, data: &[&[u8]]) -> Result<Vec<RecordID>> {
+        // Write the record to the active log file
+        let active_log = self.active_log_file.as_mut().unwrap();
+        let offset = active_log.write_records(data).await?;
+        let logfile_id = active_log.id.clone();
+
+        // Check if we need to rotate the log file and create the new one
+        if active_log.file_length() > self.options.max_file_size {
+            self.rotate_log_file().await?;
+        }
+
+        Ok(offset
+            .iter()
+            .map(|offset| RecordID::new(logfile_id.parse::<u64>().unwrap(), *offset))
+            .collect())
+    }
+
     #[instrument]
     async fn rotate_log_file(&mut self) -> Result<()> {
         let active_log = self.active_log_file.as_mut().unwrap();
@@ -190,6 +208,9 @@ mod tests {
     static LOGGER_ONCE: Once = Once::new();
     static URING_ONCE: Once = Once::new();
 
+    const NUM_RECORDS: usize = 1000;
+    const BATCH_SIZE: usize = 100;
+
     fn create_logger() {
         LOGGER_ONCE.call_once(|| {
             let subscriber = tracing_subscriber::registry().with(
@@ -214,7 +235,7 @@ mod tests {
                     let _ = GLOBAL_RING.set(Arc::new(Mutex::new(
                         IoUring::builder()
                             .setup_sqpoll(2) // 2000ms timeout
-                            .build(64)
+                            .build(100)
                             .unwrap(),
                     )));
                 }
@@ -306,7 +327,7 @@ mod tests {
         let mut records = Vec::new();
 
         let start = std::time::Instant::now();
-        for i in 0..100 {
+        for i in 0..NUM_RECORDS {
             let record = write_ahead
                 .write(format!("Hello, world! {}", i).as_bytes())
                 .await
@@ -318,7 +339,7 @@ mod tests {
 
         // Read back the records
         let start = std::time::Instant::now();
-        for i in 0..100 {
+        for i in 0..NUM_RECORDS {
             let record = write_ahead
                 .read(records[i].file_id, records[i].file_offset)
                 .await
@@ -345,7 +366,7 @@ mod tests {
         let mut records = Vec::new();
 
         let start = std::time::Instant::now();
-        for i in 0..100 {
+        for i in 0..NUM_RECORDS {
             let record = write_ahead
                 .write(format!("Hello, world! {}", i).as_bytes())
                 .await
@@ -357,7 +378,7 @@ mod tests {
 
         // Read back the records
         let start = std::time::Instant::now();
-        for i in 0..100 {
+        for i in 0..NUM_RECORDS {
             let record = write_ahead
                 .read(records[i].file_id, records[i].file_offset)
                 .await
@@ -368,5 +389,92 @@ mod tests {
         debug!("Read time taken: {:?}", end.duration_since(start));
 
         std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_uring").unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_ahead_large_data_simple_batch() {
+        let _ = std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_simple_batch");
+        create_logger();
+        let mut opts = WriteAheadOptions::default();
+        opts.log_dir = PathBuf::from("./test_logs/test_write_ahead_large_data_simple_batch");
+
+        let mut write_ahead = WriteAhead::<SimpleFile>::with_options(opts);
+        write_ahead.start().await.unwrap();
+
+        // Pre-build all the data
+        let data: Vec<Vec<u8>> = (0..NUM_RECORDS)
+            .map(|i| format!("Hello, world! {}", i).as_bytes().to_vec())
+            .collect();
+
+        let mut records = Vec::new();
+        let start = std::time::Instant::now();
+
+        // Process in chunks
+        for chunk in data.chunks(BATCH_SIZE) {
+            let batch_refs: Vec<&[u8]> = chunk.iter().map(|b| b.as_ref()).collect();
+            let batch_records = write_ahead.write_batch(&batch_refs).await.unwrap();
+            records.extend(batch_records);
+        }
+
+        let end = std::time::Instant::now();
+        debug!("Batch write time taken: {:?}", end.duration_since(start));
+
+        // Read back the records
+        let start = std::time::Instant::now();
+        for i in 0..NUM_RECORDS {
+            let record = write_ahead
+                .read(records[i].file_id, records[i].file_offset)
+                .await
+                .unwrap();
+            assert_eq!(record, format!("Hello, world! {}", i).as_bytes());
+        }
+        let end = std::time::Instant::now();
+        debug!("Read time taken: {:?}", end.duration_since(start));
+
+        std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_simple_batch").unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_write_ahead_large_data_uring_batch() {
+        let _ = std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_uring_batch");
+        create_logger();
+        let mut opts = WriteAheadOptions::default();
+        opts.log_dir = PathBuf::from("./test_logs/test_write_ahead_large_data_uring_batch");
+
+        let mut write_ahead = WriteAhead::<IOUringFile>::with_options(opts);
+        write_ahead.start().await.unwrap();
+
+        // Pre-build all the data
+        let data: Vec<Vec<u8>> = (0..NUM_RECORDS)
+            .map(|i| format!("Hello, world! {}", i).as_bytes().to_vec())
+            .collect();
+
+        let mut records = Vec::new();
+        let start = std::time::Instant::now();
+
+        // Process in chunks
+        for chunk in data.chunks(BATCH_SIZE) {
+            let batch_refs: Vec<&[u8]> = chunk.iter().map(|b| b.as_ref()).collect();
+            let batch_records = write_ahead.write_batch(&batch_refs).await.unwrap();
+            records.extend(batch_records);
+        }
+
+        let end = std::time::Instant::now();
+        debug!("Batch write time taken: {:?}", end.duration_since(start));
+
+        // Read back the records
+        let start = std::time::Instant::now();
+        for i in 0..NUM_RECORDS {
+            let record = write_ahead
+                .read(records[i].file_id, records[i].file_offset)
+                .await
+                .unwrap();
+            assert_eq!(record, format!("Hello, world! {}", i).as_bytes());
+        }
+        let end = std::time::Instant::now();
+        debug!("Read time taken: {:?}", end.duration_since(start));
+
+        std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_uring_batch").unwrap();
     }
 }

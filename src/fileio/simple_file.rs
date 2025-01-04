@@ -40,21 +40,12 @@ impl FileIO for SimpleFile {
     }
 
     #[instrument(skip(self, data), level = "trace")]
-    async fn write(&mut self, offset: u64, data: &[&[u8]]) -> anyhow::Result<()> {
+    async fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
         use std::io::{Seek, Write};
-
-        // Calculate total length and pre-allocate buffer
-        let total_len = data.iter().map(|chunk| chunk.len()).sum();
-        let mut buffer = Vec::with_capacity(total_len);
-
-        // Concatenate all chunks
-        for chunk in data {
-            buffer.extend_from_slice(chunk);
-        }
 
         let mut fd = &self.fd;
         fd.seek(std::io::SeekFrom::Start(offset))?;
-        fd.write_all(&buffer)?;
+        fd.write_all(data)?;
         fd.sync_all()?;
 
         Ok(())

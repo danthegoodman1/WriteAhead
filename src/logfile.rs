@@ -77,7 +77,7 @@ impl<F: FileIO> Logfile<F> {
         header[0..8].copy_from_slice(&MAGIC_NUMBER);
 
         let mut fio = fio;
-        fio.write(0, &[&header])
+        fio.write(0, &header)
             .await
             .context("Failed to write header")?;
 
@@ -151,7 +151,17 @@ impl<F: FileIO> Logfile<F> {
         }
 
         let mut offsets = Vec::with_capacity(records.len());
-        let mut processed_records = Vec::with_capacity(records.len());
+        // Calculate total buffer size needed:
+        // For each record: 16 bytes (hash) + 4 bytes (length) + data length + potential escape bytes
+        // let total_size = records
+        //     .iter()
+        //     .map(|r| {
+        //         let escape_count = r.iter().filter(|&&b| b == 0xff).count();
+        //         20 + r.len() + escape_count
+        //     })
+        //     .sum();
+        // let mut combined_buffer = Vec::with_capacity(total_size);
+        let mut combined_buffer = Vec::new();
         let mut current_offset = self.file_length;
 
         for record in records {
@@ -178,24 +188,20 @@ impl<F: FileIO> Logfile<F> {
             let (hash1, hash2) = murmur3_128(&processed);
             let length = processed.len() as u32;
 
-            // Pre-allocate buffer with exact size (16 bytes for hash + 4 bytes for length + record length)
-            let mut buf = Vec::with_capacity(20 + processed.len());
-            buf.extend_from_slice(&hash1.to_le_bytes());
-            buf.extend_from_slice(&hash2.to_le_bytes());
-            buf.extend_from_slice(&length.to_le_bytes());
-            buf.extend_from_slice(&processed);
-
+            // Add record to the combined buffer
             offsets.push(current_offset);
-            current_offset += buf.len() as u64;
-            processed_records.push(buf);
-        }
+            current_offset += 20 + processed.len() as u64;
 
-        // Convert processed records to slice references
-        let record_refs: Vec<&[u8]> = processed_records.iter().map(|r| r.as_slice()).collect();
+            // Append header and data to combined buffer
+            combined_buffer.extend_from_slice(&hash1.to_le_bytes());
+            combined_buffer.extend_from_slice(&hash2.to_le_bytes());
+            combined_buffer.extend_from_slice(&length.to_le_bytes());
+            combined_buffer.extend_from_slice(&processed);
+        }
 
         // Write all records in one operation
         self.fio
-            .write(self.file_length, &record_refs)
+            .write(self.file_length, &combined_buffer)
             .await
             .context("Failed to write records")?;
 
@@ -275,7 +281,7 @@ impl<F: FileIO> Logfile<F> {
         footer[1..9].copy_from_slice(&MAGIC_NUMBER);
 
         self.fio
-            .write(self.file_length, &[&footer])
+            .write(self.file_length, &footer)
             .await
             .context("Failed to write footer")?;
 
@@ -413,11 +419,7 @@ pub mod tests {
         let offsets = logfile.write_records(&[b"hello"]).await.unwrap();
 
         // Corrupt the record
-        logfile
-            .fio
-            .write(offsets[0] + 22, &[&[b'x']])
-            .await
-            .unwrap();
+        logfile.fio.write(offsets[0] + 22, &[b'x']).await.unwrap();
 
         let result = logfile.read_record(&offsets[0]).await;
         assert!(matches!(
@@ -437,11 +439,7 @@ pub mod tests {
         logfile.seal().await.unwrap();
 
         // Corrupt the record by modifying a single byte in the middle
-        logfile
-            .fio
-            .write(offsets[0] + 22, &[&[b'x']])
-            .await
-            .unwrap();
+        logfile.fio.write(offsets[0] + 22, &[b'x']).await.unwrap();
 
         // Attempting to read the corrupted record should fail due to hash mismatch
         assert!(logfile.read_record(&offsets[0]).await.is_err());
@@ -453,7 +451,7 @@ pub mod tests {
     pub async fn test_corrupted_file_header<F: FileIO>(f: F, path: PathBuf) {
         let invalid_header = [0x00; 16];
         let mut f = f;
-        f.write(0, &[&invalid_header]).await.unwrap();
+        f.write(0, &invalid_header).await.unwrap();
 
         let result = Logfile::<F>::from_file(&path).await;
         assert!(result.is_err());

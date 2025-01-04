@@ -70,40 +70,30 @@ mod linux_impl {
         }
 
         /// Writes multiple blocks to the device in a single submission
-        #[instrument(skip(self, chunks), level = "trace")]
-        pub async fn write_blocks(&self, offset: u64, chunks: &[&[u8]]) -> std::io::Result<()> {
+        #[instrument(skip(self, data), level = "trace")]
+        pub async fn write_data(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
             let fd = io_uring::types::Fd(self.fd.as_ref().unwrap().as_raw_fd());
+
+            let write_e = opcode::Write::new(fd, data.as_ptr(), data.len() as _)
+                .offset(offset)
+                .build()
+                .user_data(0x43);
+
+            // Lock the ring for this operation
             let mut ring = self.ring.lock().await;
 
-            // Submit all write operations at once
-            let mut current_offset = offset;
-            for (i, chunk) in chunks.iter().enumerate() {
-                let write_e = opcode::Write::new(fd, chunk.as_ptr(), chunk.len() as _)
-                    .offset(current_offset)
-                    .build()
-                    .user_data(i as u64);
-
-                unsafe {
-                    ring.submission()
-                        .push(&write_e)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                }
-
-                current_offset += chunk.len() as u64;
+            unsafe {
+                ring.submission()
+                    .push(&write_e)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
-            // Submit and wait for all operations to complete
-            ring.submit_and_wait(chunks.len())?;
+            ring.submit_and_wait(1)?;
 
-            // Process all completions
-            let mut completed = 0;
+            // Process completion
             while let Some(cqe) = ring.completion().next() {
                 if cqe.result() < 0 {
                     return Err(std::io::Error::from_raw_os_error(-cqe.result()));
-                }
-                completed += 1;
-                if completed == chunks.len() {
-                    break;
                 }
             }
 
@@ -137,8 +127,8 @@ mod linux_impl {
         }
 
         #[instrument(skip(self, data), level = "trace")]
-        async fn write(&mut self, offset: u64, data: &[&[u8]]) -> anyhow::Result<()> {
-            self.write_blocks(offset, data).await?;
+        async fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+            self.write_data(offset, data).await?;
             Ok(())
         }
 
@@ -193,7 +183,7 @@ mod tests {
         write_data[..hello.len()].copy_from_slice(hello);
 
         // Write test
-        device.write_blocks(0, &[&write_data]).await?;
+        device.write_data(0, &write_data).await?;
 
         // Read test
         let mut read_buffer = [0u8; BLOCK_SIZE];
@@ -233,7 +223,7 @@ mod tests {
         write_data[..test_data.len()].copy_from_slice(test_data);
 
         // Write test
-        device.write_blocks(0, &[&write_data]).await?;
+        device.write_data(0, &write_data).await?;
 
         // Read test
         let mut read_buffer = [0u8; BLOCK_SIZE];
