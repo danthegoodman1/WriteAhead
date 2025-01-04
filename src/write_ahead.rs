@@ -4,7 +4,11 @@ use tracing::{debug, instrument, trace};
 
 use anyhow::Context;
 
-use crate::{fileio::FileIO, logfile::Logfile, record::RecordID};
+use crate::{
+    fileio::FileIO,
+    logfile::{file_id_from_path, Logfile},
+    record::RecordID,
+};
 
 /// Manager controls the log file rotation and modification.
 ///
@@ -71,10 +75,10 @@ impl<F: FileIO> WriteAhead<F> {
         for log_file in log_files {
             let log_file = log_file.context("Failed to get dir entry")?;
             let path = log_file.path();
-            let file_id = Logfile::<F>::file_id_from_path(&path)?;
+            let file_id = file_id_from_path(&path)?;
             debug!("Loading existing logfile: {}", file_id);
 
-            let logfile = Logfile::new(&file_id, F::open(&path).await?).await?;
+            let logfile = Logfile::new(&path).await?;
             self.log_files
                 .insert(file_id.parse::<u64>().unwrap(), logfile);
         }
@@ -82,11 +86,8 @@ impl<F: FileIO> WriteAhead<F> {
         if self.log_files.is_empty() {
             debug!("Creating initial log file");
             let id_string = padded_u64_string(0);
-            let logfile = Logfile::new(
-                &id_string,
-                F::open(&self.options.log_dir.join(format!("{}.log", id_string))).await?,
-            )
-            .await?;
+            let logfile =
+                Logfile::new(&self.options.log_dir.join(format!("{}.log", id_string))).await?;
             self.log_files.insert(0, logfile);
             // Take ownership of the last inserted logfile
             self.active_log_file = Some(self.log_files.remove(&0).unwrap());
@@ -171,11 +172,8 @@ impl<F: FileIO> WriteAhead<F> {
             .insert(old_log.id.parse::<u64>().unwrap(), old_log);
 
         // Create new active log
-        let new_log = Logfile::new(
-            &id_string,
-            F::open(&self.options.log_dir.join(format!("{}.log", id_string))).await?,
-        )
-        .await?;
+        let new_log =
+            Logfile::new(&self.options.log_dir.join(format!("{}.log", id_string))).await?;
 
         self.active_log_file = Some(new_log);
         Ok(())

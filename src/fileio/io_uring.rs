@@ -243,9 +243,8 @@ mod tests {
         }
 
         let path = PathBuf::from("/tmp/01.log");
-        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
-        logfile::tests::test_write_without_sealing(f, path).await;
+        logfile::tests::test_write_without_sealing::<IOUringFile>(path).await;
     }
 
     #[tokio::test]
@@ -256,9 +255,8 @@ mod tests {
         }
 
         let path = PathBuf::from("/tmp/02.log");
-        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
-        logfile::tests::test_write_with_sealing(f, path).await;
+        logfile::tests::test_write_with_sealing::<IOUringFile>(path).await;
     }
 
     #[tokio::test]
@@ -269,9 +267,8 @@ mod tests {
         }
 
         let path = PathBuf::from("/tmp/03.log");
-        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
-        logfile::tests::test_corrupted_record(f, path).await;
+        logfile::tests::test_corrupted_record::<IOUringFile>(path).await;
     }
 
     #[tokio::test]
@@ -282,9 +279,8 @@ mod tests {
         }
 
         let path = PathBuf::from("/tmp/04.log");
-        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
-        logfile::tests::test_corrupted_record_sealed(f, path).await;
+        logfile::tests::test_corrupted_record_sealed::<IOUringFile>(path).await;
     }
 
     #[tokio::test]
@@ -295,9 +291,8 @@ mod tests {
         }
 
         let path = PathBuf::from("/tmp/05.log");
-        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
-        logfile::tests::test_corrupted_file_header(f, path).await;
+        logfile::tests::test_corrupted_file_header::<IOUringFile>(path).await;
     }
 
     #[tokio::test]
@@ -308,9 +303,8 @@ mod tests {
         }
 
         let path = PathBuf::from("/tmp/06.log");
-        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
-        logfile::tests::test_100_records(f, path).await;
+        logfile::tests::test_100_records::<IOUringFile>(path).await;
     }
 
     // FIXME
@@ -322,9 +316,8 @@ mod tests {
         }
 
         let path = PathBuf::from("/tmp/07.log");
-        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
-        logfile::tests::test_stream(f, path).await;
+        logfile::tests::test_stream::<IOUringFile>(path).await;
     }
 
     #[tokio::test]
@@ -335,9 +328,8 @@ mod tests {
         }
 
         let path = PathBuf::from("/tmp/08.log");
-        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
-        logfile::tests::test_write_magic_number_without_sealing_escape(f, path).await;
+        logfile::tests::test_write_magic_number_without_sealing_escape::<IOUringFile>(path).await;
     }
 
     #[tokio::test]
@@ -348,9 +340,8 @@ mod tests {
         }
 
         let path = PathBuf::from("/tmp/09.log");
-        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
-        logfile::tests::test_write_magic_number_sealing_escape(f, path).await;
+        logfile::tests::test_write_magic_number_sealing_escape::<IOUringFile>(path).await;
     }
 
     // FIXME
@@ -362,9 +353,11 @@ mod tests {
         }
 
         let path = PathBuf::from("/tmp/10.log");
-        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
-        logfile::tests::test_write_magic_number_without_sealing_escape_iterator(f, path).await;
+        logfile::tests::test_write_magic_number_without_sealing_escape_iterator::<IOUringFile>(
+            path,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -375,9 +368,9 @@ mod tests {
         }
 
         let path = PathBuf::from("/tmp/11.log");
-        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
-        logfile::tests::test_write_magic_number_with_sealing_escape_iterator(f, path).await;
+        logfile::tests::test_write_magic_number_with_sealing_escape_iterator::<IOUringFile>(path)
+            .await;
     }
 
     #[tokio::test]
@@ -388,8 +381,7 @@ mod tests {
         }
 
         let path = PathBuf::from("/tmp/12.log");
-        let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
-        logfile::tests::test_write_too_large_record(f, path).await;
+        logfile::tests::test_write_too_large_record::<IOUringFile>(path).await;
     }
 }

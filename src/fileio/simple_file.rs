@@ -68,180 +68,85 @@ mod tests {
     #[tokio::test]
     async fn test_write_without_sealing() {
         let path = PathBuf::from("/tmp/01.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_write_without_sealing(f, path).await;
+        logfile::tests::test_write_without_sealing::<SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_write_with_sealing() {
         let path = PathBuf::from("/tmp/02.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let f = SimpleFile::new(fd).unwrap();
-
-        logfile::tests::test_write_with_sealing(f, path).await;
+        logfile::tests::test_write_with_sealing::<SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_corrupted_record() {
         let path = PathBuf::from("/tmp/03.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_corrupted_record(f, path).await;
+        logfile::tests::test_corrupted_record::<SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_corrupted_record_sealed() {
         let path = PathBuf::from("/tmp/04.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_corrupted_record_sealed(f, path).await;
+        logfile::tests::test_corrupted_record_sealed::<SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_corrupted_file_header() {
         let path = PathBuf::from("/tmp/05.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_corrupted_file_header(f, path).await;
+        logfile::tests::test_corrupted_file_header::<SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_100_records() {
         let path = PathBuf::from("/tmp/06.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_100_records(f, path).await;
+        logfile::tests::test_100_records::<SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_stream() {
         let path = PathBuf::from("/tmp/07.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_stream(f, path).await;
+        logfile::tests::test_stream::<SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_write_magic_number_without_sealing_escape() {
         let path = PathBuf::from("/tmp/08.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_write_magic_number_without_sealing_escape(f, path).await;
+        logfile::tests::test_write_magic_number_without_sealing_escape::<SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_write_magic_number_sealing_escape() {
         let path = PathBuf::from("/tmp/09.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_write_magic_number_sealing_escape(f, path).await;
+        logfile::tests::test_write_magic_number_sealing_escape::<SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_write_magic_number_without_sealing_escape_iterator() {
         let path = PathBuf::from("/tmp/10.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_write_magic_number_without_sealing_escape_iterator(f, path).await;
+        logfile::tests::test_write_magic_number_without_sealing_escape_iterator::<SimpleFile>(path)
+            .await;
     }
 
     #[tokio::test]
     async fn test_write_magic_number_with_sealing_escape_iterator() {
         let path = PathBuf::from("/tmp/11.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_write_magic_number_with_sealing_escape_iterator(f, path).await;
+        logfile::tests::test_write_magic_number_with_sealing_escape_iterator::<SimpleFile>(path)
+            .await;
     }
 
     #[tokio::test]
     async fn test_write_too_large_record() {
         let path = PathBuf::from("/tmp/12.log");
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let f = SimpleFile::new(fd).unwrap();
 
-        logfile::tests::test_write_too_large_record(f, path).await;
+        logfile::tests::test_write_too_large_record::<SimpleFile>(path).await;
     }
 }
