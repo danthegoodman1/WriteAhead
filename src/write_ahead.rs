@@ -1,20 +1,30 @@
 use anyhow::Result;
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use futures::{pin_mut, Stream, StreamExt};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
+use tokio::sync::Mutex;
 use tracing::{debug, instrument, trace};
 
 use anyhow::Context;
 
-use crate::{fileio::FileIO, logfile::Logfile, record::RecordID};
+use crate::{
+    fileio::FileIO,
+    logfile::{LogFileStream, Logfile},
+    record::RecordID,
+};
 
 /// Manager controls the log file rotation and modification.
-///
-/// A manager is single threaded to ensure maximum throughput for disk operations.
-/// Async is just a convenience for using with async server frameworks.
 #[derive(Debug)]
 pub struct WriteAhead<F: FileIO> {
     options: WriteAheadOptions,
-    log_files: BTreeMap<u64, Logfile<F>>,
-    active_log_file: Option<Logfile<F>>,
+    log_files: BTreeMap<u64, Arc<Mutex<Logfile<F>>>>,
+    active_log_file: Option<Arc<Mutex<Logfile<F>>>>,
 }
 
 #[derive(Debug)]
@@ -75,8 +85,10 @@ impl<F: FileIO> WriteAhead<F> {
             debug!("Loading existing logfile: {}", file_id);
 
             let logfile = Logfile::new(&file_id, F::open(&path).await?).await?;
-            self.log_files
-                .insert(file_id.parse::<u64>().unwrap(), logfile);
+            self.log_files.insert(
+                file_id.parse::<u64>().unwrap(),
+                Arc::new(Mutex::new(logfile)),
+            );
         }
 
         if self.log_files.is_empty() {
@@ -87,7 +99,7 @@ impl<F: FileIO> WriteAhead<F> {
                 F::open(&self.options.log_dir.join(format!("{}.log", id_string))).await?,
             )
             .await?;
-            self.log_files.insert(0, logfile);
+            self.log_files.insert(0, Arc::new(Mutex::new(logfile)));
             // Take ownership of the last inserted logfile
             self.active_log_file = Some(self.log_files.remove(&0).unwrap());
         } else {
@@ -105,8 +117,8 @@ impl<F: FileIO> WriteAhead<F> {
     pub async fn read(&mut self, logfile_id: u64, offset: u64) -> Result<Vec<u8>> {
         // Check active log file first
         if let Some(active_log) = &self.active_log_file {
-            if active_log.id.parse::<u64>().unwrap() == logfile_id {
-                return active_log.read_record(&offset).await;
+            if active_log.lock().await.id.parse::<u64>().unwrap() == logfile_id {
+                return active_log.lock().await.read_record(&offset).await;
             }
         }
 
@@ -116,7 +128,7 @@ impl<F: FileIO> WriteAhead<F> {
             .get(&logfile_id)
             .ok_or(WriteAheadError::LogfileNotFound)?;
 
-        logfile.read_record(&offset).await
+        logfile.lock().await.read_record(&offset).await
     }
 
     // #[instrument(skip(self, data), level = "trace")]
@@ -140,12 +152,16 @@ impl<F: FileIO> WriteAhead<F> {
     #[instrument(skip(self, data), level = "trace")]
     pub async fn write_batch(&mut self, data: &[&[u8]]) -> Result<Vec<RecordID>> {
         // Write the record to the active log file
-        let active_log = self.active_log_file.as_mut().unwrap();
-        let offset = active_log.write_records(data).await?;
-        let logfile_id = active_log.id.clone();
+        let (offset, logfile_id, file_length) = {
+            let mut active_log = self.active_log_file.as_mut().unwrap().lock().await;
+            let offset = active_log.write_records(data).await?;
+            let logfile_id = active_log.id.clone();
+            let file_length = active_log.file_length();
+            (offset, logfile_id, file_length)
+        };
 
         // Check if we need to rotate the log file and create the new one
-        if active_log.file_length() > self.options.max_file_size {
+        if file_length > self.options.max_file_size {
             self.rotate_log_file().await?;
         }
 
@@ -157,18 +173,22 @@ impl<F: FileIO> WriteAhead<F> {
 
     #[instrument]
     async fn rotate_log_file(&mut self) -> Result<()> {
-        let active_log = self.active_log_file.as_mut().unwrap();
-        let logfile_id = active_log.id.clone();
+        let logfile_id = {
+            let mut active_log = self.active_log_file.as_mut().unwrap().lock().await;
+            active_log.seal().await?;
+            let logfile_id = active_log.id.clone();
+            logfile_id
+        };
         trace!("Rotating log file {}", logfile_id);
 
-        active_log.seal().await?;
         let next_key = logfile_id.parse::<u64>().unwrap() + 1;
         let id_string = padded_u64_string(next_key);
 
         // Move current active log to the BTreeMap
-        let old_log = self.active_log_file.take().unwrap();
-        self.log_files
-            .insert(old_log.id.parse::<u64>().unwrap(), old_log);
+        self.log_files.insert(
+            logfile_id.parse::<u64>().unwrap(),
+            self.active_log_file.as_mut().unwrap().clone(),
+        );
 
         // Create new active log
         let new_log = Logfile::new(
@@ -177,13 +197,69 @@ impl<F: FileIO> WriteAhead<F> {
         )
         .await?;
 
-        self.active_log_file = Some(new_log);
+        self.active_log_file = Some(Arc::new(Mutex::new(new_log)));
         Ok(())
+    }
+
+    pub fn stream<'a>(&'a mut self, logfile_id: u64, offset: u64) -> WriteAheadStream<'a, F> {
+        WriteAheadStream {
+            write_ahead: self,
+            logfile_id,
+            offset,
+            logfile_stream: None,
+        }
     }
 }
 
 fn padded_u64_string(id: u64) -> String {
     format!("{:010}", id)
+}
+
+struct WriteAheadIterator<'a, F: FileIO> {
+    write_ahead: &'a mut WriteAhead<F>,
+    logfile_id: u64,
+    offset: u64,
+    logfile_stream: Option<LogFileStream<'a, F>>,
+}
+
+impl<'a, F: FileIO> Stream for WriteAheadStream<'a, F> {
+    type Item = Result<Vec<u8>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        // Initialize the logfile stream
+        if self.logfile_stream.is_none() {
+            let min_logfile_id = self.write_ahead.log_files.keys().min().unwrap();
+            self.logfile_stream = Some(
+                self.write_ahead
+                    .log_files
+                    .get(min_logfile_id)
+                    .unwrap()
+                    .lock()
+                    .await
+                    .stream_from_offset(self.offset)
+                    .await,
+            );
+        }
+
+        // Poll the logfile stream
+        let result = match self.logfile_stream.as_mut().unwrap().poll_next_unpin(cx) {
+            Poll::Ready(result) => match result {
+                Some(record) => Poll::Ready(Some(record)),
+                None => {
+                    // If there is another log file, then make a new logfile_stream and jump back to polling
+                    if let Some(logfile) = self.write_ahead.log_files.get_mut(&self.logfile_id) {
+                        self.logfile_stream = Some(logfile.stream_from_offset(self.offset));
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(None)
+                    }
+                }
+            },
+            Poll::Pending => Poll::Pending,
+        };
+
+        result
+    }
 }
 
 #[cfg(test)]

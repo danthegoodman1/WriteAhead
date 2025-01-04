@@ -3,7 +3,9 @@ use futures::{pin_mut, Stream};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
+use tokio::sync::Mutex;
 use tracing::trace;
 
 use crate::{fileio::FileIO, murmur3::murmur3_128};
@@ -42,7 +44,7 @@ pub struct Logfile<F: FileIO> {
     pub sealed: bool,
     pub id: String,
     pub file_length: u64,
-    fio: F,
+    fio: Arc<Mutex<F>>,
 }
 
 const MAGIC_NUMBER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
@@ -84,7 +86,7 @@ impl<F: FileIO> Logfile<F> {
         Ok(Self {
             sealed: false,
             id: id.to_string(),
-            fio,
+            fio: Arc::new(Mutex::new(fio)),
             file_length: 8,
         })
     }
@@ -140,7 +142,7 @@ impl<F: FileIO> Logfile<F> {
         Ok(Self {
             sealed,
             id,
-            fio: fd,
+            fio: Arc::new(Mutex::new(fd)),
             file_length,
         })
     }
@@ -201,6 +203,8 @@ impl<F: FileIO> Logfile<F> {
 
         // Write all records in one operation
         self.fio
+            .lock()
+            .await
             .write(self.file_length, &combined_buffer)
             .await
             .context("Failed to write records")?;
@@ -220,8 +224,10 @@ impl<F: FileIO> Logfile<F> {
             self.sealed
         );
 
+        let fio = self.fio.lock().await;
+
         // Read the hash and length (20 bytes total)
-        let header = self.fio.read(*offset, 20).await.context(
+        let header = fio.read(*offset, 20).await.context(
             "Failed to read record header, is the file corrupted, or a partial write occurred?",
         )?;
 
@@ -248,7 +254,7 @@ impl<F: FileIO> Logfile<F> {
         }
 
         // Read the actual record data
-        let mut record = self.fio.read(*offset + 20, length as u64).await?;
+        let mut record = fio.read(*offset + 20, length as u64).await?;
 
         // Verify the hash
         let (computed_hash1, computed_hash2) = murmur3_128(&record);
@@ -281,6 +287,8 @@ impl<F: FileIO> Logfile<F> {
         footer[1..9].copy_from_slice(&MAGIC_NUMBER);
 
         self.fio
+            .lock()
+            .await
             .write(self.file_length, &footer)
             .await
             .context("Failed to write footer")?;
@@ -289,17 +297,17 @@ impl<F: FileIO> Logfile<F> {
         Ok(())
     }
 
-    pub fn stream(&mut self) -> LogFileStream<F> {
+    pub fn stream(self) -> LogFileStream<F> {
         LogFileStream {
-            logfile: self,
+            logfile: Arc::new(Mutex::new(self)),
             offset: 8,
         }
     }
 
-    pub fn stream_from_offset(&mut self, offset: u64) -> LogFileStream<F> {
+    pub fn stream_from_offset(self, offset: u64) -> LogFileStream<F> {
         let offset = if offset < 8 { 8 } else { offset };
         LogFileStream {
-            logfile: self,
+            logfile: Arc::new(Mutex::new(self)),
             offset,
         }
     }
@@ -309,12 +317,12 @@ impl<F: FileIO> Logfile<F> {
     }
 }
 
-pub struct LogFileStream<'a, F: FileIO> {
-    logfile: &'a mut Logfile<F>,
+pub struct LogFileStream<F: FileIO> {
+    logfile: Arc<Mutex<Logfile<F>>>,
     offset: u64,
 }
 
-impl<'a, F: FileIO> LogFileStream<'a, F> {
+impl<F: FileIO> LogFileStream<F> {
     pub fn reset_stream(&mut self) {
         self.offset = 8;
     }
@@ -328,21 +336,29 @@ impl<'a, F: FileIO> LogFileStream<'a, F> {
     }
 
     async fn read_and_move_offset(&mut self, offset: u64) -> Result<Vec<u8>> {
-        let record = self.logfile.read_record(&offset).await?;
+        let record = self.logfile.lock().await.read_record(&offset).await?;
         self.offset += 20 + record.len() as u64;
         Ok(record)
     }
 }
 
-impl<'a, F: FileIO> Stream for LogFileStream<'a, F> {
+impl<F: FileIO> Stream for LogFileStream<F> {
     type Item = Result<Vec<u8>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         // If we've reached the end of the file (or the footer if sealed)
-        let end_offset = if self.logfile.sealed {
-            self.logfile.file_length - 9 // Account for the 9-byte footer
+        let this = self.clone();
+        let logfile = self.logfile.lock();
+        pin_mut!(logfile);
+        let logfile = match logfile.poll(cx) {
+            Poll::Ready(logfile) => logfile,
+            Poll::Pending => return Poll::Pending,
+        };
+
+        let end_offset = if logfile.sealed {
+            logfile.file_length - 9 // Account for the 9-byte footer
         } else {
-            self.logfile.file_length
+            logfile.file_length
         };
 
         // Add this check to ensure we have enough bytes remaining for at least a record header
@@ -427,7 +443,13 @@ pub mod tests {
         let offsets = logfile.write_records(&[b"hello"]).await.unwrap();
 
         // Corrupt the record
-        logfile.fio.write(offsets[0] + 22, &[b'x']).await.unwrap();
+        logfile
+            .fio
+            .lock()
+            .await
+            .write(offsets[0] + 22, &[b'x'])
+            .await
+            .unwrap();
 
         let result = logfile.read_record(&offsets[0]).await;
         assert!(matches!(
@@ -447,7 +469,13 @@ pub mod tests {
         logfile.seal().await.unwrap();
 
         // Corrupt the record by modifying a single byte in the middle
-        logfile.fio.write(offsets[0] + 22, &[b'x']).await.unwrap();
+        logfile
+            .fio
+            .lock()
+            .await
+            .write(offsets[0] + 22, &[b'x'])
+            .await
+            .unwrap();
 
         // Attempting to read the corrupted record should fail due to hash mismatch
         assert!(logfile.read_record(&offsets[0]).await.is_err());
