@@ -6,7 +6,7 @@ use anyhow::Context;
 
 use crate::{
     fileio::FileIO,
-    logfile::{file_id_from_path, Logfile},
+    logfile::{file_id_from_path, LogFileWriter, Logfile, WriterCommand},
     record::RecordID,
 };
 
@@ -15,10 +15,10 @@ use crate::{
 /// A manager is single threaded to ensure maximum throughput for disk operations.
 /// Async is just a convenience for using with async server frameworks.
 #[derive(Debug)]
-pub struct WriteAhead<F: FileIO> {
+pub struct WriteAhead<WriteF: FileIO, ReadF: FileIO> {
     options: WriteAheadOptions,
-    log_files: BTreeMap<u64, Logfile<F>>,
-    active_log_file: Option<Logfile<F>>,
+    log_files: BTreeMap<u64, Logfile<ReadF>>, // TODO: make this a connection pool
+    active_log_file: Option<LogFileWriter<WriteF>>,
 }
 
 #[derive(Debug)]
@@ -55,7 +55,7 @@ pub enum WriteAheadError {
     RecordNotFound,
 }
 
-impl<F: FileIO> WriteAhead<F> {
+impl<WriteF: FileIO, ReadF: FileIO> WriteAhead<WriteF, ReadF> {
     pub fn with_options(options: WriteAheadOptions) -> Self {
         Self {
             options,
@@ -89,6 +89,7 @@ impl<F: FileIO> WriteAhead<F> {
             let logfile =
                 Logfile::new(&self.options.log_dir.join(format!("{}.log", id_string))).await?;
             self.log_files.insert(0, logfile);
+
             // Take ownership of the last inserted logfile
             self.active_log_file = Some(self.log_files.remove(&0).unwrap());
         } else {
@@ -144,7 +145,11 @@ impl<F: FileIO> WriteAhead<F> {
         let logfile_id = active_log.id.clone();
         trace!("Rotating log file {}", logfile_id);
 
-        active_log.seal().await?;
+        // Seal the log file
+        let (tx, rx) = flume::unbounded();
+        active_log.send(WriterCommand::Seal(tx)).unwrap();
+        rx.recv().unwrap().unwrap();
+
         let next_key = logfile_id.parse::<u64>().unwrap() + 1;
         let id_string = padded_u64_string(next_key);
 
