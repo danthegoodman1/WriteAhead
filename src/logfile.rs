@@ -267,7 +267,7 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
         })
     }
 
-    #[instrument(level = "debug")]
+    #[instrument(level = "trace")]
     pub async fn launch(path: &Path) -> Result<flume::Sender<WriterCommand>> {
         let (tx, rx) = flume::unbounded();
         let logfile = Self::new(path, rx).await?;
@@ -280,7 +280,7 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
             let msg = match self.recv.recv() {
                 Ok(msg) => msg,
                 Err(e) => {
-                    debug!("Logfile {} writer actor disconnected", self.id);
+                    trace!("Logfile {} writer actor disconnected", self.id);
                     return;
                 }
             };
@@ -302,7 +302,7 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
                         .unwrap();
                 }
                 WriterCommand::Seal(return_chan) => {
-                    debug!("Sealing logfile {}", self.id);
+                    trace!("Sealing logfile {}", self.id);
                     return_chan.send(self.seal()).unwrap();
                 }
             }

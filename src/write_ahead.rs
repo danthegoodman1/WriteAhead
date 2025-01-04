@@ -147,7 +147,7 @@ impl<WriteF: FileWriter + 'static, ReadF: FileReader + 'static> WriteAhead<Write
     async fn rotate_log_file(&mut self) -> Result<()> {
         let active_log = self.active_log_file.as_mut().unwrap();
         let logfile_id = self.active_log_id.unwrap();
-        debug!("Rotating log file {}", logfile_id);
+        trace!("Rotating log file {}", logfile_id);
 
         // Seal the log file
         let (tx, rx) = flume::unbounded();
@@ -601,10 +601,13 @@ mod tests {
 
         // Write 100 records
         for i in 0..100 {
+            let start = std::time::Instant::now();
             let record = write_ahead
                 .write_batch(vec![format!("Hello, world! {}", i).as_bytes().to_vec()])
                 .await
                 .unwrap();
+            let end = std::time::Instant::now();
+            debug!("Write time taken: {:?}", end.duration_since(start));
             records.push(record);
         }
 
