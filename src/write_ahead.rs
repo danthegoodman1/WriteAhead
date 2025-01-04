@@ -1,12 +1,10 @@
 use anyhow::Result;
-use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, rc::Rc, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use tracing::{debug, instrument, trace};
 
 use anyhow::Context;
 
 use crate::{fileio::FileIO, logfile::Logfile, record::RecordID};
-
-use std::sync::Once;
 
 /// Manager controls the log file rotation and modification.
 ///
@@ -185,6 +183,7 @@ mod tests {
     use crate::fileio::io_uring::{IOUringFile, GLOBAL_RING};
 
     use crate::fileio::simple_file::SimpleFile;
+    use std::sync::Once;
 
     use super::*;
 

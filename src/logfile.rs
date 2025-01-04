@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Context, Result};
-use futures::{pin_mut, FutureExt, Stream};
+use futures::{pin_mut, Stream};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
-use tracing::{debug, trace};
+use tracing::trace;
 
 use crate::{fileio::FileIO, murmur3::murmur3_128};
 
@@ -367,7 +367,7 @@ pub mod tests {
             .unwrap();
         let offsets = logfile.write_records(&[b"hello"]).await.unwrap();
 
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
+        let logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "01");
         assert!(!logfile.sealed);
         assert_eq!(logfile.read_record(&offsets[0]).await.unwrap(), b"hello");
@@ -397,7 +397,7 @@ pub mod tests {
             Some(LogfileError::WriteToSealed)
         ));
 
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
+        let logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "02");
         assert!(logfile.sealed);
         assert_eq!(logfile.read_record(&offsets[0]).await.unwrap(), b"hello");
@@ -487,7 +487,7 @@ pub mod tests {
         logfile.seal().await.unwrap();
 
         // Reopen the file and verify all records
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
+        let logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         for (i, offset) in offsets.iter().enumerate() {
             let record = logfile.read_record(offset).await.unwrap();
             assert_eq!(
@@ -542,7 +542,7 @@ pub mod tests {
             .unwrap();
         let offsets = logfile.write_records(&[&MAGIC_NUMBER]).await.unwrap();
 
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
+        let logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "08");
         assert!(!logfile.sealed);
         assert_eq!(
@@ -561,7 +561,7 @@ pub mod tests {
         let offsets = logfile.write_records(&[&MAGIC_NUMBER]).await.unwrap();
         logfile.seal().await.unwrap();
 
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
+        let logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "09");
         assert!(logfile.sealed);
         assert_eq!(
