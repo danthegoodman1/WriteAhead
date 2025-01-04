@@ -40,7 +40,7 @@ impl FileIO for SimpleFile {
     }
 
     #[instrument(skip(self, data), level = "trace")]
-    async fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+    async fn write(&self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
         use std::io::{Seek, Write};
 
         let mut fd = &self.fd;
