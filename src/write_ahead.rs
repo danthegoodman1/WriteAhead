@@ -119,23 +119,23 @@ impl<F: FileIO> WriteAhead<F> {
         logfile.read_record(&offset).await
     }
 
-    #[instrument(skip(self, data), level = "trace")]
-    pub async fn write(&mut self, data: &[u8]) -> Result<RecordID> {
-        // TODO: Maybe we make this a batch write internally with some flush interval, and we return a future that will resolve when the data is flushed to disk
-        // Then we can queue them up in memory and flush them to disk in a background task
+    // #[instrument(skip(self, data), level = "trace")]
+    // pub async fn write(&mut self, data: &[u8]) -> Result<RecordID> {
+    //     // TODO: Maybe we make this a batch write internally with some flush interval, and we return a future that will resolve when the data is flushed to disk
+    //     // Then we can queue them up in memory and flush them to disk in a background task
 
-        // Write the record to the active log file
-        let active_log = self.active_log_file.as_mut().unwrap();
-        let offset = active_log.write_records(&[&data]).await?;
-        let logfile_id = active_log.id.clone();
+    //     // Write the record to the active log file
+    //     let active_log = self.active_log_file.as_mut().unwrap();
+    //     let offset = active_log.write_records(&[&data]).await?;
+    //     let logfile_id = active_log.id.clone();
 
-        // Check if we need to rotate the log file and create the new one
-        if active_log.file_length() > self.options.max_file_size {
-            self.rotate_log_file().await?;
-        }
+    //     // Check if we need to rotate the log file and create the new one
+    //     if active_log.file_length() > self.options.max_file_size {
+    //         self.rotate_log_file().await?;
+    //     }
 
-        Ok(RecordID::new(logfile_id.parse::<u64>().unwrap(), offset[0]))
-    }
+    //     Ok(RecordID::new(logfile_id.parse::<u64>().unwrap(), offset[0]))
+    // }
 
     #[instrument(skip(self, data), level = "trace")]
     pub async fn write_batch(&mut self, data: &[&[u8]]) -> Result<Vec<RecordID>> {
@@ -268,11 +268,14 @@ mod tests {
         write_ahead.start().await.unwrap();
 
         // Write a record
-        let record = write_ahead.write("Hello, world!".as_bytes()).await.unwrap();
+        let record = write_ahead
+            .write_batch(&["Hello, world!".as_bytes()])
+            .await
+            .unwrap();
         println!("record: {:?}", record);
         // Read the record
         let record = write_ahead
-            .read(record.file_id, record.file_offset)
+            .read(record[0].file_id, record[0].file_offset)
             .await
             .unwrap();
         assert_eq!(record, "Hello, world!".as_bytes());
@@ -296,7 +299,7 @@ mod tests {
         // Write 1000 records
         for i in 0..200 {
             let record = write_ahead
-                .write(format!("Hello, world! {}", i).as_bytes())
+                .write_batch(&[format!("Hello, world! {}", i).as_bytes()])
                 .await
                 .unwrap();
             records.push(record);
@@ -305,7 +308,7 @@ mod tests {
         // Read back the records
         for i in 0..200 {
             let record = write_ahead
-                .read(records[i].file_id, records[i].file_offset)
+                .read(records[i][0].file_id, records[i][0].file_offset)
                 .await
                 .unwrap();
             assert_eq!(record, format!("Hello, world! {}", i).as_bytes());
@@ -315,7 +318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_ahead_large_data_simple() {
+    async fn test_write_ahead_large_data_simple_sequential() {
         let _ = std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_simple");
         create_logger();
         let mut opts = WriteAheadOptions::default();
@@ -329,7 +332,7 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..NUM_RECORDS {
             let record = write_ahead
-                .write(format!("Hello, world! {}", i).as_bytes())
+                .write_batch(&[format!("Hello, world! {}", i).as_bytes()])
                 .await
                 .unwrap();
             records.push(record);
@@ -341,7 +344,7 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..NUM_RECORDS {
             let record = write_ahead
-                .read(records[i].file_id, records[i].file_offset)
+                .read(records[i][0].file_id, records[i][0].file_offset)
                 .await
                 .unwrap();
             assert_eq!(record, format!("Hello, world! {}", i).as_bytes());
@@ -354,7 +357,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn test_write_ahead_large_data_uring() {
+    async fn test_write_ahead_large_data_uring_sequential() {
         let _ = std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_uring");
         create_logger();
         let mut opts = WriteAheadOptions::default();
@@ -368,7 +371,7 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..NUM_RECORDS {
             let record = write_ahead
-                .write(format!("Hello, world! {}", i).as_bytes())
+                .write_batch(&[format!("Hello, world! {}", i).as_bytes()])
                 .await
                 .unwrap();
             records.push(record);
@@ -380,7 +383,7 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..NUM_RECORDS {
             let record = write_ahead
-                .read(records[i].file_id, records[i].file_offset)
+                .read(records[i][0].file_id, records[i][0].file_offset)
                 .await
                 .unwrap();
             assert_eq!(record, format!("Hello, world! {}", i).as_bytes());
