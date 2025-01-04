@@ -1,10 +1,15 @@
 use anyhow::Result;
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use futures::{Stream, TryStreamExt};
+use std::{collections::BTreeMap, path::PathBuf, pin::Pin, time::Duration};
 use tracing::{debug, instrument, trace};
 
 use anyhow::Context;
 
-use crate::{fileio::FileIO, logfile::Logfile, record::RecordID};
+use crate::{
+    fileio::FileIO,
+    logfile::{LogFileStream, Logfile},
+    record::RecordID,
+};
 
 /// Manager controls the log file rotation and modification.
 ///
@@ -479,5 +484,73 @@ mod tests {
         debug!("Read time taken: {:?}", end.duration_since(start));
 
         std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_uring_batch").unwrap();
+    }
+}
+
+// The WriteAheadStream needs to be tied to the lifetime of WriteAhead
+pub struct WriteAheadStream<'a, F: FileIO> {
+    write_ahead: &'a mut WriteAhead<F>,
+    current_logfile_id: u64,
+    current_stream: Option<LogFileStream<'a, F>>,
+}
+
+impl<'a, F: FileIO> WriteAheadStream<'a, F> {
+    pub fn new(write_ahead: &'a mut WriteAhead<F>) -> Self {
+        // Get the first logfile ID (could be from active or stored files)
+        let first_id = *write_ahead.log_files.first_key_value().unwrap().0;
+
+        Self {
+            write_ahead,
+            current_logfile_id: first_id,
+            current_stream: None,
+        }
+    }
+
+    // Helper to get next stream when current one is exhausted
+    fn advance_to_next_stream(&mut self) -> Option<()> {
+        // If we have an active stream, drop it
+        self.current_stream = None;
+
+        // Try to get next logfile
+        let next_logfile = self
+            .write_ahead
+            .log_files
+            .get_mut(&self.current_logfile_id)?;
+
+        // Create new stream
+        self.current_stream = Some(LogFileStream::new(next_logfile));
+        self.current_logfile_id += 1;
+        Some(())
+    }
+}
+
+use std::task::{Context as TaskContext, Poll};
+
+impl<'a, F: FileIO> Stream for WriteAheadStream<'a, F> {
+    type Item = Result<Vec<u8>, anyhow::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            // If we have an active stream, try to get next item
+            if let Some(stream) = &mut self.current_stream {
+                match Pin::new(stream).poll_next(cx) {
+                    Poll::Ready(Some(item)) => return Poll::Ready(Some(item)),
+                    Poll::Ready(None) => {
+                        // Current stream exhausted, try to advance
+                        if self.advance_to_next_stream().is_none() {
+                            return Poll::Ready(None);
+                        }
+                        // Continue loop to poll new stream
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            } else {
+                // No active stream, try to advance
+                if self.advance_to_next_stream().is_none() {
+                    return Poll::Ready(None);
+                }
+                // Continue loop to poll new stream
+            }
+        }
     }
 }

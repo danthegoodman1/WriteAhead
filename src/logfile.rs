@@ -289,21 +289,6 @@ impl<F: FileIO> Logfile<F> {
         Ok(())
     }
 
-    pub fn stream(&mut self) -> LogFileStream<F> {
-        LogFileStream {
-            logfile: self,
-            offset: 8,
-        }
-    }
-
-    pub fn stream_from_offset(&mut self, offset: u64) -> LogFileStream<F> {
-        let offset = if offset < 8 { 8 } else { offset };
-        LogFileStream {
-            logfile: self,
-            offset,
-        }
-    }
-
     pub fn file_length(&self) -> u64 {
         self.file_length
     }
@@ -315,6 +300,18 @@ pub struct LogFileStream<'a, F: FileIO> {
 }
 
 impl<'a, F: FileIO> LogFileStream<'a, F> {
+    pub fn new(logfile: &'a mut Logfile<F>) -> Self {
+        Self { logfile, offset: 8 }
+    }
+
+    pub fn new_from_offset(logfile: &'a mut Logfile<F>, offset: u64) -> Self {
+        if offset < 8 {
+            Self { logfile, offset: 8 }
+        } else {
+            Self { logfile, offset }
+        }
+    }
+
     pub fn reset_stream(&mut self) {
         self.offset = 8;
     }
@@ -523,7 +520,7 @@ pub mod tests {
 
         // First iteration
         {
-            let mut iter = logfile.stream();
+            let mut iter = LogFileStream::new(&mut logfile);
             for i in 0..100 {
                 let record = iter.next().await.unwrap().unwrap();
                 assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
@@ -533,7 +530,7 @@ pub mod tests {
 
         // Second iteration - verify we can create a new iterator and read again
         {
-            let mut iter = logfile.stream();
+            let mut iter = LogFileStream::new(&mut logfile);
             for i in 0..100 {
                 let record = iter.next().await.unwrap().unwrap();
                 assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
@@ -589,7 +586,7 @@ pub mod tests {
         logfile.write_records(&[&MAGIC_NUMBER]).await.unwrap();
 
         let file_length = logfile.file_length.clone();
-        let mut iter = logfile.stream();
+        let mut iter = LogFileStream::new(&mut logfile);
         let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
         println!("offset: {} file length: {}", iter.offset, file_length);
@@ -601,7 +598,7 @@ pub mod tests {
         assert_eq!(logfile.id, "10");
         assert!(!logfile.sealed);
 
-        let mut iter = logfile.stream();
+        let mut iter = LogFileStream::new(&mut logfile);
         let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
         assert!(iter.next().await.is_none());
@@ -621,7 +618,7 @@ pub mod tests {
 
         // First iteration
         {
-            let mut iter = logfile.stream();
+            let mut iter = LogFileStream::new(&mut logfile);
             let record = iter.next().await.unwrap().unwrap();
             assert_eq!(record, MAGIC_NUMBER);
             assert!(iter.next().await.is_none());
@@ -632,7 +629,7 @@ pub mod tests {
 
         // Second iteration after sealing
         {
-            let mut iter = logfile.stream();
+            let mut iter = LogFileStream::new(&mut logfile);
             let record = iter.next().await.unwrap().unwrap();
             assert_eq!(record, MAGIC_NUMBER);
             assert!(iter.next().await.is_none());
@@ -643,7 +640,7 @@ pub mod tests {
         assert_eq!(logfile.id, "11");
         assert!(logfile.sealed);
 
-        let mut iter = logfile.stream();
+        let mut iter = LogFileStream::new(&mut logfile);
         let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
         assert!(iter.next().await.is_none());
