@@ -18,4 +18,4 @@ Some relationships:
 - A WriteAheadStream must take a snapshot of existing Logfiles, but may gather new ones. This ensures no gaps are created from dropping. Therefore the BTreeMap will need either a Mutex, or maybe just some atomic/waiting for the ability to take mutability. Or we can have some sequential processing of instructions, and rolling and TTL'ing is an internally sent instruction (maybe use mpsc then, and poke a worker via another mpsc)
 - For writing, we can still keep a reference to the active log file outside in a dedicated Arc so we don't need to lock to write
 
-Updating in a github issue
+Updating in a github issue: https://github.com/danthegoodman1/WriteAhead/issues/3
