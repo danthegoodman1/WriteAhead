@@ -37,6 +37,12 @@ TLDR it's super fast.
 
 # Notes
 
+## Separating writers and readers
+
+By using a single writer, we can increase throughput via batching with simplicity (exploration of `io_uring` for writing planned).
+
+With a separate reader, can we have a single writer using the `sfd::fs::File`, while readers can use `io_uring` to prevent blocking each other. This means the writer never waits for readers, and the readers never wait for each other.
+
 ## Integrating with a thread-safe API framework (Axum, tonic, etc.)
 
 Since WriteAhead is single-threaded, to preserve performance it's probably best to spawn off a thread dedicated for this, and use a channel to communicate writes and reads. Then you can even buffer them up in memory and micro-batch them (e.g. at most 500us) for increased throughput.
