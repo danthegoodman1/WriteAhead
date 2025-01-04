@@ -17,7 +17,7 @@ use crate::{
 #[derive(Debug)]
 pub struct WriteAhead<WriteF: FileIO, ReadF: FileIO> {
     options: WriteAheadOptions,
-    log_files: BTreeMap<u64, Logfile<ReadF>>, // TODO: make this a connection pool
+    log_files: BTreeMap<u64, Logfile<ReadF>>, // TODO: make this a reader connection pool?
     active_log_file: Option<LogFileWriter<WriteF>>,
 }
 

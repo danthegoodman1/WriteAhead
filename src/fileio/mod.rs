@@ -21,6 +21,7 @@ where
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<()>;
     fn file_length(&self) -> impl Future<Output = u64> + Send;
 }
+// TODO: break this up into reader and writer traits, so can impl io_uring reader, but sync writer
 
 // pub mod io_uring;
 pub mod simple_file;
