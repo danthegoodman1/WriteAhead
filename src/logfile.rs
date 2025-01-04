@@ -254,8 +254,14 @@ impl<F: FileIO> Drop for Logfile<F> {
 }
 
 pub enum WriterCommand {
-    Write(flume::Sender<Result<Vec<u64>>>, Vec<Vec<u8>>),
+    Write(flume::Sender<Result<WriteResponse>>, Vec<Vec<u8>>),
     Seal(flume::Sender<Result<()>>),
+}
+
+#[derive(Debug)]
+pub struct WriteResponse {
+    offsets: Vec<u64>,
+    file_length: u64,
 }
 
 #[derive(Debug)]
@@ -300,7 +306,19 @@ impl<F: FileIO + 'static> LogFileWriter<F> {
             match msg {
                 WriterCommand::Write(return_chan, data) => {
                     trace!("Writing {} records to logfile {}", data.len(), self.id);
-                    return_chan.send(self.write_records(data)).unwrap();
+                    let offsets = match self.write_records(data) {
+                        Ok(offsets) => offsets,
+                        Err(e) => {
+                            return_chan.send(Err(e)).unwrap();
+                            continue;
+                        }
+                    };
+                    return_chan
+                        .send(Ok(WriteResponse {
+                            offsets,
+                            file_length: self.file_length,
+                        }))
+                        .unwrap();
                 }
                 WriterCommand::Seal(return_chan) => {
                     debug!("Sealing logfile {}", self.id);
@@ -464,7 +482,8 @@ pub mod tests {
         writer
             .send(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
             .unwrap();
-        let offsets = rx.recv().unwrap().unwrap();
+        let response = rx.recv().unwrap().unwrap();
+        let offsets = response.offsets;
 
         let logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "01");
@@ -480,7 +499,8 @@ pub mod tests {
         writer
             .send(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
             .unwrap();
-        let offsets = rx.recv().unwrap().unwrap();
+        let response = rx.recv().unwrap().unwrap();
+        let offsets = response.offsets;
 
         // Seal the file
         let (tx, rx) = flume::unbounded();
@@ -514,7 +534,8 @@ pub mod tests {
         writer
             .send(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
             .unwrap();
-        let offsets = rx.recv().unwrap().unwrap();
+        let response = rx.recv().unwrap().unwrap();
+        let offsets = response.offsets;
 
         // Corrupt the record directly using a new file handle
         let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
@@ -537,7 +558,8 @@ pub mod tests {
         writer
             .send(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
             .unwrap();
-        let offsets = rx.recv().unwrap().unwrap();
+        let response = rx.recv().unwrap().unwrap();
+        let offsets = response.offsets;
 
         // Seal the file
         let (tx, rx) = flume::unbounded();
@@ -562,7 +584,8 @@ pub mod tests {
 
         let (tx, rx) = flume::unbounded();
         writer.send(WriterCommand::Write(tx, records)).unwrap();
-        let offsets = rx.recv().unwrap().unwrap();
+        let response = rx.recv().unwrap().unwrap();
+        let offsets = response.offsets;
 
         // Seal the file
         let (tx, rx) = flume::unbounded();
@@ -588,7 +611,8 @@ pub mod tests {
         writer
             .send(WriterCommand::Write(tx, vec![MAGIC_NUMBER.to_vec()]))
             .unwrap();
-        let offsets = rx.recv().unwrap().unwrap();
+        let response = rx.recv().unwrap().unwrap();
+        let offsets = response.offsets;
 
         let logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "08");
@@ -609,7 +633,8 @@ pub mod tests {
         writer
             .send(WriterCommand::Write(tx, vec![MAGIC_NUMBER.to_vec()]))
             .unwrap();
-        let offsets = rx.recv().unwrap().unwrap();
+        let response = rx.recv().unwrap().unwrap();
+        let offsets = response.offsets;
 
         // Seal the file
         let (tx, rx) = flume::unbounded();
@@ -634,7 +659,8 @@ pub mod tests {
 
         let (tx, rx) = flume::unbounded();
         writer.send(WriterCommand::Write(tx, records)).unwrap();
-        let offsets = rx.recv().unwrap().unwrap();
+        let response = rx.recv().unwrap().unwrap();
+        let offsets = response.offsets;
 
         let logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(offsets.len(), 3);
