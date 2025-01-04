@@ -8,6 +8,8 @@ For distributed usage, consider FDB's model (may want to place a custom in-memor
 
 Almost always under 200us persistence on my M3 MBP, rarely breaking the 1ms mark when a log rotation occurrs.
 
+This is an aggressive log rotation test where each write is a `Hello world! {i}` record, and log rotation occurs every 5 messages due to log file size restrictions:
+
 ```
 2025-01-04T20:07:40.161477Z DEBUG src/write_ahead.rs:610: Write time taken: 1.003083ms
 2025-01-04T20:07:40.161649Z DEBUG src/write_ahead.rs:610: Write time taken: 154.542µs
