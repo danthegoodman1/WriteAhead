@@ -3,8 +3,10 @@ use futures::{pin_mut, Stream};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use tracing::trace;
+use tracing::{debug, trace};
 
 use crate::{fileio::FileIO, murmur3::murmur3_128};
 
@@ -42,6 +44,7 @@ pub struct Logfile<F: FileIO> {
     pub sealed: bool,
     pub id: String,
     pub file_length: u64,
+    delete_on_drop: AtomicBool,
     fio: F,
 }
 
@@ -76,7 +79,6 @@ impl<F: FileIO> Logfile<F> {
         let mut header = [0u8; 8];
         header[0..8].copy_from_slice(&MAGIC_NUMBER);
 
-        let mut fio = fio;
         fio.write(0, &header)
             .await
             .context("Failed to write header")?;
@@ -86,6 +88,7 @@ impl<F: FileIO> Logfile<F> {
             id: id.to_string(),
             fio,
             file_length: 8,
+            delete_on_drop: AtomicBool::new(false),
         })
     }
 
@@ -142,6 +145,7 @@ impl<F: FileIO> Logfile<F> {
             id,
             fio: fd,
             file_length,
+            delete_on_drop: AtomicBool::new(false),
         })
     }
 
@@ -292,19 +296,36 @@ impl<F: FileIO> Logfile<F> {
     pub fn file_length(&self) -> u64 {
         self.file_length
     }
+
+    pub fn delete(&mut self) {
+        self.delete_on_drop
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
-pub struct LogFileStream<'a, F: FileIO> {
-    logfile: &'a mut Logfile<F>,
+impl<F: FileIO> Drop for Logfile<F> {
+    fn drop(&mut self) {
+        if self
+            .delete_on_drop
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            debug!("Deleting logfile {}", self.id);
+            std::fs::remove_file(&self.id).unwrap();
+        }
+    }
+}
+
+pub struct LogFileStream<F: FileIO> {
+    logfile: Arc<Logfile<F>>,
     offset: u64,
 }
 
-impl<'a, F: FileIO> LogFileStream<'a, F> {
-    pub fn new(logfile: &'a mut Logfile<F>) -> Self {
+impl<F: FileIO> LogFileStream<F> {
+    pub fn new(logfile: Arc<Logfile<F>>) -> Self {
         Self { logfile, offset: 8 }
     }
 
-    pub fn new_from_offset(logfile: &'a mut Logfile<F>, offset: u64) -> Self {
+    pub fn new_from_offset(logfile: Arc<Logfile<F>>, offset: u64) -> Self {
         if offset < 8 {
             Self { logfile, offset: 8 }
         } else {
@@ -331,7 +352,7 @@ impl<'a, F: FileIO> LogFileStream<'a, F> {
     }
 }
 
-impl<'a, F: FileIO> Stream for LogFileStream<'a, F> {
+impl<F: FileIO> Stream for LogFileStream<F> {
     type Item = Result<Vec<u8>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
@@ -519,8 +540,9 @@ pub mod tests {
         }
 
         // First iteration
+        let logfile = Arc::new(logfile);
         {
-            let mut iter = LogFileStream::new(&mut logfile);
+            let mut iter = LogFileStream::new(logfile.clone());
             for i in 0..100 {
                 let record = iter.next().await.unwrap().unwrap();
                 assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
@@ -530,7 +552,7 @@ pub mod tests {
 
         // Second iteration - verify we can create a new iterator and read again
         {
-            let mut iter = LogFileStream::new(&mut logfile);
+            let mut iter = LogFileStream::new(logfile.clone());
             for i in 0..100 {
                 let record = iter.next().await.unwrap().unwrap();
                 assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
@@ -585,20 +607,20 @@ pub mod tests {
             .unwrap();
         logfile.write_records(&[&MAGIC_NUMBER]).await.unwrap();
 
-        let file_length = logfile.file_length.clone();
-        let mut iter = LogFileStream::new(&mut logfile);
+        let logfile = Arc::new(logfile);
+        let mut iter = LogFileStream::new(logfile.clone());
         let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
-        println!("offset: {} file length: {}", iter.offset, file_length);
         let res = iter.next().await;
         println!("res: {:?}", res);
         assert!(res.is_none());
 
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
+        let logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "10");
         assert!(!logfile.sealed);
 
-        let mut iter = LogFileStream::new(&mut logfile);
+        let logfile = Arc::new(logfile);
+        let mut iter = LogFileStream::new(logfile.clone());
         let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
         assert!(iter.next().await.is_none());
