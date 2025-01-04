@@ -17,7 +17,6 @@ where
     Self: Sized + Send + Sync + std::fmt::Debug,
 {
     fn open(path: &Path) -> impl Future<Output = Result<Self>> + Send;
-    fn read(&self, offset: u64, size: u64) -> impl Future<Output = Result<Vec<u8>>> + Send;
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<()>;
     fn file_length(&self) -> u64;
 }

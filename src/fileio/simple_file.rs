@@ -27,17 +27,6 @@ impl FileWriter for SimpleFile {
         Self::new(fd)
     }
 
-    #[instrument(skip(self), level = "trace")]
-    async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
-        let mut fd = &self.fd;
-        fd.seek(std::io::SeekFrom::Start(offset))?;
-
-        let mut buffer = vec![0u8; size as usize];
-        fd.read_exact(&mut buffer)?;
-
-        Ok(buffer)
-    }
-
     #[instrument(skip(self, data), level = "trace")]
     fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
         let mut fd = &self.fd;
