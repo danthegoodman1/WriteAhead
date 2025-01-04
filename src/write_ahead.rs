@@ -120,24 +120,6 @@ impl<F: FileIO> WriteAhead<F> {
         logfile.read_record(&offset).await
     }
 
-    // #[instrument(skip(self, data), level = "trace")]
-    // pub async fn write(&mut self, data: &[u8]) -> Result<RecordID> {
-    //     // TODO: Maybe we make this a batch write internally with some flush interval, and we return a future that will resolve when the data is flushed to disk
-    //     // Then we can queue them up in memory and flush them to disk in a background task
-
-    //     // Write the record to the active log file
-    //     let active_log = self.active_log_file.as_mut().unwrap();
-    //     let offset = active_log.write_records(&[&data]).await?;
-    //     let logfile_id = active_log.id.clone();
-
-    //     // Check if we need to rotate the log file and create the new one
-    //     if active_log.file_length() > self.options.max_file_size {
-    //         self.rotate_log_file().await?;
-    //     }
-
-    //     Ok(RecordID::new(logfile_id.parse::<u64>().unwrap(), offset[0]))
-    // }
-
     #[instrument(skip(self, data), level = "trace")]
     pub async fn write_batch(&mut self, data: &[&[u8]]) -> Result<Vec<RecordID>> {
         // Write the record to the active log file
