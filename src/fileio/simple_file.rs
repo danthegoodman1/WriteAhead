@@ -80,7 +80,7 @@ impl FileReader for SimpleFile {
         Ok(buffer)
     }
 
-    async fn file_length(&self) -> u64 {
+    fn file_length(&self) -> u64 {
         self.fd.metadata().unwrap().len()
     }
 }

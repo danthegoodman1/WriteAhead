@@ -14,7 +14,7 @@ mod linux_impl {
     pub static GLOBAL_RING: OnceCell<Arc<Mutex<IoUring>>> = OnceCell::new();
 
     pub struct IOUringFile {
-        fd: Option<std::fs::File>,
+        fd: std::fs::File,
         ring: Arc<Mutex<IoUring>>,
     }
 
@@ -35,13 +35,13 @@ mod linux_impl {
                 .create(true)
                 .open(device_path)?;
 
-            Ok(Self { fd: Some(fd), ring })
+            Ok(Self { fd, ring })
         }
 
         /// Reads a block from the device into the given buffer.
         #[instrument(skip(self, buffer), level = "trace")]
         pub async fn read_block(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
-            let fd = io_uring::types::Fd(self.fd.as_ref().unwrap().as_raw_fd());
+            let fd = io_uring::types::Fd(self.fd.as_raw_fd());
 
             let read_e = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as _)
                 .offset(offset)
@@ -72,7 +72,7 @@ mod linux_impl {
         /// Writes multiple blocks to the device in a single submission
         #[instrument(skip(self, data), level = "trace")]
         pub async fn write_data(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
-            let fd = io_uring::types::Fd(self.fd.as_ref().unwrap().as_raw_fd());
+            let fd = io_uring::types::Fd(self.fd.as_raw_fd());
 
             let write_e = opcode::Write::new(fd, data.as_ptr(), data.len() as _)
                 .offset(offset)
@@ -101,14 +101,6 @@ mod linux_impl {
         }
     }
 
-    impl Drop for IOUringFile {
-        fn drop(&mut self) {
-            if let Some(fd) = self.fd.take() {
-                drop(fd);
-            }
-        }
-    }
-
     use anyhow::Result;
 
     impl FileReader for IOUringFile {
@@ -126,12 +118,8 @@ mod linux_impl {
             Ok(buffer)
         }
 
-        async fn file_length(&self) -> u64 {
-            self.fd
-                .as_ref()
-                .and_then(|f| f.metadata().ok())
-                .map(|m| m.len())
-                .unwrap_or(0)
+        fn file_length(&self) -> u64 {
+            self.fd.metadata().unwrap().len()
         }
     }
 }

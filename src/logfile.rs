@@ -211,6 +211,10 @@ impl<F: FileReader> Logfile<F> {
         self.delete_on_drop
             .store(true, std::sync::atomic::Ordering::Release);
     }
+
+    fn file_length(&self) -> u64 {
+        self.fio.file_length()
+    }
 }
 
 impl<F: FileReader> Drop for Logfile<F> {
@@ -388,64 +392,64 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
     }
 }
 
-// pub struct LogFileStream<'a, F: FileWriter> {
-//     logfile: &'a mut Logfile<F>,
-//     offset: u64,
-// }
+pub struct LogFileStream<F: FileReader> {
+    logfile: Logfile<F>,
+    offset: u64,
+}
 
-// impl<'a, F: FileWriter> LogFileStream<'a, F> {
-//     pub fn reset_stream(&mut self) {
-//         self.offset = 8;
-//     }
+impl<F: FileReader> LogFileStream<F> {
+    pub fn reset_stream(&mut self) {
+        self.offset = 8;
+    }
 
-//     pub fn stream_offset(&self) -> u64 {
-//         self.offset
-//     }
+    pub fn stream_offset(&self) -> u64 {
+        self.offset
+    }
 
-//     pub fn set_stream_offset(&mut self, offset: u64) {
-//         self.offset = offset;
-//     }
+    pub fn set_stream_offset(&mut self, offset: u64) {
+        self.offset = offset;
+    }
 
-//     async fn read_and_move_offset(&mut self, offset: u64) -> Result<Vec<u8>> {
-//         let record = self.logfile.read_record(&offset).await?;
-//         self.offset += 20 + record.len() as u64;
-//         Ok(record)
-//     }
-// }
+    async fn read_and_move_offset(&mut self, offset: u64) -> Result<Vec<u8>> {
+        let record = self.logfile.read_record(&offset).await?;
+        self.offset += 20 + record.len() as u64;
+        Ok(record)
+    }
+}
 
-// impl<'a, F: FileIO> Stream for LogFileStream<'a, F> {
-//     type Item = Result<Vec<u8>>;
+impl<F: FileReader> Stream for LogFileStream<F> {
+    type Item = Result<Vec<u8>>;
 
-//     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-//         // If we've reached the end of the file (or the footer if sealed)
-//         let end_offset = if self.logfile.sealed {
-//             self.logfile.file_length - 9 // Account for the 9-byte footer
-//         } else {
-//             self.logfile.file_length
-//         };
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        // If we've reached the end of the file (or the footer if sealed)
+        let end_offset = if self.logfile.sealed {
+            self.logfile.file_length() - 9 // Account for the 9-byte footer
+        } else {
+            self.logfile.file_length()
+        };
 
-//         // Add this check to ensure we have enough bytes remaining for at least a record header
-//         if self.offset >= end_offset || end_offset - self.offset < 20 {
-//             return Poll::Ready(None);
-//         }
+        // Add this check to ensure we have enough bytes remaining for at least a record header
+        if self.offset >= end_offset || end_offset - self.offset < 20 {
+            return Poll::Ready(None);
+        }
 
-//         // Create a future to read the record
-//         let offset = self.offset;
-//         let future = self.read_and_move_offset(offset);
-//         pin_mut!(future); // Pin the future so we can poll it
+        // Create a future to read the record
+        let offset = self.offset;
+        let future = self.read_and_move_offset(offset);
+        pin_mut!(future); // Pin the future so we can poll it
 
-//         // Poll the future
-//         let result = match future.poll(cx) {
-//             Poll::Ready(result) => match result {
-//                 Ok(record) => Poll::Ready(Some(Ok(record))),
-//                 Err(e) => Poll::Ready(Some(Err(e))),
-//             },
-//             Poll::Pending => Poll::Pending,
-//         };
+        // Poll the future
+        let result = match future.poll(cx) {
+            Poll::Ready(result) => match result {
+                Ok(record) => Poll::Ready(Some(Ok(record))),
+                Err(e) => Poll::Ready(Some(Err(e))),
+            },
+            Poll::Pending => Poll::Pending,
+        };
 
-//         result
-//     }
-// }
+        result
+    }
+}
 
 #[cfg(test)]
 pub mod tests {
