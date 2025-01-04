@@ -5,7 +5,7 @@ use tracing::{debug, instrument, trace};
 use anyhow::Context;
 
 use crate::{
-    fileio::FileIO,
+    fileio::{FileReader, FileWriter},
     logfile::{file_id_from_path, LogFileWriter, Logfile, WriterCommand},
     record::RecordID,
 };
@@ -15,7 +15,7 @@ use crate::{
 /// A manager is single threaded to ensure maximum throughput for disk operations.
 /// Async is just a convenience for using with async server frameworks.
 #[derive(Debug)]
-pub struct WriteAhead<WriteF: FileIO, ReadF: FileIO> {
+pub struct WriteAhead<WriteF: FileWriter, ReadF: FileReader> {
     options: WriteAheadOptions,
     log_files: BTreeMap<u64, Logfile<ReadF>>, // TODO: make this a reader connection pool?
     active_log_file: Option<flume::Sender<WriterCommand>>,
@@ -57,7 +57,7 @@ pub enum WriteAheadError {
     RecordNotFound,
 }
 
-impl<WriteF: FileIO + 'static, ReadF: FileIO + 'static> WriteAhead<WriteF, ReadF> {
+impl<WriteF: FileWriter + 'static, ReadF: FileReader + 'static> WriteAhead<WriteF, ReadF> {
     pub fn with_options(options: WriteAheadOptions) -> Self {
         Self {
             options,
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    // #[tokio::test]
+    #[tokio::test]
     async fn test_write_ahead_large_data_uring_sequential() {
         let _ = std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_uring");
         create_logger();
@@ -425,7 +425,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    // #[tokio::test]
+    #[tokio::test]
     async fn test_write_ahead_large_data_uring_batch() {
         let _ = std::fs::remove_dir_all("./test_logs/test_write_ahead_large_data_uring_batch");
         create_logger();

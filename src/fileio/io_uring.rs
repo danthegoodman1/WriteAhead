@@ -1,6 +1,6 @@
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use crate::fileio::FileIO;
+    use crate::fileio::{FileReader, FileWriter};
 
     use io_uring::{opcode, IoUring};
     use once_cell::sync::OnceCell;
@@ -111,7 +111,7 @@ mod linux_impl {
 
     use anyhow::Result;
 
-    impl FileIO for IOUringFile {
+    impl FileReader for IOUringFile {
         async fn open(path: &Path) -> Result<Self> {
             // Check if the once cell is already initialized
             match GLOBAL_RING.get() {
@@ -124,13 +124,6 @@ mod linux_impl {
             let mut buffer = vec![0u8; size as usize];
             self.read_block(offset, &mut buffer).await?;
             Ok(buffer)
-        }
-
-        #[instrument(skip(self, data), level = "trace")]
-        fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
-            panic!("Not implemented");
-            // self.write_data(offset, data).await?;
-            Ok(())
         }
 
         async fn file_length(&self) -> u64 {
@@ -155,7 +148,7 @@ mod tests {
 
     static TEST_MUTEX: StdMutex<()> = StdMutex::new(());
 
-    use crate::logfile;
+    use crate::{fileio::simple_file::SimpleFile, logfile};
 
     use super::*;
     use std::{
@@ -245,7 +238,7 @@ mod tests {
 
         let path = PathBuf::from("/tmp/01.log");
 
-        logfile::tests::test_write_without_sealing::<IOUringFile>(path).await;
+        logfile::tests::test_write_without_sealing::<SimpleFile, IOUringFile>(path).await;
     }
 
     #[tokio::test]
@@ -257,7 +250,7 @@ mod tests {
 
         let path = PathBuf::from("/tmp/02.log");
 
-        logfile::tests::test_write_with_sealing::<IOUringFile>(path).await;
+        logfile::tests::test_write_with_sealing::<SimpleFile, IOUringFile>(path).await;
     }
 
     #[tokio::test]
@@ -269,7 +262,7 @@ mod tests {
 
         let path = PathBuf::from("/tmp/03.log");
 
-        logfile::tests::test_corrupted_record::<IOUringFile>(path).await;
+        logfile::tests::test_corrupted_record::<SimpleFile, IOUringFile>(path).await;
     }
 
     #[tokio::test]
@@ -281,7 +274,7 @@ mod tests {
 
         let path = PathBuf::from("/tmp/04.log");
 
-        logfile::tests::test_corrupted_record_sealed::<IOUringFile>(path).await;
+        logfile::tests::test_corrupted_record_sealed::<SimpleFile, IOUringFile>(path).await;
     }
 
     // #[tokio::test]
@@ -305,7 +298,7 @@ mod tests {
 
         let path = PathBuf::from("/tmp/06.log");
 
-        logfile::tests::test_100_records::<IOUringFile>(path).await;
+        logfile::tests::test_100_records::<SimpleFile, IOUringFile>(path).await;
     }
 
     // FIXME
@@ -330,7 +323,10 @@ mod tests {
 
         let path = PathBuf::from("/tmp/08.log");
 
-        logfile::tests::test_write_magic_number_without_sealing_escape::<IOUringFile>(path).await;
+        logfile::tests::test_write_magic_number_without_sealing_escape::<SimpleFile, IOUringFile>(
+            path,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -342,7 +338,8 @@ mod tests {
 
         let path = PathBuf::from("/tmp/09.log");
 
-        logfile::tests::test_write_magic_number_sealing_escape::<IOUringFile>(path).await;
+        logfile::tests::test_write_magic_number_sealing_escape::<SimpleFile, IOUringFile>(path)
+            .await;
     }
 
     // FIXME

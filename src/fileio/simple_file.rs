@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 
 use tracing::instrument;
 
-use super::FileIO;
+use super::{FileReader, FileWriter};
 
 #[derive(Debug)]
 pub struct SimpleFile {
@@ -15,7 +15,7 @@ impl SimpleFile {
     }
 }
 
-impl FileIO for SimpleFile {
+impl FileWriter for SimpleFile {
     async fn open(path: &std::path::Path) -> anyhow::Result<Self> {
         let fd = OpenOptions::new()
             .read(true)
@@ -56,6 +56,35 @@ impl FileIO for SimpleFile {
     }
 }
 
+impl FileReader for SimpleFile {
+    async fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        Self::new(fd)
+    }
+
+    #[instrument(skip(self), level = "trace")]
+    async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
+        use std::io::{Read, Seek};
+
+        let mut fd = &self.fd;
+        fd.seek(std::io::SeekFrom::Start(offset))?;
+
+        let mut buffer = vec![0u8; size as usize];
+        fd.read_exact(&mut buffer)?;
+
+        Ok(buffer)
+    }
+
+    async fn file_length(&self) -> u64 {
+        self.fd.metadata().unwrap().len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -69,27 +98,27 @@ mod tests {
     async fn test_write_without_sealing() {
         let path = PathBuf::from("/tmp/01.log");
 
-        logfile::tests::test_write_without_sealing::<SimpleFile>(path).await;
+        logfile::tests::test_write_without_sealing::<SimpleFile, SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_write_with_sealing() {
         let path = PathBuf::from("/tmp/02.log");
-        logfile::tests::test_write_with_sealing::<SimpleFile>(path).await;
+        logfile::tests::test_write_with_sealing::<SimpleFile, SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_corrupted_record() {
         let path = PathBuf::from("/tmp/03.log");
 
-        logfile::tests::test_corrupted_record::<SimpleFile>(path).await;
+        logfile::tests::test_corrupted_record::<SimpleFile, SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_corrupted_record_sealed() {
         let path = PathBuf::from("/tmp/04.log");
 
-        logfile::tests::test_corrupted_record_sealed::<SimpleFile>(path).await;
+        logfile::tests::test_corrupted_record_sealed::<SimpleFile, SimpleFile>(path).await;
     }
 
     // #[tokio::test]
@@ -103,21 +132,25 @@ mod tests {
     async fn test_100_records() {
         let path = PathBuf::from("/tmp/06.log");
 
-        logfile::tests::test_100_records::<SimpleFile>(path).await;
+        logfile::tests::test_100_records::<SimpleFile, SimpleFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_write_magic_number_without_sealing_escape() {
         let path = PathBuf::from("/tmp/08.log");
 
-        logfile::tests::test_write_magic_number_without_sealing_escape::<SimpleFile>(path).await;
+        logfile::tests::test_write_magic_number_without_sealing_escape::<SimpleFile, SimpleFile>(
+            path,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn test_write_magic_number_sealing_escape() {
         let path = PathBuf::from("/tmp/09.log");
 
-        logfile::tests::test_write_magic_number_sealing_escape::<SimpleFile>(path).await;
+        logfile::tests::test_write_magic_number_sealing_escape::<SimpleFile, SimpleFile>(path)
+            .await;
     }
 
     // #[tokio::test]
