@@ -67,7 +67,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_without_sealing() {
-        let path = PathBuf::from("/tmp/01.log");
+        let path = PathBuf::from("/tmp/simple/01.log");
+        std::fs::create_dir_all("/tmp/simple").unwrap();
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -82,7 +83,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_with_sealing() {
-        let path = PathBuf::from("/tmp/02.log");
+        let path = PathBuf::from("/tmp/simple/02.log");
+        std::fs::create_dir_all("/tmp/simple").unwrap();
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -97,7 +99,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_corrupted_record() {
-        let path = PathBuf::from("/tmp/03.log");
+        let path = PathBuf::from("/tmp/simple/03.log");
+        std::fs::create_dir_all("/tmp/simple").unwrap();
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -112,7 +115,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_corrupted_record_sealed() {
-        let path = PathBuf::from("/tmp/04.log");
+        let path = PathBuf::from("/tmp/simple/04.log");
+        std::fs::create_dir_all("/tmp/simple").unwrap();
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -126,8 +130,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_corrupted_file_header() {
-        let path = PathBuf::from("/tmp/05.log");
+    async fn qtest_corrupted_file_header() {
+        let path = PathBuf::from("/tmp/simple/05.log");
+        std::fs::create_dir_all("/tmp/simple").unwrap();
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -142,7 +147,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_100_records() {
-        let path = PathBuf::from("/tmp/06.log");
+        let path = PathBuf::from("/tmp/simple/06.log");
+        std::fs::create_dir_all("/tmp/simple").unwrap();
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -157,7 +163,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream() {
-        let path = PathBuf::from("/tmp/07.log");
+        let path = PathBuf::from("/tmp/simple/07.log");
+        std::fs::create_dir_all("/tmp/simple").unwrap();
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -172,7 +179,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_magic_number_without_sealing_escape() {
-        let path = PathBuf::from("/tmp/08.log");
+        let path = PathBuf::from("/tmp/simple/08.log");
+        std::fs::create_dir_all("/tmp/simple").unwrap();
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -187,7 +195,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_magic_number_sealing_escape() {
-        let path = PathBuf::from("/tmp/09.log");
+        let path = PathBuf::from("/tmp/simple/09.log");
+        std::fs::create_dir_all("/tmp/simple").unwrap();
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -202,7 +211,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_magic_number_without_sealing_escape_iterator() {
-        let path = PathBuf::from("/tmp/10.log");
+        let path = PathBuf::from("/tmp/simple/10.log");
+        std::fs::create_dir_all("/tmp/simple").unwrap();
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -217,7 +227,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_magic_number_with_sealing_escape_iterator() {
-        let path = PathBuf::from("/tmp/11.log");
+        let path = PathBuf::from("/tmp/simple/11.log");
+        std::fs::create_dir_all("/tmp/simple").unwrap();
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -232,7 +243,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_too_large_record() {
-        let path = PathBuf::from("/tmp/12.log");
+        let path = PathBuf::from("/tmp/simple/12.log");
+        std::fs::create_dir_all("/tmp/simple").unwrap();
         let fd = OpenOptions::new()
             .read(true)
             .write(true)

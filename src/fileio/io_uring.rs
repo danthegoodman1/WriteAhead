@@ -166,6 +166,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_io_uring_read_write() -> Result<(), Box<dyn std::error::Error>> {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         // Create a shared io_uring instance
         // Create a shared io_uring instance
         let ring = Arc::new(Mutex::new(IoUring::new(128)?));
@@ -203,6 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_io_uring_sqpoll() -> Result<(), Box<dyn std::error::Error>> {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         // Create a shared io_uring instance with SQPOLL enabled
         let ring = Arc::new(Mutex::new(
             IoUring::builder()
@@ -237,12 +239,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_without_sealing() {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
             let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
-        let path = PathBuf::from("/tmp/01.log");
+        let path = PathBuf::from("/tmp/io/01.log");
         let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
         logfile::tests::test_write_without_sealing(f, path).await;
@@ -250,12 +253,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_with_sealing() {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
             let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
-        let path = PathBuf::from("/tmp/02.log");
+        let path = PathBuf::from("/tmp/io/02.log");
         let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
         logfile::tests::test_write_with_sealing(f, path).await;
@@ -263,12 +267,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_corrupted_record() {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
             let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
-        let path = PathBuf::from("/tmp/03.log");
+        let path = PathBuf::from("/tmp/io/03.log");
         let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
         logfile::tests::test_corrupted_record(f, path).await;
@@ -276,12 +281,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_corrupted_record_sealed() {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
             let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
-        let path = PathBuf::from("/tmp/04.log");
+        let path = PathBuf::from("/tmp/io/04.log");
         let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
         logfile::tests::test_corrupted_record_sealed(f, path).await;
@@ -289,12 +295,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_corrupted_file_header() {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
             let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
-        let path = PathBuf::from("/tmp/05.log");
+        let path = PathBuf::from("/tmp/io/05.log");
         let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
         logfile::tests::test_corrupted_file_header(f, path).await;
@@ -302,12 +309,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_100_records() {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
             let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
-        let path = PathBuf::from("/tmp/06.log");
+        let path = PathBuf::from("/tmp/io/06.log");
         let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
         logfile::tests::test_100_records(f, path).await;
@@ -316,12 +324,13 @@ mod tests {
     // FIXME
     #[tokio::test]
     async fn test_stream() {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
             let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
-        let path = PathBuf::from("/tmp/07.log");
+        let path = PathBuf::from("/tmp/io/07.log");
         let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
         logfile::tests::test_stream(f, path).await;
@@ -329,12 +338,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_magic_number_without_sealing_escape() {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
             let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
-        let path = PathBuf::from("/tmp/08.log");
+        let path = PathBuf::from("/tmp/io/08.log");
         let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
         logfile::tests::test_write_magic_number_without_sealing_escape(f, path).await;
@@ -342,12 +352,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_magic_number_sealing_escape() {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
             let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
-        let path = PathBuf::from("/tmp/09.log");
+        let path = PathBuf::from("/tmp/io/09.log");
         let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
         logfile::tests::test_write_magic_number_sealing_escape(f, path).await;
@@ -356,12 +367,13 @@ mod tests {
     // FIXME
     #[tokio::test]
     async fn test_write_magic_number_without_sealing_escape_iterator() {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
             let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
-        let path = PathBuf::from("/tmp/10.log");
+        let path = PathBuf::from("/tmp/io/10.log");
         let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
         logfile::tests::test_write_magic_number_without_sealing_escape_iterator(f, path).await;
@@ -369,12 +381,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_magic_number_with_sealing_escape_iterator() {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
             let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
-        let path = PathBuf::from("/tmp/11.log");
+        let path = PathBuf::from("/tmp/io/11.log");
         let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
         logfile::tests::test_write_magic_number_with_sealing_escape_iterator(f, path).await;
@@ -382,12 +395,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_too_large_record() {
+        std::fs::create_dir_all("/tmp/io").unwrap();
         let _guard = TEST_MUTEX.lock().unwrap();
         if GLOBAL_RING.get().is_none() {
             let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
         }
 
-        let path = PathBuf::from("/tmp/12.log");
+        let path = PathBuf::from("/tmp/io/12.log");
         let f = IOUringFile::new(&path, GLOBAL_RING.get().unwrap().clone()).unwrap();
 
         logfile::tests::test_write_too_large_record(f, path).await;
