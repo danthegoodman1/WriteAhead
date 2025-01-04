@@ -1,7 +1,9 @@
 use anyhow::Result;
-use futures::{pin_mut, Stream, StreamExt};
+use futures::{pin_mut, FutureExt, Stream, StreamExt};
+use pin_project_lite::pin_project;
 use std::{
     collections::BTreeMap,
+    future::IntoFuture,
     path::PathBuf,
     pin::Pin,
     sync::Arc,
@@ -131,24 +133,6 @@ impl<F: FileIO> WriteAhead<F> {
         logfile.lock().await.read_record(&offset).await
     }
 
-    // #[instrument(skip(self, data), level = "trace")]
-    // pub async fn write(&mut self, data: &[u8]) -> Result<RecordID> {
-    //     // TODO: Maybe we make this a batch write internally with some flush interval, and we return a future that will resolve when the data is flushed to disk
-    //     // Then we can queue them up in memory and flush them to disk in a background task
-
-    //     // Write the record to the active log file
-    //     let active_log = self.active_log_file.as_mut().unwrap();
-    //     let offset = active_log.write_records(&[&data]).await?;
-    //     let logfile_id = active_log.id.clone();
-
-    //     // Check if we need to rotate the log file and create the new one
-    //     if active_log.file_length() > self.options.max_file_size {
-    //         self.rotate_log_file().await?;
-    //     }
-
-    //     Ok(RecordID::new(logfile_id.parse::<u64>().unwrap(), offset[0]))
-    // }
-
     #[instrument(skip(self, data), level = "trace")]
     pub async fn write_batch(&mut self, data: &[&[u8]]) -> Result<Vec<RecordID>> {
         // Write the record to the active log file
@@ -201,66 +185,107 @@ impl<F: FileIO> WriteAhead<F> {
         Ok(())
     }
 
-    pub fn stream<'a>(&'a mut self, logfile_id: u64, offset: u64) -> WriteAheadStream<'a, F> {
-        WriteAheadStream {
-            write_ahead: self,
-            logfile_id,
-            offset,
-            logfile_stream: None,
-        }
-    }
+    // pub fn stream<'a>(&'a mut self, logfile_id: u64, offset: u64) -> WriteAheadStream<'a, F> {
+    //     WriteAheadStream {
+    //         write_ahead: self,
+    //         logfile_id,
+    //         offset,
+    //         logfile_stream: None,
+    //     }
+    // }
 }
 
 fn padded_u64_string(id: u64) -> String {
     format!("{:010}", id)
 }
 
-struct WriteAheadIterator<'a, F: FileIO> {
-    write_ahead: &'a mut WriteAhead<F>,
-    logfile_id: u64,
-    offset: u64,
-    logfile_stream: Option<LogFileStream<'a, F>>,
-}
+// pin_project! {
+//     struct WriteAheadStream<F: FileIO> {
+//         write_ahead: Arc<Mutex<WriteAhead<F>>>,
+//         logfile_id: u64,
+//         offset: u64,
+//         logfile_stream: Option<Arc<Mutex<LogFileStream<F>>>>,
+//     }
+// }
 
-impl<'a, F: FileIO> Stream for WriteAheadStream<'a, F> {
-    type Item = Result<Vec<u8>>;
+// impl<F: FileIO> WriteAheadStream<F> {
+//     pub fn new(write_ahead: Arc<Mutex<WriteAhead<F>>>, logfile_id: u64, offset: u64) -> Self {
+//         Self {
+//             write_ahead,
+//             logfile_id,
+//             offset,
+//             logfile_stream: None,
+//         }
+//     }
+// }
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        // Initialize the logfile stream
-        if self.logfile_stream.is_none() {
-            let min_logfile_id = self.write_ahead.log_files.keys().min().unwrap();
-            self.logfile_stream = Some(
-                self.write_ahead
-                    .log_files
-                    .get(min_logfile_id)
-                    .unwrap()
-                    .lock()
-                    .await
-                    .stream_from_offset(self.offset)
-                    .await,
-            );
-        }
+// impl<F: FileIO> Stream for WriteAheadStream<F> {
+//     type Item = Result<Vec<u8>>;
 
-        // Poll the logfile stream
-        let result = match self.logfile_stream.as_mut().unwrap().poll_next_unpin(cx) {
-            Poll::Ready(result) => match result {
-                Some(record) => Poll::Ready(Some(record)),
-                None => {
-                    // If there is another log file, then make a new logfile_stream and jump back to polling
-                    if let Some(logfile) = self.write_ahead.log_files.get_mut(&self.logfile_id) {
-                        self.logfile_stream = Some(logfile.stream_from_offset(self.offset));
-                        Poll::Pending
-                    } else {
-                        Poll::Ready(None)
-                    }
-                }
-            },
-            Poll::Pending => Poll::Pending,
-        };
+//     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+//         // Initialize the logfile stream
+//         if self.logfile_stream.is_none() {
+//             // We need to handle waiting for the lock
+//             let lock_future = self.write_ahead.lock();
+//             pin_mut!(lock_future);
+//             let write_ahead = match lock_future.poll_unpin(cx) {
+//                 Poll::Ready(write_ahead) => write_ahead,
+//                 Poll::Pending => return Poll::Pending,
+//             };
 
-        result
-    }
-}
+//             // Then we need to create the new logfile stream
+//             let min_logfile_id = write_ahead.log_files.keys().min().unwrap();
+//             let logfile_arc = write_ahead.log_files.get(min_logfile_id).unwrap();
+//             let lock_future = logfile_arc.lock();
+//             pin_mut!(lock_future);
+//             let logfile = match lock_future.poll_unpin(cx) {
+//                 Poll::Ready(logfile) => logfile,
+//                 Poll::Pending => return Poll::Pending,
+//             };
+
+//             let logfile_stream = LogFileStream::new_from_offset(logfile_arc.clone(), self.offset);
+
+//             self.logfile_stream = Some(Arc::new(Mutex::new(logfile_stream)));
+//         }
+
+//         // Poll the logfile stream
+//         let lock_future = self.logfile_stream.as_mut().unwrap().lock();
+//         pin_mut!(lock_future);
+//         let log_stream = match lock_future.poll_unpin(cx) {
+//             Poll::Ready(log_stream) => log_stream,
+//             Poll::Pending => return Poll::Pending,
+//         };
+
+//         let result = match log_stream.poll_next_unpin(cx) {
+//             Poll::Ready(result) => match result {
+//                 Some(record) => Poll::Ready(Some(record)),
+//                 None => {
+//                     // If there is another log file, then make a new logfile_stream and jump back to polling
+
+//                     // Get the writeahead
+//                     let lock_future = self.write_ahead.lock();
+//                     pin_mut!(lock_future);
+//                     let write_ahead = match lock_future.poll_unpin(cx) {
+//                         Poll::Ready(write_ahead) => write_ahead,
+//                         Poll::Pending => return Poll::Pending,
+//                     };
+
+//                     // get the logfile
+//                     let logfile_arc = write_ahead.log_files.get(&self.logfile_id).unwrap();
+//                     let lock_future = logfile_arc.lock();
+//                     pin_mut!(lock_future);
+//                     let logfile = match lock_future.poll_unpin(cx) {
+//                         Poll::Ready(logfile) => logfile,
+//                         Poll::Pending => return Poll::Pending,
+//                     };
+//                 }
+//             },
+//             Poll::Pending => Poll::Pending,
+//         };
+
+//         result
+//     }
+// }
 
 #[cfg(test)]
 mod tests {

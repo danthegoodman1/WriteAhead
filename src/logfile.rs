@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context, Result};
-use futures::{pin_mut, Stream};
+use futures::{pin_mut, SinkExt, Stream, StreamExt};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::rc::Rc;
+use std::sync::Rc;
 use std::task::{Context as TaskContext, Poll};
-use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tracing::trace;
 
 use crate::{fileio::FileIO, murmur3::murmur3_128};
@@ -44,7 +45,7 @@ pub struct Logfile<F: FileIO> {
     pub sealed: bool,
     pub id: String,
     pub file_length: u64,
-    fio: Arc<Mutex<F>>,
+    fio: F,
 }
 
 const MAGIC_NUMBER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
@@ -86,7 +87,7 @@ impl<F: FileIO> Logfile<F> {
         Ok(Self {
             sealed: false,
             id: id.to_string(),
-            fio: Arc::new(Mutex::new(fio)),
+            fio,
             file_length: 8,
         })
     }
@@ -113,13 +114,13 @@ impl<F: FileIO> Logfile<F> {
     }
 
     pub async fn from_file(path: &Path) -> Result<Self> {
-        let fd = F::open(path).await?;
-        let file_length = fd.file_length().await;
+        let fio = F::open(path).await?;
+        let file_length = fio.file_length().await;
         let id = Self::file_id_from_path(path)?;
 
         // Read the first 8 bytes of the file
 
-        let buffer = fd
+        let buffer = fio
             .read(0, 8)
             .await
             .context("Failed to read first 8 bytes of logfile")?;
@@ -133,7 +134,7 @@ impl<F: FileIO> Logfile<F> {
         let mut sealed = false;
         if file_length >= 17 {
             // 8 header + at least 9 footer
-            let buffer = fd.read(file_length - 9, 9).await?;
+            let buffer = fio.read(file_length - 9, 9).await?;
             if buffer[1..9] == MAGIC_NUMBER {
                 sealed = buffer[0] == 1;
             }
@@ -142,7 +143,7 @@ impl<F: FileIO> Logfile<F> {
         Ok(Self {
             sealed,
             id,
-            fio: Arc::new(Mutex::new(fd)),
+            fio,
             file_length,
         })
     }
@@ -153,6 +154,7 @@ impl<F: FileIO> Logfile<F> {
         }
 
         let mut offsets = Vec::with_capacity(records.len());
+        // TODO: optmization?
         // Calculate total buffer size needed:
         // For each record: 16 bytes (hash) + 4 bytes (length) + data length + potential escape bytes
         // let total_size = records
@@ -203,8 +205,6 @@ impl<F: FileIO> Logfile<F> {
 
         // Write all records in one operation
         self.fio
-            .lock()
-            .await
             .write(self.file_length, &combined_buffer)
             .await
             .context("Failed to write records")?;
@@ -224,10 +224,8 @@ impl<F: FileIO> Logfile<F> {
             self.sealed
         );
 
-        let fio = self.fio.lock().await;
-
         // Read the hash and length (20 bytes total)
-        let header = fio.read(*offset, 20).await.context(
+        let header = self.fio.read(*offset, 20).await.context(
             "Failed to read record header, is the file corrupted, or a partial write occurred?",
         )?;
 
@@ -254,7 +252,7 @@ impl<F: FileIO> Logfile<F> {
         }
 
         // Read the actual record data
-        let mut record = fio.read(*offset + 20, length as u64).await?;
+        let mut record = self.fio.read(*offset + 20, length as u64).await?;
 
         // Verify the hash
         let (computed_hash1, computed_hash2) = murmur3_128(&record);
@@ -287,8 +285,6 @@ impl<F: FileIO> Logfile<F> {
         footer[1..9].copy_from_slice(&MAGIC_NUMBER);
 
         self.fio
-            .lock()
-            .await
             .write(self.file_length, &footer)
             .await
             .context("Failed to write footer")?;
@@ -297,32 +293,54 @@ impl<F: FileIO> Logfile<F> {
         Ok(())
     }
 
-    pub fn stream(self) -> LogFileStream<F> {
-        LogFileStream {
-            logfile: Arc::new(Mutex::new(self)),
-            offset: 8,
-        }
-    }
-
-    pub fn stream_from_offset(self, offset: u64) -> LogFileStream<F> {
-        let offset = if offset < 8 { 8 } else { offset };
-        LogFileStream {
-            logfile: Arc::new(Mutex::new(self)),
-            offset,
-        }
-    }
-
     pub fn file_length(&self) -> u64 {
         self.file_length
     }
 }
 
+// pub struct ChannelStream {
+//     chan: mpsc::Receiver<Result<Vec<u8>>>,
+// }
+
+// impl Stream for ChannelStream {
+//     type Item = Result<Vec<u8>>;
+
+//     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+//         // Try to receive from the channel
+//         self.chan.poll_recv(cx)
+//     }
+// }
+
+// impl ChannelStream {
+//     pub fn new<F: FileIO + Send + 'static>(logfile: Rc<Logfile<F>>) -> ChannelStream {
+//         let (tx, rx) = mpsc::channel(100);
+//         tokio::spawn(async move {
+//             let mut offset = 8;
+//             loop {
+//                 let record = logfile.read_record(&offset).await.expect("blah");
+//                 let record_len = record.len() as u64;
+//                 tx.send(Ok(record)).await.unwrap();
+//                 offset += 20 + record_len;
+//             }
+//         });
+//         ChannelStream { chan: rx }
+//     }
+// }
+
 pub struct LogFileStream<F: FileIO> {
-    logfile: Arc<Mutex<Logfile<F>>>,
+    logfile: Rc<Logfile<F>>,
     offset: u64,
 }
 
 impl<F: FileIO> LogFileStream<F> {
+    pub fn new(logfile: Rc<Logfile<F>>) -> Self {
+        Self { logfile, offset: 8 }
+    }
+
+    pub fn new_from_offset(logfile: Rc<Logfile<F>>, offset: u64) -> Self {
+        Self { logfile, offset }
+    }
+
     pub fn reset_stream(&mut self) {
         self.offset = 8;
     }
@@ -336,7 +354,7 @@ impl<F: FileIO> LogFileStream<F> {
     }
 
     async fn read_and_move_offset(&mut self, offset: u64) -> Result<Vec<u8>> {
-        let record = self.logfile.lock().await.read_record(&offset).await?;
+        let record = self.logfile.read_record(&offset).await?;
         self.offset += 20 + record.len() as u64;
         Ok(record)
     }
@@ -345,30 +363,27 @@ impl<F: FileIO> LogFileStream<F> {
 impl<F: FileIO> Stream for LogFileStream<F> {
     type Item = Result<Vec<u8>>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         // If we've reached the end of the file (or the footer if sealed)
-        let this = self.clone();
-        let logfile = self.logfile.lock();
-        pin_mut!(logfile);
-        let logfile = match logfile.poll(cx) {
-            Poll::Ready(logfile) => logfile,
-            Poll::Pending => return Poll::Pending,
-        };
+        let mut this = self;
+        {
+            let logfile = this.logfile.clone();
 
-        let end_offset = if logfile.sealed {
-            logfile.file_length - 9 // Account for the 9-byte footer
-        } else {
-            logfile.file_length
-        };
+            let end_offset = if logfile.sealed {
+                logfile.file_length - 9 // Account for the 9-byte footer
+            } else {
+                logfile.file_length
+            };
 
-        // Add this check to ensure we have enough bytes remaining for at least a record header
-        if self.offset >= end_offset || end_offset - self.offset < 20 {
-            return Poll::Ready(None);
+            // Add this check to ensure we have enough bytes remaining for at least a record header
+            if this.offset >= end_offset || end_offset - this.offset < 20 {
+                return Poll::Ready(None);
+            }
         }
 
         // Create a future to read the record
-        let offset = self.offset;
-        let future = self.read_and_move_offset(offset);
+        let offset = this.offset;
+        let future = this.read_and_move_offset(offset);
         pin_mut!(future); // Pin the future so we can poll it
 
         // Poll the future
@@ -387,7 +402,7 @@ impl<F: FileIO> Stream for LogFileStream<F> {
 #[cfg(test)]
 pub mod tests {
     use futures::stream::StreamExt;
-    use std::path::PathBuf;
+    use std::{borrow::BorrowMut, path::PathBuf};
 
     use super::*;
 
@@ -443,13 +458,7 @@ pub mod tests {
         let offsets = logfile.write_records(&[b"hello"]).await.unwrap();
 
         // Corrupt the record
-        logfile
-            .fio
-            .lock()
-            .await
-            .write(offsets[0] + 22, &[b'x'])
-            .await
-            .unwrap();
+        logfile.fio.write(offsets[0] + 22, &[b'x']).await.unwrap();
 
         let result = logfile.read_record(&offsets[0]).await;
         assert!(matches!(
@@ -469,13 +478,7 @@ pub mod tests {
         logfile.seal().await.unwrap();
 
         // Corrupt the record by modifying a single byte in the middle
-        logfile
-            .fio
-            .lock()
-            .await
-            .write(offsets[0] + 22, &[b'x'])
-            .await
-            .unwrap();
+        logfile.fio.write(offsets[0] + 22, &[b'x']).await.unwrap();
 
         // Attempting to read the corrupted record should fail due to hash mismatch
         assert!(logfile.read_record(&offsets[0]).await.is_err());
@@ -550,24 +553,22 @@ pub mod tests {
         }
 
         // First iteration
+        let logfile = Rc::new(logfile);
         {
-            let mut iter = logfile.stream();
+            let mut iter = LogFileStream::new(logfile.clone());
             for i in 0..100 {
                 let record = iter.next().await.unwrap().unwrap();
                 assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
             }
             assert!(iter.next().await.is_none());
         }
-
         // Second iteration - verify we can create a new iterator and read again
-        {
-            let mut iter = logfile.stream();
-            for i in 0..100 {
-                let record = iter.next().await.unwrap().unwrap();
-                assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
-            }
-            assert!(iter.next().await.is_none());
+        let mut iter = LogFileStream::new_from_offset(logfile, 8);
+        for i in 0..100 {
+            let record = iter.next().await.unwrap().unwrap();
+            assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
         }
+        assert!(iter.next().await.is_none());
     }
 
     pub async fn test_write_magic_number_without_sealing_escape<F: FileIO>(f: F, path: PathBuf) {
@@ -617,7 +618,8 @@ pub mod tests {
         logfile.write_records(&[&MAGIC_NUMBER]).await.unwrap();
 
         let file_length = logfile.file_length.clone();
-        let mut iter = logfile.stream();
+        let logfile = Rc::new(logfile);
+        let mut iter = LogFileStream::new(logfile.clone());
         let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
         println!("offset: {} file length: {}", iter.offset, file_length);
@@ -625,11 +627,13 @@ pub mod tests {
         println!("res: {:?}", res);
         assert!(res.is_none());
 
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
+        let logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "10");
         assert!(!logfile.sealed);
 
-        let mut iter = logfile.stream();
+        let logfile = Rc::new(logfile);
+
+        let mut iter = LogFileStream::new(logfile.clone());
         let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
         assert!(iter.next().await.is_none());
@@ -648,30 +652,32 @@ pub mod tests {
         logfile.write_records(&[&MAGIC_NUMBER]).await.unwrap();
 
         // First iteration
+        let mut log_rc = Rc::new(logfile);
         {
-            let mut iter = logfile.stream();
+            let mut iter = LogFileStream::new(log_rc.clone());
             let record = iter.next().await.unwrap().unwrap();
             assert_eq!(record, MAGIC_NUMBER);
             assert!(iter.next().await.is_none());
         }
 
         // Seal the file
-        logfile.seal().await.unwrap();
-
-        // Second iteration after sealing
         {
-            let mut iter = logfile.stream();
-            let record = iter.next().await.unwrap().unwrap();
-            assert_eq!(record, MAGIC_NUMBER);
-            assert!(iter.next().await.is_none());
+            let mut logfile = log_rc.borrow_mut();
+            logfile.seal().await.unwrap();
         }
 
+        // Second iteration after sealing
+        let mut iter = LogFileStream::new(log_rc.clone());
+        let record = iter.next().await.unwrap().unwrap();
+        assert_eq!(record, MAGIC_NUMBER);
+        assert!(iter.next().await.is_none());
+
         // Verify with a fresh file handle
-        let mut logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
+        let logfile: Logfile<F> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "11");
         assert!(logfile.sealed);
 
-        let mut iter = logfile.stream();
+        let mut iter = LogFileStream::new(log_rc.clone());
         let record = iter.next().await.unwrap().unwrap();
         assert_eq!(record, MAGIC_NUMBER);
         assert!(iter.next().await.is_none());

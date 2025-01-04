@@ -676,6 +676,7 @@ dependencies = [
  "io-uring",
  "libc",
  "once_cell",
+ "pin-project-lite",
  "tempfile",
  "thiserror",
  "tokio",
