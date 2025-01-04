@@ -34,3 +34,13 @@ This is an aggressive log rotation test where each write is a `Hello world! {i}`
 ```
 
 TLDR it's super fast.
+
+# Notes
+
+## Integrating with a thread-safe API framework (Axum, tonic, etc.)
+
+Since WriteAhead is single-threaded, to preserve performance it's probably best to spawn off a thread dedicated for this, and use a channel to communicate writes and reads. Then you can even buffer them up in memory and micro-batch them (e.g. at most 500us) for increased throughput.
+
+If you need to stream a WriteAheadStream back to a response, you can use either a stream helper, or write a little helper that will turn that stream into a channel, then use something like `flume::Receiver::into_stream` to respond. Should use a bounded channel so you don't bloat memory.
+
+WriteAheadStream is also Send (see `test_write_ahead_stream_is_send`), so you can actually send it over the channel back to the API handler, and feed that stream directly to the response as well if you don't need as much control (e.g. you can just stream to the end)

@@ -618,4 +618,10 @@ mod tests {
             assert_eq!(record, format!("Hello, world! {}", i).as_bytes());
         }
     }
+
+    #[test]
+    fn test_write_ahead_stream_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<WriteAheadStream<SimpleFile>>();
+    }
 }
