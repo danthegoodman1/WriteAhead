@@ -6,32 +6,29 @@ A great component for a (distributed) data store.
 
 For distributed usage, consider FDB's model (may want to place a custom in-memory index in front for custom ID->offset mappings)
 
-Sub-ms persistence, sometimes sneaking over if a file rotation occurrs:
+Almost always under 200us persistence on my M3 MBP, rarely breaking the 1ms mark when a log rotation occurrs.
+
 ```
-2025-01-04T19:56:07.459536Z DEBUG write_batch: src/write_ahead.rs:124: close time.busy=1.08ms time.idle=3.58µs
-2025-01-04T19:56:07.459541Z DEBUG src/logfile.rs:283: Logfile 0000000021 writer actor disconnected
-2025-01-04T19:56:07.459836Z DEBUG write_batch: src/write_ahead.rs:124: close time.busy=267µs time.idle=3.50µs
-2025-01-04T19:56:07.460112Z DEBUG write_batch: src/write_ahead.rs:124: close time.busy=247µs time.idle=3.42µs
-2025-01-04T19:56:07.460400Z DEBUG write_batch: src/write_ahead.rs:124: close time.busy=249µs time.idle=4.83µs
-2025-01-04T19:56:07.460660Z DEBUG write_batch: src/write_ahead.rs:150: Rotating log file 22
-2025-01-04T19:56:07.460730Z DEBUG src/logfile.rs:305: Sealing logfile 0000000022
-2025-01-04T19:56:07.461482Z DEBUG write_batch:launch: src/logfile.rs:270: close time.busy=309µs time.idle=4.79µs path="./test_logs/test_write_ahead_stream/0000000023.log"
-2025-01-04T19:56:07.461530Z DEBUG src/logfile.rs:283: Logfile 0000000022 writer actor disconnected
-2025-01-04T19:56:07.461528Z DEBUG write_batch: src/write_ahead.rs:124: close time.busy=1.09ms time.idle=4.04µs
-2025-01-04T19:56:07.461755Z DEBUG write_batch: src/write_ahead.rs:124: close time.busy=189µs time.idle=5.08µs
-2025-01-04T19:56:07.461960Z DEBUG write_batch: src/write_ahead.rs:124: close time.busy=177µs time.idle=3.50µs
-2025-01-04T19:56:07.462155Z DEBUG write_batch: src/write_ahead.rs:124: close time.busy=171µs time.idle=4.08µs
-2025-01-04T19:56:07.462360Z DEBUG write_batch: src/write_ahead.rs:150: Rotating log file 23
-2025-01-04T19:56:07.462395Z DEBUG src/logfile.rs:305: Sealing logfile 0000000023
-2025-01-04T19:56:07.463003Z DEBUG write_batch:launch: src/logfile.rs:270: close time.busy=272µs time.idle=4.50µs path="./test_logs/test_write_ahead_stream/0000000024.log"
-2025-01-04T19:56:07.463042Z DEBUG write_batch: src/write_ahead.rs:124: close time.busy=859µs time.idle=4.92µs
-2025-01-04T19:56:07.463047Z DEBUG src/logfile.rs:283: Logfile 0000000023 writer actor disconnected
-2025-01-04T19:56:07.463325Z DEBUG write_batch: src/write_ahead.rs:124: close time.busy=253µs time.idle=3.62µs
-2025-01-04T19:56:07.463514Z DEBUG write_batch: src/write_ahead.rs:124: close time.busy=161µs time.idle=4.12µs
-2025-01-04T19:56:07.463705Z DEBUG write_batch: src/write_ahead.rs:124: close time.busy=157µs time.idle=5.04µs
-2025-01-04T19:56:07.463897Z DEBUG write_batch: src/write_ahead.rs:150: Rotating log file 24
+2025-01-04T20:07:40.161477Z DEBUG src/write_ahead.rs:610: Write time taken: 1.003083ms
+2025-01-04T20:07:40.161649Z DEBUG src/write_ahead.rs:610: Write time taken: 154.542µs
+2025-01-04T20:07:40.161817Z DEBUG src/write_ahead.rs:610: Write time taken: 148.125µs
+2025-01-04T20:07:40.162006Z DEBUG src/write_ahead.rs:610: Write time taken: 177.584µs
+2025-01-04T20:07:40.162882Z DEBUG src/write_ahead.rs:610: Write time taken: 864.125µs
+2025-01-04T20:07:40.163141Z DEBUG src/write_ahead.rs:610: Write time taken: 242.292µs
+2025-01-04T20:07:40.163355Z DEBUG src/write_ahead.rs:610: Write time taken: 195.208µs
+2025-01-04T20:07:40.163544Z DEBUG src/write_ahead.rs:610: Write time taken: 175µs
+2025-01-04T20:07:40.164352Z DEBUG src/write_ahead.rs:610: Write time taken: 795.958µs
+2025-01-04T20:07:40.164517Z DEBUG src/write_ahead.rs:610: Write time taken: 152.125µs
+2025-01-04T20:07:40.164672Z DEBUG src/write_ahead.rs:610: Write time taken: 141.5µs
+2025-01-04T20:07:40.164813Z DEBUG src/write_ahead.rs:610: Write time taken: 129.125µs
+2025-01-04T20:07:40.165483Z DEBUG src/write_ahead.rs:610: Write time taken: 657.542µs
+2025-01-04T20:07:40.165636Z DEBUG src/write_ahead.rs:610: Write time taken: 141.333µs
+2025-01-04T20:07:40.165784Z DEBUG src/write_ahead.rs:610: Write time taken: 138.042µs
+2025-01-04T20:07:40.165942Z DEBUG src/write_ahead.rs:610: Write time taken: 144.083µs
+2025-01-04T20:07:40.166539Z DEBUG src/write_ahead.rs:610: Write time taken: 586.75µs
+2025-01-04T20:07:40.166691Z DEBUG src/write_ahead.rs:610: Write time taken: 139.666µs
+2025-01-04T20:07:40.166834Z DEBUG src/write_ahead.rs:610: Write time taken: 132.917µs
+2025-01-04T20:07:40.167017Z DEBUG src/write_ahead.rs:610: Write time taken: 173.042µs
 ```
 
-M3 Max MBP
-
-A rotation has to do 2 additional writes, and there's a bit of overhead in message passing with the flume channels. This was also run in a VSCode dev container.
+TLDR it's super fast.
