@@ -39,7 +39,7 @@ TLDR it's super fast.
 
 ## Separating writers and readers
 
-By using a single writer, we can increase throughput via batching with simplicity (exploration of `io_uring` for writing planned).
+By using a single writer, we can increase throughput via batching with simplicity (`io_uring` does not provide a benefit for a single writer with a dedicated thread).
 
 With a separate reader, can we have a single writer using the `sfd::fs::File`, while readers can use `io_uring` to prevent blocking each other. This means the writer never waits for readers, and the readers never wait for each other.
 
