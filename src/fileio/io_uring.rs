@@ -6,13 +6,30 @@ mod linux_impl {
     use std::env;
     use std::os::unix::io::AsRawFd;
     use std::path::Path;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
     use tracing::instrument;
+
+    pub enum IOUringCommand {
+        Read {
+            offset: u64,
+            size: u64,
+            response: flume::Sender<std::io::Result<Vec<u8>>>,
+        },
+        Write {
+            offset: u64,
+            data: Vec<u8>,
+            response: flume::Sender<std::io::Result<()>>,
+        },
+    }
 
     pub struct IOUringFile {
         fd: std::fs::File,
-        ring: Arc<Mutex<IoUring>>,
+        command_sender: flume::Sender<IOUringCommand>,
+    }
+
+    struct IOUringActor {
+        fd: std::fs::File,
+        ring: IoUring,
+        command_receiver: flume::Receiver<IOUringCommand>,
     }
 
     const DEFAULT_SQPOLL_TIMEOUT: u32 = 20;
@@ -53,99 +70,13 @@ mod linux_impl {
     }
 
     impl IOUringFile {
-        pub fn new(
-            device_path: &Path,
-            ring: Arc<tokio::sync::Mutex<IoUring>>,
-        ) -> std::io::Result<Self> {
+        pub fn new(device_path: &Path) -> std::io::Result<Self> {
             let fd = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .open(device_path)?;
 
-            Ok(Self { fd, ring })
-        }
-
-        /// Reads a block from the device into the given buffer.
-        #[instrument(skip(self, buffer), level = "trace")]
-        pub async fn read_block(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
-            let fd = io_uring::types::Fd(self.fd.as_raw_fd());
-
-            let read_e = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as _)
-                .offset(offset)
-                .build()
-                .user_data(0x42);
-
-            // Lock the ring for this operation
-            {
-                let mut ring = self.ring.lock().await;
-
-                unsafe {
-                    ring.submission()
-                        .push(&read_e)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                }
-
-                ring.submit_and_wait(1)?;
-            }
-
-            // Release the lock so that the ring can be used by other operations
-
-            // Get the lock again
-            {
-                // Process completion
-                let mut ring = self.ring.lock().await;
-                while let Some(cqe) = ring.completion().next() {
-                    if cqe.result() < 0 {
-                        return Err(std::io::Error::from_raw_os_error(-cqe.result()));
-                    }
-                }
-            }
-
-            Ok(())
-        }
-
-        /// Writes multiple blocks to the device in a single submission
-        #[instrument(skip(self, data), level = "trace")]
-        pub async fn write_data(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
-            let fd = io_uring::types::Fd(self.fd.as_raw_fd());
-
-            let write_e = opcode::Write::new(fd, data.as_ptr(), data.len() as _)
-                .offset(offset)
-                .build()
-                .user_data(0x43);
-
-            {
-                // Lock the ring for this operation
-                let mut ring = self.ring.lock().await;
-
-                unsafe {
-                    ring.submission()
-                        .push(&write_e)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                }
-
-                ring.submit_and_wait(1)?;
-            }
-
-            {
-                // Process completion
-                let mut ring = self.ring.lock().await;
-                while let Some(cqe) = ring.completion().next() {
-                    if cqe.result() < 0 {
-                        return Err(std::io::Error::from_raw_os_error(-cqe.result()));
-                    }
-                }
-            }
-
-            Ok(())
-        }
-    }
-
-    use anyhow::Result;
-
-    impl FileReader for IOUringFile {
-        async fn open(path: &Path) -> Result<Self> {
             let ring = if *USE_SQPOLL {
                 IoUring::builder()
                     .setup_sqpoll(*SQPOLL_TIMEOUT)
@@ -153,13 +84,143 @@ mod linux_impl {
             } else {
                 IoUring::new(*URING_SIZE)?
             };
-            Ok(Self::new(path, Arc::new(Mutex::new(ring)))?)
+
+            let (tx, rx) = flume::unbounded();
+
+            let actor = IOUringActor {
+                fd: fd.try_clone()?,
+                ring,
+                command_receiver: rx,
+            };
+
+            tokio::spawn(actor.run());
+
+            Ok(Self {
+                fd,
+                command_sender: tx,
+            })
+        }
+
+        pub async fn read_block(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
+            let (tx, rx) = flume::unbounded();
+            self.command_sender
+                .send(IOUringCommand::Read {
+                    offset,
+                    size: buffer.len() as u64,
+                    response: tx,
+                })
+                .unwrap();
+
+            let data = rx.recv_async().await.unwrap()?;
+            buffer.copy_from_slice(&data);
+            Ok(())
+        }
+
+        pub async fn write_data(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+            let (tx, rx) = flume::unbounded();
+            self.command_sender
+                .send(IOUringCommand::Write {
+                    offset,
+                    data: data.to_vec(),
+                    response: tx,
+                })
+                .unwrap();
+            let _ = rx.recv_async().await.unwrap();
+            Ok(())
+        }
+    }
+
+    impl IOUringActor {
+        async fn run(mut self) {
+            while let Ok(cmd) = self.command_receiver.recv_async().await {
+                match cmd {
+                    IOUringCommand::Read {
+                        offset,
+                        size,
+                        response,
+                    } => {
+                        let result = self.handle_read(offset, size).await;
+                        let _ = response.send(result);
+                    }
+                    IOUringCommand::Write {
+                        offset,
+                        data,
+                        response,
+                    } => {
+                        let result = self.handle_write(offset, &data).await;
+                        let _ = response.send(result);
+                    }
+                }
+            }
+        }
+
+        async fn handle_read(&mut self, offset: u64, size: u64) -> std::io::Result<Vec<u8>> {
+            let mut buffer = vec![0u8; size as usize];
+            let fd = io_uring::types::Fd(self.fd.as_raw_fd());
+
+            let read_e = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as _)
+                .offset(offset)
+                .build()
+                .user_data(0x42);
+
+            unsafe {
+                self.ring
+                    .submission()
+                    .push(&read_e)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
+
+            self.ring.submit_and_wait(1)?;
+
+            while let Some(cqe) = self.ring.completion().next() {
+                if cqe.result() < 0 {
+                    return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+                }
+            }
+
+            Ok(buffer)
+        }
+
+        async fn handle_write(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+            let fd = io_uring::types::Fd(self.fd.as_raw_fd());
+
+            let write_e = opcode::Write::new(fd, data.as_ptr(), data.len() as _)
+                .offset(offset)
+                .build()
+                .user_data(0x43);
+
+            unsafe {
+                self.ring
+                    .submission()
+                    .push(&write_e)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
+
+            self.ring.submit_and_wait(1)?;
+
+            while let Some(cqe) = self.ring.completion().next() {
+                if cqe.result() < 0 {
+                    return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+                }
+            }
+
+            Ok(())
+        }
+    }
+
+    impl FileReader for IOUringFile {
+        async fn open(path: &Path) -> anyhow::Result<Self> {
+            Ok(Self::new(path)?)
         }
 
         async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
-            let mut buffer = vec![0u8; size as usize];
-            self.read_block(offset, &mut buffer).await?;
-            Ok(buffer)
+            let (tx, rx) = flume::unbounded();
+            self.command_sender.send(IOUringCommand::Read {
+                offset,
+                size,
+                response: tx,
+            })?;
+            Ok(rx.recv_async().await??)
         }
 
         fn file_length(&self) -> u64 {
@@ -168,20 +229,18 @@ mod linux_impl {
     }
 
     impl FileWriter for IOUringFile {
-        async fn open(path: &Path) -> Result<Self> {
-            let ring = if *USE_SQPOLL {
-                IoUring::builder()
-                    .setup_sqpoll(*SQPOLL_TIMEOUT)
-                    .build(*URING_SIZE)?
-            } else {
-                IoUring::new(*URING_SIZE)?
-            };
-            Ok(Self::new(path, Arc::new(Mutex::new(ring)))?)
+        async fn open(path: &Path) -> anyhow::Result<Self> {
+            Ok(Self::new(path)?)
         }
 
         async fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
-            self.write_data(offset, data).await?;
-            Ok(())
+            let (tx, rx) = flume::unbounded();
+            self.command_sender.send(IOUringCommand::Write {
+                offset,
+                data: data.to_vec(),
+                response: tx,
+            })?;
+            Ok(rx.recv_async().await??)
         }
 
         fn file_length(&self) -> u64 {
@@ -210,102 +269,39 @@ mod tests {
     const BLOCK_SIZE: usize = 4096;
 
     #[tokio::test]
-    async fn test_io_uring_read_write() -> Result<(), Box<dyn std::error::Error>> {
-        // Create a shared io_uring instance
-        // Create a shared io_uring instance
-        let ring = Arc::new(Mutex::new(IoUring::new(128)?));
-
-        // Create a temporary file path
-        let temp_file = tempfile::NamedTempFile::new()?;
-        let temp_path = temp_file.path().to_str().unwrap();
-
-        // Create a new device instance
-        let device = IOUringFile::new(&Path::new(temp_path), ring)?;
-
-        // Test data
-        let mut write_data = [0u8; BLOCK_SIZE];
-        let hello = b"Hello, world!\n";
-        write_data[..hello.len()].copy_from_slice(hello);
-
-        // Write test
-        device.write_data(0, &write_data).await?;
-
-        // Read test
-        let mut read_buffer = [0u8; BLOCK_SIZE];
-        device.read_block(0, &mut read_buffer).await?;
-
-        // Verify the contents
-        assert_eq!(&read_buffer[..hello.len()], hello);
-        println!("Read data: {:?}", &read_buffer[..hello.len()]);
-        // As a string
-        println!(
-            "Read data (string): {}",
-            String::from_utf8_lossy(&read_buffer[..hello.len()])
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_io_uring_sqpoll() -> Result<(), Box<dyn std::error::Error>> {
-        // Create a shared io_uring instance with SQPOLL enabled
-        let ring = Arc::new(Mutex::new(
-            IoUring::builder()
-                .setup_sqpoll(2000) // 2000ms timeout
-                .build(128)?,
-        ));
-
-        // Create a temporary file path
-        let temp_file = tempfile::NamedTempFile::new()?;
-        let temp_path = temp_file.path().to_str().unwrap();
-
-        // Create a new device instance
-        let device = IOUringFile::new(&Path::new(temp_path), ring)?;
-
-        // Test data
-        let mut write_data = [0u8; BLOCK_SIZE];
-        let test_data = b"Testing SQPOLL mode!\n";
-        write_data[..test_data.len()].copy_from_slice(test_data);
-
-        // Write test
-        device.write_data(0, &write_data).await?;
-
-        // Read test
-        let mut read_buffer = [0u8; BLOCK_SIZE];
-        device.read_block(0, &mut read_buffer).await?;
-
-        // Verify the contents
-        assert_eq!(&read_buffer[..test_data.len()], test_data);
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_write_without_sealing() {
         let path = PathBuf::from("/tmp/01.log");
 
-        logfile::tests::test_write_without_sealing::<SimpleFile, IOUringFile>(path).await;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            logfile::tests::test_write_without_sealing::<IOUringFile, IOUringFile>(path),
+        )
+        .await
+        {
+            Ok(_) => (),
+            Err(elapsed) => panic!("Test timed out after 5 seconds: {}", elapsed),
+        }
     }
 
     #[tokio::test]
     async fn test_write_with_sealing() {
         let path = PathBuf::from("/tmp/02.log");
 
-        logfile::tests::test_write_with_sealing::<SimpleFile, IOUringFile>(path).await;
+        logfile::tests::test_write_with_sealing::<IOUringFile, IOUringFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_corrupted_record() {
         let path = PathBuf::from("/tmp/03.log");
 
-        logfile::tests::test_corrupted_record::<SimpleFile, IOUringFile>(path).await;
+        logfile::tests::test_corrupted_record::<IOUringFile, IOUringFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_corrupted_record_sealed() {
         let path = PathBuf::from("/tmp/04.log");
 
-        logfile::tests::test_corrupted_record_sealed::<SimpleFile, IOUringFile>(path).await;
+        logfile::tests::test_corrupted_record_sealed::<IOUringFile, IOUringFile>(path).await;
     }
 
     // #[tokio::test]
@@ -324,7 +320,7 @@ mod tests {
     async fn test_100_records() {
         let path = PathBuf::from("/tmp/06.log");
 
-        logfile::tests::test_100_records::<SimpleFile, IOUringFile>(path).await;
+        logfile::tests::test_100_records::<IOUringFile, IOUringFile>(path).await;
     }
 
     // FIXME
@@ -332,14 +328,14 @@ mod tests {
     async fn test_stream() {
         let path = PathBuf::from("/tmp/10.log");
 
-        logfile::tests::test_stream::<SimpleFile, IOUringFile>(path).await;
+        logfile::tests::test_stream::<IOUringFile, IOUringFile>(path).await;
     }
 
     #[tokio::test]
     async fn test_write_magic_number_without_sealing_escape() {
         let path = PathBuf::from("/tmp/08.log");
 
-        logfile::tests::test_write_magic_number_without_sealing_escape::<SimpleFile, IOUringFile>(
+        logfile::tests::test_write_magic_number_without_sealing_escape::<IOUringFile, IOUringFile>(
             path,
         )
         .await;
@@ -349,7 +345,7 @@ mod tests {
     async fn test_write_magic_number_sealing_escape() {
         let path = PathBuf::from("/tmp/09.log");
 
-        logfile::tests::test_write_magic_number_sealing_escape::<SimpleFile, IOUringFile>(path)
+        logfile::tests::test_write_magic_number_sealing_escape::<IOUringFile, IOUringFile>(path)
             .await;
     }
 

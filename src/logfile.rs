@@ -478,20 +478,40 @@ pub mod tests {
     >(
         path: PathBuf,
     ) {
+        debug!("Starting test_write_without_sealing");
+
+        debug!("Launching LogFileWriter");
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
+
+        debug!("Creating channels for write command");
         let (tx, rx) = flume::unbounded();
+
+        debug!("Sending write command");
         writer
             .send(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
             .unwrap();
+
+        debug!("Waiting for write response");
         let response = rx.recv().unwrap().unwrap();
         let offsets = response.offsets;
+        debug!("Received write response with offsets: {:?}", offsets);
 
+        debug!("Opening logfile for reading");
         let logfile: Logfile<ReadF> = Logfile::from_file(&path).await.unwrap();
+
+        debug!("Verifying logfile properties");
         assert_eq!(logfile.id, "01");
         assert!(!logfile.sealed);
-        assert_eq!(logfile.read_record(&offsets[0]).await.unwrap(), b"hello");
 
+        debug!("Reading record at offset {}", offsets[0]);
+        let record = logfile.read_record(&offsets[0]).await.unwrap();
+        debug!("Read record: {:?}", record);
+        assert_eq!(record, b"hello");
+
+        debug!("Cleaning up - removing test file");
         std::fs::remove_file(&path).unwrap();
+
+        debug!("Test completed successfully");
     }
 
     pub async fn test_write_with_sealing<
