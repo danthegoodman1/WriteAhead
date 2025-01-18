@@ -181,7 +181,7 @@ mod linux_impl {
                         );
                         let result = self.handle_read(offset, size).await;
                         println!("IOUringActor::run - Read result: {:?}", result.is_ok());
-                        let _ = response.send(result);
+                        let _ = response.send_async(result).await;
                     }
 
                     IOUringCommand::Write {
@@ -196,7 +196,7 @@ mod linux_impl {
                         );
                         let result = self.handle_write(offset, &data).await;
                         println!("IOUringActor::run - Write result: {:?}", result.is_ok());
-                        let _ = response.send(result);
+                        let _ = response.send_async(result).await;
                         println!("IOUringActor::run - Sent response");
                     }
                 }
@@ -311,11 +311,13 @@ mod linux_impl {
             );
             let (tx, rx) = flume::unbounded();
             println!("FileReader::read - Sending read command");
-            self.command_sender.send(IOUringCommand::Read {
-                offset,
-                size,
-                response: tx,
-            })?;
+            self.command_sender
+                .send_async(IOUringCommand::Read {
+                    offset,
+                    size,
+                    response: tx,
+                })
+                .await?;
             println!("FileReader::read - Waiting for response");
             let result = rx.recv_async().await??;
             println!("FileReader::read - Received {} bytes", result.len());
@@ -346,11 +348,13 @@ mod linux_impl {
             );
             let (tx, rx) = flume::unbounded();
             println!("FileWriter::write - Sending write command");
-            self.command_sender.send(IOUringCommand::Write {
-                offset,
-                data: data.to_vec(),
-                response: tx,
-            })?;
+            self.command_sender
+                .send_async(IOUringCommand::Write {
+                    offset,
+                    data: data.to_vec(),
+                    response: tx,
+                })
+                .await?;
             println!("FileWriter::write - Waiting for response");
             let result = rx.recv_async().await.unwrap().unwrap();
             println!("FileWriter::write - Write completed successfully");

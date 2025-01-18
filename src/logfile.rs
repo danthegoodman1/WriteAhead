@@ -478,40 +478,27 @@ pub mod tests {
     >(
         path: PathBuf,
     ) {
-        println!("Starting test_write_without_sealing");
-
-        println!("Launching LogFileWriter");
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
 
-        println!("Creating channels for write command");
         let (tx, rx) = flume::unbounded();
 
-        println!("Sending write command");
         writer
-            .send(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
+            .send_async(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
+            .await
             .unwrap();
 
-        println!("Waiting for write response");
-        let response = rx.recv().unwrap().unwrap();
+        let response = rx.recv_async().await.unwrap().unwrap();
         let offsets = response.offsets;
-        println!("Received write response with offsets: {:?}", offsets);
 
-        println!("Opening logfile for reading");
         let logfile: Logfile<ReadF> = Logfile::from_file(&path).await.unwrap();
 
-        println!("Verifying logfile properties");
         assert_eq!(logfile.id, "01");
         assert!(!logfile.sealed);
 
-        println!("Reading record at offset {}", offsets[0]);
         let record = logfile.read_record(&offsets[0]).await.unwrap();
-        println!("Read record: {:?}", record);
         assert_eq!(record, b"hello");
 
-        println!("Cleaning up - removing test file");
         std::fs::remove_file(&path).unwrap();
-
-        println!("Test completed successfully");
     }
 
     pub async fn test_write_with_sealing<
@@ -523,23 +510,26 @@ pub mod tests {
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
         let (tx, rx) = flume::unbounded();
         writer
-            .send(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
+            .send_async(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
+            .await
             .unwrap();
-        let response = rx.recv().unwrap().unwrap();
+        let response = rx.recv_async().await.unwrap().unwrap();
         let offsets = response.offsets;
 
         // Seal the file
         let (tx, rx) = flume::unbounded();
-        writer.send(WriterCommand::Seal(tx)).unwrap();
-        rx.recv().unwrap().unwrap();
+        writer.send_async(WriterCommand::Seal(tx)).await.unwrap();
+        rx.recv_async().await.unwrap().unwrap();
 
         // Try to write after sealing - should fail
         let (tx, rx) = flume::unbounded();
         writer
-            .send(WriterCommand::Write(tx, vec![b"world".to_vec()]))
+            .send_async(WriterCommand::Write(tx, vec![b"world".to_vec()]))
+            .await
             .unwrap();
         assert!(matches!(
-            rx.recv()
+            rx.recv_async()
+                .await
                 .unwrap()
                 .unwrap_err()
                 .downcast_ref::<LogfileError>(),
@@ -563,9 +553,10 @@ pub mod tests {
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
         let (tx, rx) = flume::unbounded();
         writer
-            .send(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
+            .send_async(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
+            .await
             .unwrap();
-        let response = rx.recv().unwrap().unwrap();
+        let response = rx.recv_async().await.unwrap().unwrap();
         let offsets = response.offsets;
 
         // Corrupt the record directly using a new file handle
@@ -598,15 +589,16 @@ pub mod tests {
         // Write and get offset
         let (tx, rx) = flume::unbounded();
         writer
-            .send(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
+            .send_async(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
+            .await
             .unwrap();
-        let response = rx.recv().unwrap().unwrap();
+        let response = rx.recv_async().await.unwrap().unwrap();
         let offsets = response.offsets;
 
         // Seal the file
         let (tx, rx) = flume::unbounded();
-        writer.send(WriterCommand::Seal(tx)).unwrap();
-        rx.recv().unwrap().unwrap();
+        writer.send_async(WriterCommand::Seal(tx)).await.unwrap();
+        rx.recv_async().await.unwrap().unwrap();
 
         // Corrupt the record
         let logfile: Logfile<ReadF> = Logfile::from_file(&path).await.unwrap();
@@ -633,14 +625,17 @@ pub mod tests {
             .collect();
 
         let (tx, rx) = flume::unbounded();
-        writer.send(WriterCommand::Write(tx, records)).unwrap();
-        let response = rx.recv().unwrap().unwrap();
+        writer
+            .send_async(WriterCommand::Write(tx, records))
+            .await
+            .unwrap();
+        let response = rx.recv_async().await.unwrap().unwrap();
         let offsets = response.offsets;
 
         // Seal the file
         let (tx, rx) = flume::unbounded();
-        writer.send(WriterCommand::Seal(tx)).unwrap();
-        rx.recv().unwrap().unwrap();
+        writer.send_async(WriterCommand::Seal(tx)).await.unwrap();
+        rx.recv_async().await.unwrap().unwrap();
 
         // Verify all records
         let logfile: Logfile<ReadF> = Logfile::from_file(&path).await.unwrap();
@@ -662,9 +657,10 @@ pub mod tests {
 
         let (tx, rx) = flume::unbounded();
         writer
-            .send(WriterCommand::Write(tx, vec![MAGIC_NUMBER.to_vec()]))
+            .send_async(WriterCommand::Write(tx, vec![MAGIC_NUMBER.to_vec()]))
+            .await
             .unwrap();
-        let response = rx.recv().unwrap().unwrap();
+        let response = rx.recv_async().await.unwrap().unwrap();
         let offsets = response.offsets;
 
         let logfile: Logfile<ReadF> = Logfile::from_file(&path).await.unwrap();
@@ -689,15 +685,16 @@ pub mod tests {
         // Write magic number
         let (tx, rx) = flume::unbounded();
         writer
-            .send(WriterCommand::Write(tx, vec![MAGIC_NUMBER.to_vec()]))
+            .send_async(WriterCommand::Write(tx, vec![MAGIC_NUMBER.to_vec()]))
+            .await
             .unwrap();
-        let response = rx.recv().unwrap().unwrap();
+        let response = rx.recv_async().await.unwrap().unwrap();
         let offsets = response.offsets;
 
         // Seal the file
         let (tx, rx) = flume::unbounded();
-        writer.send(WriterCommand::Seal(tx)).unwrap();
-        rx.recv().unwrap().unwrap();
+        writer.send_async(WriterCommand::Seal(tx)).await.unwrap();
+        rx.recv_async().await.unwrap().unwrap();
 
         let logfile: Logfile<ReadF> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "09");
@@ -718,8 +715,11 @@ pub mod tests {
         let records = vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()];
 
         let (tx, rx) = flume::unbounded();
-        writer.send(WriterCommand::Write(tx, records)).unwrap();
-        let response = rx.recv().unwrap().unwrap();
+        writer
+            .send_async(WriterCommand::Write(tx, records))
+            .await
+            .unwrap();
+        let response = rx.recv_async().await.unwrap().unwrap();
         let offsets = response.offsets;
 
         let logfile: Logfile<ReadF> = Logfile::from_file(&path).await.unwrap();
@@ -742,8 +742,11 @@ pub mod tests {
             .collect();
 
         let (tx, rx) = flume::unbounded();
-        writer.send(WriterCommand::Write(tx, records)).unwrap();
-        rx.recv().unwrap().unwrap();
+        writer
+            .send_async(WriterCommand::Write(tx, records))
+            .await
+            .unwrap();
+        rx.recv_async().await.unwrap().unwrap();
 
         // Test streaming
         let logfile: Logfile<ReadF> = Logfile::from_file(&path).await.unwrap();
