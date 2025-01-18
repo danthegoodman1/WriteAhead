@@ -148,8 +148,10 @@ impl<F: FileReader> Logfile<F> {
     }
 
     pub async fn read_record(&self, offset: &u64) -> Result<Vec<u8>> {
+        println!("read_record - Starting read at offset {}", offset);
         // Verify that the header is not trying to be read
         if *offset < 8 {
+            println!("read_record - Invalid offset {}", offset);
             return Err(anyhow!(LogfileError::InvalidOffset(*offset)));
         }
         trace!(
@@ -158,10 +160,15 @@ impl<F: FileReader> Logfile<F> {
             self.sealed
         );
 
+        println!(
+            "read_record - Reading header (20 bytes) at offset {}",
+            offset
+        );
         // Read the hash and length (20 bytes total)
         let header = self.fio.read(*offset, 20).await.context(
             "Failed to read record header, is the file corrupted, or a partial write occurred?",
         )?;
+        println!("read_record - Successfully read header");
 
         // Parse the header
         let hash1 = i64::from_le_bytes(
@@ -179,20 +186,30 @@ impl<F: FileReader> Logfile<F> {
                 .try_into()
                 .context("Failed to parse record length")?,
         );
+        println!("read_record - Parsed header: length={}", length);
 
         // Verify that the file is long enough to contain the record
         // if *offset + 20 + length as u64 > self.file_length {
         //     return Err(anyhow!(LogfileError::PartialWrite));
         // }
+        println!(
+            "read_record - Reading record data ({} bytes) at offset {}",
+            length,
+            offset + 20
+        );
 
         // Read the actual record data
         let mut record = self.fio.read(*offset + 20, length as u64).await?;
+        println!("read_record - Successfully read record data");
 
+        println!("read_record - Verifying hash");
         // Verify the hash
         let (computed_hash1, computed_hash2) = murmur3_128(&record);
         if computed_hash1 != hash1 || computed_hash2 != hash2 {
+            println!("read_record - Hash verification failed");
             return Err(anyhow!(LogfileError::Corrupted));
         }
+        println!("read_record - Hash verified successfully");
 
         // Replace 0x00 0xff with 0xff, scanning from end to start
         let mut i = record.len();
@@ -204,6 +221,10 @@ impl<F: FileReader> Logfile<F> {
             }
         }
 
+        println!(
+            "read_record - Finished processing record of length {}",
+            record.len()
+        );
         Ok(record)
     }
 
@@ -415,8 +436,14 @@ impl<F: FileReader> LogFileStream<F> {
     }
 
     async fn read_and_move_offset(&mut self, offset: u64) -> Result<Vec<u8>> {
+        println!("read_and_move_offset - Starting read at offset {}", offset);
         let record = self.logfile.read_record(&offset).await?;
+        println!(
+            "read_and_move_offset - Successfully read record of length {}",
+            record.len()
+        );
         self.offset += 20 + record.len() as u64;
+        println!("read_and_move_offset - Updated offset to {}", self.offset);
         Ok(record)
     }
 }
@@ -426,20 +453,40 @@ impl<F: FileReader> Stream for LogFileStream<F> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        println!(
+            "poll_next - Current offset: {}, file length: {}",
+            this.offset,
+            this.logfile.file_length()
+        );
 
         if this.logfile.sealed && this.offset >= this.logfile.file_length() - 9 {
+            println!("poll_next - End of sealed file reached");
             return Poll::Ready(None);
         } else if this.offset >= this.logfile.file_length() {
+            println!("poll_next - End of file reached");
             return Poll::Ready(None);
         }
 
+        println!("poll_next - Creating future for offset {}", this.offset);
         let future = this.read_and_move_offset(this.offset);
         pin_mut!(future);
 
         match future.poll(cx) {
-            Poll::Ready(Ok(record)) => Poll::Ready(Some(Ok(record))),
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(record)) => {
+                println!(
+                    "poll_next - Successfully read record of length {}",
+                    record.len()
+                );
+                Poll::Ready(Some(Ok(record)))
+            }
+            Poll::Ready(Err(e)) => {
+                println!("poll_next - Error reading record: {:?}", e);
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Pending => {
+                println!("poll_next - Poll pending");
+                Poll::Pending
+            }
         }
     }
 }
@@ -734,30 +781,44 @@ pub mod tests {
     pub async fn test_stream<WriteF: FileWriter + 'static, ReadF: FileReader + 'static>(
         path: PathBuf,
     ) {
+        println!("Starting test_stream");
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
+        println!("Writer launched");
 
         // Write 10 records
         let records: Vec<Vec<u8>> = (0..10)
             .map(|i| format!("record_{}", i).into_bytes())
             .collect();
+        println!("Created {} records", records.len());
 
         let (tx, rx) = flume::unbounded();
         writer
             .send_async(WriterCommand::Write(tx, records))
             .await
             .unwrap();
+        println!("Sent write command");
         rx.recv_async().await.unwrap().unwrap();
+        println!("Write completed");
 
         // Test streaming
         let logfile: Logfile<ReadF> = Logfile::from_file(&path).await.unwrap();
+        println!("Opened logfile for reading");
         let mut stream = LogFileStream::new(logfile);
+        println!("Created stream");
+
         for i in 0..10 {
+            println!("Reading record {}", i);
             let record = stream.next().await.unwrap().unwrap();
+            println!("Successfully read record {}", i);
             assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
         }
+
+        println!("Checking for end of stream");
         let next_val = stream.next().await;
         assert!(next_val.is_none());
+        println!("Stream ended as expected");
 
         std::fs::remove_file(&path).unwrap();
+        println!("Test completed successfully");
     }
 }
