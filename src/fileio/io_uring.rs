@@ -182,6 +182,7 @@ mod linux_impl {
                         let result = self.handle_read(offset, size).await;
                         println!("IOUringActor::run - Read result: {:?}", result.is_ok());
                         let _ = response.send_async(result).await;
+                        println!("IOUringActor::run - Sent read response");
                     }
 
                     IOUringCommand::Write {
@@ -197,7 +198,7 @@ mod linux_impl {
                         let result = self.handle_write(offset, &data).await;
                         println!("IOUringActor::run - Write result: {:?}", result.is_ok());
                         let _ = response.send_async(result).await;
-                        println!("IOUringActor::run - Sent response");
+                        println!("IOUringActor::run - Sent write response");
                     }
                 }
             }
@@ -319,7 +320,7 @@ mod linux_impl {
                 })
                 .await?;
             println!("FileReader::read - Waiting for response");
-            let result = rx.recv_async().await??;
+            let result = rx.recv_async().await.unwrap().unwrap();
             println!("FileReader::read - Received {} bytes", result.len());
             Ok(result)
         }
@@ -441,7 +442,7 @@ mod tests {
     // FIXME
     #[tokio::test]
     async fn test_stream() {
-        let path = PathBuf::from("/tmp/10.log");
+        let path = PathBuf::from("/tmp/07.log");
 
         logfile::tests::test_stream::<IOUringFile, IOUringFile>(path).await;
     }
