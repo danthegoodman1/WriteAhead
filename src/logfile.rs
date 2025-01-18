@@ -525,6 +525,7 @@ pub mod tests {
     >(
         path: PathBuf,
     ) {
+        let _ = std::fs::remove_file(&path);
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
 
         let (tx, rx) = flume::unbounded();
@@ -554,6 +555,7 @@ pub mod tests {
     >(
         path: PathBuf,
     ) {
+        let _ = std::fs::remove_file(&path);
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
         let (tx, rx) = flume::unbounded();
         writer
@@ -597,6 +599,7 @@ pub mod tests {
     >(
         path: PathBuf,
     ) {
+        let _ = std::fs::remove_file(&path);
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
         let (tx, rx) = flume::unbounded();
         writer
@@ -631,6 +634,7 @@ pub mod tests {
     >(
         path: PathBuf,
     ) {
+        let _ = std::fs::remove_file(&path);
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
 
         // Write and get offset
@@ -664,6 +668,7 @@ pub mod tests {
     pub async fn test_100_records<WriteF: FileWriter + 'static, ReadF: FileReader + 'static>(
         path: PathBuf,
     ) {
+        let _ = std::fs::remove_file(&path);
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
 
         // Write 100 records
@@ -700,6 +705,7 @@ pub mod tests {
     >(
         path: PathBuf,
     ) {
+        let _ = std::fs::remove_file(&path);
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
 
         let (tx, rx) = flume::unbounded();
@@ -727,6 +733,7 @@ pub mod tests {
     >(
         path: PathBuf,
     ) {
+        let _ = std::fs::remove_file(&path);
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
 
         // Write magic number
@@ -757,6 +764,7 @@ pub mod tests {
     pub async fn test_bulk_writes<WriteF: FileWriter + 'static, ReadF: FileReader + 'static>(
         path: PathBuf,
     ) {
+        let _ = std::fs::remove_file(&path);
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
 
         let records = vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()];
@@ -781,6 +789,7 @@ pub mod tests {
     pub async fn test_stream<WriteF: FileWriter + 'static, ReadF: FileReader + 'static>(
         path: PathBuf,
     ) {
+        let _ = std::fs::remove_file(&path);
         println!("Starting test_stream");
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
         println!("Writer launched");
@@ -815,6 +824,7 @@ pub mod tests {
 
         println!("Checking for end of stream");
         let next_val = stream.next().await;
+        println!("next_val: {:?}", next_val);
         assert!(next_val.is_none());
         println!("Stream ended as expected");
 
