@@ -20,6 +20,9 @@ mod linux_impl {
             data: Vec<u8>,
             response: flume::Sender<std::io::Result<()>>,
         },
+        FileLength {
+            response: flume::Sender<std::io::Result<u64>>,
+        },
     }
 
     pub struct IOUringFile {
@@ -108,51 +111,6 @@ mod linux_impl {
                 command_sender: tx,
             })
         }
-
-        // pub async fn read_block(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
-        //     println!(
-        //         "read_block - Starting read at offset {} with size {}",
-        //         offset,
-        //         buffer.len()
-        //     );
-        //     let (tx, rx) = flume::unbounded();
-        //     println!("read_block - Sending read command");
-        //     self.command_sender
-        //         .send(IOUringCommand::Read {
-        //             offset,
-        //             size: buffer.len() as u64,
-        //             response: tx,
-        //         })
-        //         .unwrap();
-
-        //     println!("read_block - Waiting for response");
-        //     let data = rx.recv_async().await.unwrap()?;
-        //     println!("read_block - Received {} bytes", data.len());
-        //     buffer.copy_from_slice(&data);
-        //     println!("read_block - Completed successfully");
-        //     Ok(())
-        // }
-
-        // pub async fn write_data(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
-        //     println!(
-        //         "write_data - Starting write at offset {} with size {}",
-        //         offset,
-        //         data.len()
-        //     );
-        //     let (tx, rx) = flume::unbounded();
-        //     println!("write_data - Sending write command");
-        //     self.command_sender
-        //         .send(IOUringCommand::Write {
-        //             offset,
-        //             data: data.to_vec(),
-        //             response: tx,
-        //         })
-        //         .unwrap();
-        //     println!("write_data - Waiting for response");
-        //     let _ = rx.recv_async().await.unwrap();
-        //     println!("write_data - Completed successfully");
-        //     Ok(())
-        // }
     }
 
     impl IOUringActor {
@@ -199,6 +157,14 @@ mod linux_impl {
                         println!("IOUringActor::run - Write result: {:?}", result.is_ok());
                         let _ = response.send_async(result).await;
                         println!("IOUringActor::run - Sent write response");
+                    }
+
+                    IOUringCommand::FileLength { response } => {
+                        println!("IOUringActor::run - Handling file length command");
+                        let result = Ok(self.fd.metadata().unwrap().len());
+                        println!("IOUringActor::run - File length result: {:?}", result);
+                        let _ = response.send_async(result).await;
+                        println!("IOUringActor::run - Sent file length response");
                     }
                 }
             }
@@ -327,7 +293,13 @@ mod linux_impl {
 
         fn file_length(&self) -> u64 {
             println!("FileReader::file_length - Getting file length");
-            let length = self.fd.metadata().unwrap().len();
+            let (tx, rx) = flume::unbounded();
+            // FIXME: This blocks
+            self.command_sender
+                .send(IOUringCommand::FileLength { response: tx })
+                .unwrap();
+            println!("FileReader::file_length - Waiting for response");
+            let length = rx.recv().unwrap().unwrap();
             println!("FileReader::file_length - File length is {}", length);
             length
         }
@@ -364,7 +336,11 @@ mod linux_impl {
 
         fn file_length(&self) -> u64 {
             println!("FileWriter::file_length - Getting file length");
-            let length = self.fd.metadata().unwrap().len();
+            let (tx, rx) = flume::unbounded();
+            self.command_sender
+                .send(IOUringCommand::FileLength { response: tx })
+                .unwrap();
+            let length = rx.recv().unwrap().unwrap();
             println!("FileWriter::file_length - File length is {}", length);
             length
         }
