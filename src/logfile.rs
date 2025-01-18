@@ -254,7 +254,7 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
         let mut header = [0u8; 8];
         header[0..8].copy_from_slice(&MAGIC_NUMBER);
 
-        fio.write(0, &header).unwrap();
+        fio.write(0, &header).await?;
 
         let file_length = fio.file_length();
         let id = file_id_from_path(path)?;
@@ -271,11 +271,13 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
     pub async fn launch(path: &Path) -> Result<flume::Sender<WriterCommand>> {
         let (tx, rx) = flume::unbounded();
         let logfile = Self::new(path, rx).await?;
-        thread::spawn(move || logfile.actor_loop());
+        thread::spawn(move || {
+            block_on(logfile.actor_loop());
+        });
         Ok(tx)
     }
 
-    fn actor_loop(mut self) {
+    async fn actor_loop(mut self) {
         loop {
             let msg = match self.recv.recv() {
                 Ok(msg) => msg,
@@ -287,7 +289,7 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
             match msg {
                 WriterCommand::Write(return_chan, data) => {
                     trace!("Writing {} records to logfile {}", data.len(), self.id);
-                    let offsets = match self.write_records(data) {
+                    let offsets = match self.write_records(data).await {
                         Ok(offsets) => offsets,
                         Err(e) => {
                             return_chan.send(Err(e)).unwrap();
@@ -303,13 +305,13 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
                 }
                 WriterCommand::Seal(return_chan) => {
                     trace!("Sealing logfile {}", self.id);
-                    return_chan.send(self.seal()).unwrap();
+                    return_chan.send(self.seal().await).unwrap();
                 }
             }
         }
     }
 
-    fn write_records(&mut self, records: Vec<Vec<u8>>) -> Result<Vec<u64>> {
+    async fn write_records(&mut self, records: Vec<Vec<u8>>) -> Result<Vec<u64>> {
         if self.sealed {
             return Err(anyhow!(LogfileError::WriteToSealed));
         }
@@ -366,13 +368,14 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
         // Write all records in one operation
         self.fio
             .write(self.file_length, &combined_buffer)
+            .await
             .context("Failed to write records")?;
 
         self.file_length = current_offset;
         Ok(offsets)
     }
 
-    pub fn seal(&mut self) -> Result<()> {
+    pub async fn seal(&mut self) -> Result<()> {
         if self.sealed {
             return Err(anyhow!(LogfileError::WriteToSealed));
         }
@@ -385,6 +388,7 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
 
         self.fio
             .write(self.file_length, &footer)
+            .await
             .context("Failed to write footer")?;
 
         self.file_length += 9;

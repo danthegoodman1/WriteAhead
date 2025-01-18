@@ -28,7 +28,7 @@ impl FileWriter for SimpleFile {
     }
 
     #[instrument(skip(self, data), level = "trace")]
-    fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+    async fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
         let mut fd = &self.fd;
         fd.seek(std::io::SeekFrom::Start(offset))?;
         fd.write_all(data)?;

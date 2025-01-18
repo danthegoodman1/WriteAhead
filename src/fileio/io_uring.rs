@@ -49,20 +49,28 @@ mod linux_impl {
                 .user_data(0x42);
 
             // Lock the ring for this operation
-            let mut ring = self.ring.lock().await;
+            {
+                let mut ring = self.ring.lock().await;
 
-            unsafe {
-                ring.submission()
-                    .push(&read_e)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                unsafe {
+                    ring.submission()
+                        .push(&read_e)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                }
+
+                ring.submit_and_wait(1)?;
             }
 
-            ring.submit_and_wait(1)?;
+            // Release the lock so that the ring can be used by other operations
 
-            // Process completion
-            while let Some(cqe) = ring.completion().next() {
-                if cqe.result() < 0 {
-                    return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+            // Get the lock again
+            {
+                // Process completion
+                let mut ring = self.ring.lock().await;
+                while let Some(cqe) = ring.completion().next() {
+                    if cqe.result() < 0 {
+                        return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+                    }
                 }
             }
 
@@ -79,21 +87,26 @@ mod linux_impl {
                 .build()
                 .user_data(0x43);
 
-            // Lock the ring for this operation
-            let mut ring = self.ring.lock().await;
+            {
+                // Lock the ring for this operation
+                let mut ring = self.ring.lock().await;
 
-            unsafe {
-                ring.submission()
-                    .push(&write_e)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                unsafe {
+                    ring.submission()
+                        .push(&write_e)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                }
+
+                ring.submit_and_wait(1)?;
             }
 
-            ring.submit_and_wait(1)?;
-
-            // Process completion
-            while let Some(cqe) = ring.completion().next() {
-                if cqe.result() < 0 {
-                    return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+            {
+                // Process completion
+                let mut ring = self.ring.lock().await;
+                while let Some(cqe) = ring.completion().next() {
+                    if cqe.result() < 0 {
+                        return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+                    }
                 }
             }
 
@@ -116,6 +129,25 @@ mod linux_impl {
             let mut buffer = vec![0u8; size as usize];
             self.read_block(offset, &mut buffer).await?;
             Ok(buffer)
+        }
+
+        fn file_length(&self) -> u64 {
+            self.fd.metadata().unwrap().len()
+        }
+    }
+
+    impl FileWriter for IOUringFile {
+        async fn open(path: &Path) -> Result<Self> {
+            // Check if the once cell is already initialized
+            match GLOBAL_RING.get() {
+                Some(ring) => Ok(Self::new(path, ring.clone())?),
+                None => Err(anyhow::anyhow!("Global ring not initialized, initialize")),
+            }
+        }
+
+        async fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+            self.write_data(offset, data).await?;
+            Ok(())
         }
 
         fn file_length(&self) -> u64 {
