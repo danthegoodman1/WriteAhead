@@ -3,19 +3,47 @@ mod linux_impl {
     use crate::fileio::{FileReader, FileWriter};
 
     use io_uring::{opcode, IoUring};
-    use once_cell::sync::OnceCell;
+    use std::env;
     use std::os::unix::io::AsRawFd;
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tracing::instrument;
 
-    /// Gloal ring for use with [crate::fileio::FileIO::open]
-    pub static GLOBAL_RING: OnceCell<Arc<Mutex<IoUring>>> = OnceCell::new();
-
     pub struct IOUringFile {
         fd: std::fs::File,
         ring: Arc<Mutex<IoUring>>,
+    }
+
+    const DEFAULT_SQPOLL_TIMEOUT: u32 = 20;
+    const DEFAULT_URING_SIZE: u32 = 32;
+    const DEFAULT_USE_SQPOLL: bool = false;
+
+    fn get_sqpoll_timeout() -> u32 {
+        env::var("SQPOLL_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SQPOLL_TIMEOUT)
+    }
+
+    fn get_uring_size() -> u32 {
+        env::var("URING_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_URING_SIZE)
+    }
+
+    fn get_use_sqpoll() -> bool {
+        env::var("USE_SQPOLL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_USE_SQPOLL)
+    }
+
+    lazy_static::lazy_static! {
+        static ref SQPOLL_TIMEOUT: u32 = get_sqpoll_timeout();
+        static ref URING_SIZE: u32 = get_uring_size();
+        static ref USE_SQPOLL: bool = get_use_sqpoll();
     }
 
     impl std::fmt::Debug for IOUringFile {
@@ -118,11 +146,14 @@ mod linux_impl {
 
     impl FileReader for IOUringFile {
         async fn open(path: &Path) -> Result<Self> {
-            // Check if the once cell is already initialized
-            match GLOBAL_RING.get() {
-                Some(ring) => Ok(Self::new(path, ring.clone())?),
-                None => Err(anyhow::anyhow!("Global ring not initialized, initialize")),
-            }
+            let ring = if *USE_SQPOLL {
+                IoUring::builder()
+                    .setup_sqpoll(*SQPOLL_TIMEOUT)
+                    .build(*URING_SIZE)?
+            } else {
+                IoUring::new(*URING_SIZE)?
+            };
+            Ok(Self::new(path, Arc::new(Mutex::new(ring)))?)
         }
 
         async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
@@ -138,11 +169,14 @@ mod linux_impl {
 
     impl FileWriter for IOUringFile {
         async fn open(path: &Path) -> Result<Self> {
-            // Check if the once cell is already initialized
-            match GLOBAL_RING.get() {
-                Some(ring) => Ok(Self::new(path, ring.clone())?),
-                None => Err(anyhow::anyhow!("Global ring not initialized, initialize")),
-            }
+            let ring = if *USE_SQPOLL {
+                IoUring::builder()
+                    .setup_sqpoll(*SQPOLL_TIMEOUT)
+                    .build(*URING_SIZE)?
+            } else {
+                IoUring::new(*URING_SIZE)?
+            };
+            Ok(Self::new(path, Arc::new(Mutex::new(ring)))?)
         }
 
         async fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
@@ -162,11 +196,8 @@ pub use linux_impl::*;
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use io_uring::IoUring;
-    use linux_impl::{IOUringFile, GLOBAL_RING};
-    use std::sync::Mutex as StdMutex;
+    use linux_impl::IOUringFile;
     use tokio::sync::Mutex;
-
-    static TEST_MUTEX: StdMutex<()> = StdMutex::new(());
 
     use crate::{fileio::simple_file::SimpleFile, logfile};
 
@@ -251,11 +282,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_without_sealing() {
-        let _guard = TEST_MUTEX.lock().unwrap();
-        if GLOBAL_RING.get().is_none() {
-            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
-        }
-
         let path = PathBuf::from("/tmp/01.log");
 
         logfile::tests::test_write_without_sealing::<SimpleFile, IOUringFile>(path).await;
@@ -263,11 +289,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_with_sealing() {
-        let _guard = TEST_MUTEX.lock().unwrap();
-        if GLOBAL_RING.get().is_none() {
-            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
-        }
-
         let path = PathBuf::from("/tmp/02.log");
 
         logfile::tests::test_write_with_sealing::<SimpleFile, IOUringFile>(path).await;
@@ -275,11 +296,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_corrupted_record() {
-        let _guard = TEST_MUTEX.lock().unwrap();
-        if GLOBAL_RING.get().is_none() {
-            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
-        }
-
         let path = PathBuf::from("/tmp/03.log");
 
         logfile::tests::test_corrupted_record::<SimpleFile, IOUringFile>(path).await;
@@ -287,11 +303,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_corrupted_record_sealed() {
-        let _guard = TEST_MUTEX.lock().unwrap();
-        if GLOBAL_RING.get().is_none() {
-            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
-        }
-
         let path = PathBuf::from("/tmp/04.log");
 
         logfile::tests::test_corrupted_record_sealed::<SimpleFile, IOUringFile>(path).await;
@@ -311,11 +322,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_100_records() {
-        let _guard = TEST_MUTEX.lock().unwrap();
-        if GLOBAL_RING.get().is_none() {
-            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
-        }
-
         let path = PathBuf::from("/tmp/06.log");
 
         logfile::tests::test_100_records::<SimpleFile, IOUringFile>(path).await;
@@ -324,11 +330,6 @@ mod tests {
     // FIXME
     #[tokio::test]
     async fn test_stream() {
-        let _guard = TEST_MUTEX.lock().unwrap();
-        if GLOBAL_RING.get().is_none() {
-            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
-        }
-
         let path = PathBuf::from("/tmp/10.log");
 
         logfile::tests::test_stream::<SimpleFile, IOUringFile>(path).await;
@@ -336,11 +337,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_magic_number_without_sealing_escape() {
-        let _guard = TEST_MUTEX.lock().unwrap();
-        if GLOBAL_RING.get().is_none() {
-            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
-        }
-
         let path = PathBuf::from("/tmp/08.log");
 
         logfile::tests::test_write_magic_number_without_sealing_escape::<SimpleFile, IOUringFile>(
@@ -351,11 +347,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_magic_number_sealing_escape() {
-        let _guard = TEST_MUTEX.lock().unwrap();
-        if GLOBAL_RING.get().is_none() {
-            let _ = GLOBAL_RING.set(Arc::new(Mutex::new(IoUring::new(128).unwrap())));
-        }
-
         let path = PathBuf::from("/tmp/09.log");
 
         logfile::tests::test_write_magic_number_sealing_escape::<SimpleFile, IOUringFile>(path)

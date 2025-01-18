@@ -788,6 +788,7 @@ dependencies = [
  "flume",
  "futures",
  "io-uring",
+ "lazy_static",
  "libc",
  "once_cell",
  "tempfile",

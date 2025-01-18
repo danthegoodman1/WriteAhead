@@ -291,17 +291,13 @@ impl<F: FileReader> Unpin for WriteAheadStream<F> {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     #[cfg(target_os = "linux")]
-    use io_uring::IoUring;
-
-    use tokio::sync::Mutex;
     use tracing::Level;
     use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, Layer};
 
     #[cfg(target_os = "linux")]
-    use crate::fileio::io_uring::{IOUringFile, GLOBAL_RING};
+    use crate::fileio::io_uring::IOUringFile;
 
     use crate::fileio::simple_file::SimpleFile;
     use std::sync::Once;
@@ -311,7 +307,6 @@ mod tests {
     use super::*;
 
     static LOGGER_ONCE: Once = Once::new();
-    static URING_ONCE: Once = Once::new();
 
     const NUM_RECORDS: usize = 1000;
     const BATCH_SIZE: usize = 100;
@@ -332,20 +327,6 @@ mod tests {
 
             tracing::subscriber::set_global_default(subscriber).unwrap();
         });
-
-        #[cfg(target_os = "linux")]
-        {
-            URING_ONCE.call_once(|| {
-                if GLOBAL_RING.get().is_none() {
-                    let _ = GLOBAL_RING.set(Arc::new(Mutex::new(
-                        IoUring::builder()
-                            .setup_sqpoll(2) // 2000ms timeout
-                            .build(100)
-                            .unwrap(),
-                    )));
-                }
-            });
-        }
     }
 
     #[tokio::test]
@@ -742,11 +723,7 @@ mod tests {
                 .await
                 .unwrap();
             let end = std::time::Instant::now();
-            trace!(
-                "Write time taken for record {}: {:?}",
-                i,
-                end.duration_since(start)
-            );
+            debug!("Write time taken: {:?}", end.duration_since(start));
             records.push(record);
         }
         debug!("Finished writing all records");
