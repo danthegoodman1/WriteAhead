@@ -43,6 +43,28 @@ By using a single writer, we can increase throughput via batching with simplicit
 
 With a separate reader, can we have a single writer using the `sfd::fs::File`, while readers can use `io_uring` to prevent blocking each other. This means the writer never waits for readers, and the readers never wait for each other.
 
+### Some thoughts on io_uring
+
+io_uring for fileio is only particularly useful if using direct IO, which generally is good for a data storage system that intends to store a large amount of data.
+
+However, one use case where it's not a good fit is for a WAL. That's because in the normal case, we expect readers will likely be reading very recently written data, and as you can tell from tests, `SimpleFile` which uses the page cache reads back faster so much faster than the `IOUringFile` package:
+
+`SimpleFile`:
+```
+2025-01-19T00:35:31.122171Z DEBUG src/write_ahead.rs:92: Creating initial log file
+2025-01-19T00:35:31.206835Z DEBUG src/write_ahead.rs:445: Write time taken: 83.650875ms
+2025-01-19T00:35:31.208957Z DEBUG src/write_ahead.rs:457: Read time taken: 2.086291ms
+```
+
+`IOUringFile` (which uses `SimpleFile` for writing):
+```
+2025-01-19T00:35:21.075255Z DEBUG src/write_ahead.rs:92: Creating initial log file
+2025-01-19T00:35:21.154822Z DEBUG src/write_ahead.rs:484: Write time taken: 79.14325ms
+2025-01-19T00:35:21.280025Z DEBUG src/write_ahead.rs:496: Read time taken: 125.154709ms
+```
+
+As you can see, reading recently written files is quite a bit faster with the page cache. As a result, `IOUringFile` is more likely to be removed than completed.
+
 ## Integrating with a thread-safe API framework (Axum, tonic, etc.)
 
 Since WriteAhead is single-threaded, to preserve performance it's probably best to spawn off a thread dedicated for this, and use a channel to communicate writes and reads. Then you can even buffer them up in memory and micro-batch them (e.g. at most 500us) for increased throughput.
