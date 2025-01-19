@@ -37,8 +37,8 @@ impl FileWriter for SimpleFile {
         Ok(())
     }
 
-    fn file_length(&self) -> u64 {
-        self.fd.metadata().unwrap().len()
+    async fn file_length(&self) -> anyhow::Result<u64> {
+        Ok(self.fd.metadata().unwrap().len())
     }
 }
 
@@ -64,8 +64,8 @@ impl FileReader for SimpleFile {
         Ok(buffer)
     }
 
-    fn file_length(&self) -> u64 {
-        self.fd.metadata().unwrap().len()
+    async fn file_length(&self) -> anyhow::Result<u64> {
+        Ok(self.fd.metadata().unwrap().len())
     }
 }
 
@@ -137,10 +137,10 @@ mod tests {
             .await;
     }
 
-    #[tokio::test]
-    async fn test_stream() {
-        let path = PathBuf::from("/tmp/10.log");
+    // #[tokio::test]
+    // async fn test_stream() {
+    //     let path = PathBuf::from("/tmp/10.log");
 
-        logfile::tests::test_stream::<SimpleFile, SimpleFile>(path).await;
-    }
+    //     logfile::tests::test_stream::<SimpleFile, SimpleFile>(path).await;
+    // }
 }
