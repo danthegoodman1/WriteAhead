@@ -2,40 +2,36 @@
 mod linux_impl {
     use crate::fileio::{FileReader, FileWriter};
 
-    use io_uring::{opcode, IoUring};
-    use once_cell::sync::OnceCell;
-    use std::os::unix::io::AsRawFd;
+    use io_uring::IoUring;
+    use io_uring_actor::io_uring::IOUringAPI;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
     use tracing::instrument;
 
-    /// Gloal ring for use with [crate::fileio::FileIO::open]
-    pub static GLOBAL_RING: OnceCell<Arc<Mutex<IoUring>>> = OnceCell::new();
-
-    pub struct IOUringFile {
-        fd: std::fs::File,
-        ring: Arc<Mutex<IoUring>>,
+    pub struct IOUringFile<const BLOCK_SIZE: usize> {
+        api: IOUringAPI<BLOCK_SIZE>,
     }
 
-    impl std::fmt::Debug for IOUringFile {
+    impl<const BLOCK_SIZE: usize> std::fmt::Debug for IOUringFile<BLOCK_SIZE> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "IOUringFile {{ fd: {:?} }}", self.fd)
+            write!(f, "IOUringFile")
         }
     }
 
-    impl IOUringFile {
-        pub fn new(
-            device_path: &Path,
-            ring: Arc<tokio::sync::Mutex<IoUring>>,
-        ) -> std::io::Result<Self> {
+    impl<const BLOCK_SIZE: usize> IOUringFile<BLOCK_SIZE> {
+        pub async fn new(device_path: &Path) -> std::io::Result<Self> {
             let fd = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
+                .custom_flags(libc::O_DSYNC)
                 .open(device_path)?;
 
-            Ok(Self { fd, ring })
+            let ring = IoUring::new(128)?;
+
+            let api = IOUringAPI::new(fd, ring, 128).await?;
+
+            Ok(Self { api })
         }
 
         /// Reads a block from the device into the given buffer.
@@ -103,13 +99,11 @@ mod linux_impl {
 
     use anyhow::Result;
 
-    impl FileReader for IOUringFile {
+    impl<const BLOCK_SIZE: usize> FileReader for IOUringFile<BLOCK_SIZE> {
         async fn open(path: &Path) -> Result<Self> {
-            // Check if the once cell is already initialized
-            match GLOBAL_RING.get() {
-                Some(ring) => Ok(Self::new(path, ring.clone())?),
-                None => Err(anyhow::anyhow!("Global ring not initialized, initialize")),
-            }
+            // Already opened, just return
+            let file = Self::new(path).await?;
+            Ok(file)
         }
 
         async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
@@ -119,7 +113,7 @@ mod linux_impl {
         }
 
         fn file_length(&self) -> u64 {
-            self.fd.metadata().unwrap().len()
+            self.api.file_length()
         }
     }
 }

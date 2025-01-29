@@ -467,7 +467,9 @@ mod tests {
         let mut opts = WriteAheadOptions::default();
         opts.log_dir = PathBuf::from("./test_logs/test_write_ahead_large_data_uring");
 
-        let mut write_ahead = WriteAhead::<SimpleFile, IOUringFile>::with_options(opts);
+        const BLOCK_SIZE: usize = 4096;
+
+        let mut write_ahead = WriteAhead::<SimpleFile, IOUringFile<BLOCK_SIZE>>::with_options(opts);
         write_ahead.start().await.unwrap();
 
         let mut records = Vec::new();

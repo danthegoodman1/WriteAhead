@@ -32,7 +32,7 @@ impl FileWriter for SimpleFile {
         let mut fd = &self.fd;
         fd.seek(std::io::SeekFrom::Start(offset))?;
         fd.write_all(data)?;
-        fd.sync_all()?;
+        fd.sync_data()?;
 
         Ok(())
     }
