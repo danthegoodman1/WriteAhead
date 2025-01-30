@@ -28,17 +28,17 @@ impl FileWriter for SimpleFile {
     }
 
     #[instrument(skip(self, data), level = "trace")]
-    fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+    async fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
         let mut fd = &self.fd;
         fd.seek(std::io::SeekFrom::Start(offset))?;
         fd.write_all(data)?;
-        fd.sync_all()?;
+        fd.sync_data()?;
 
         Ok(())
     }
 
-    fn file_length(&self) -> u64 {
-        self.fd.metadata().unwrap().len()
+    fn file_length(&self) -> Result<u64, anyhow::Error> {
+        Ok(self.fd.metadata()?.len())
     }
 }
 
@@ -64,8 +64,8 @@ impl FileReader for SimpleFile {
         Ok(buffer)
     }
 
-    fn file_length(&self) -> u64 {
-        self.fd.metadata().unwrap().len()
+    fn file_length(&self) -> Result<u64, anyhow::Error> {
+        Ok(self.fd.metadata()?.len())
     }
 }
 
