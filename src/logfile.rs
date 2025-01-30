@@ -115,7 +115,7 @@ impl<F: FileReader> Logfile<F> {
 
     pub async fn from_file(path: &Path) -> Result<Self> {
         let fd = F::open(path).await?;
-        let file_length = fd.file_length();
+        let file_length = fd.file_length()?;
         let id = file_id_from_path(path)?;
 
         // Read the first 8 bytes of the file
@@ -212,7 +212,7 @@ impl<F: FileReader> Logfile<F> {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    fn file_length(&self) -> u64 {
+    fn file_length(&self) -> Result<u64, anyhow::Error> {
         self.fio.file_length()
     }
 }
@@ -423,9 +423,9 @@ impl<F: FileReader> Stream for LogFileStream<F> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        if this.logfile.sealed && this.offset >= this.logfile.file_length() - 9 {
+        if this.logfile.sealed && this.offset >= this.logfile.file_length()? - 9 {
             return Poll::Ready(None);
-        } else if this.offset >= this.logfile.file_length() {
+        } else if this.offset >= this.logfile.file_length()? {
             return Poll::Ready(None);
         }
 

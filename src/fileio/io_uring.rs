@@ -112,8 +112,14 @@ mod linux_impl {
             Ok(buffer)
         }
 
-        fn file_length(&self) -> u64 {
-            self.api.file_length()
+        fn file_length(&self) -> Result<u64, anyhow::Error> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+
+            // Call the asynchronous connect method using the runtime.
+            let metadata = rt.block_on(self.api.get_metadata())?;
+            Ok(metadata.stx_size)
         }
     }
 }
@@ -124,7 +130,7 @@ pub use linux_impl::*;
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use io_uring::IoUring;
-    use linux_impl::{IOUringFile, GLOBAL_RING};
+    use linux_impl::IOUringFile;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Mutex;
 

@@ -27,7 +27,7 @@ where
 {
     fn open(path: &Path) -> impl Future<Output = Result<Self>> + Send;
     fn read(&self, offset: u64, size: u64) -> impl Future<Output = Result<Vec<u8>>> + Send;
-    fn file_length(&self) -> u64;
+    fn file_length(&self) -> Result<u64>;
 }
 
 pub mod io_uring;

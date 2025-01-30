@@ -217,9 +217,9 @@ dependencies = [
 
 [[package]]
 name = "io_uring_actor"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4517a66926301a6ca62fc8877db35619811abdc459cf8d07d8c22217bbede728"
+checksum = "884813342ba4d185baa5ad213e507a6afda33e8c322649546d3abca29ecf9d7c"
 dependencies = [
  "flume",
  "io-uring",

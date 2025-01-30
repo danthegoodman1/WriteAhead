@@ -64,8 +64,8 @@ impl FileReader for SimpleFile {
         Ok(buffer)
     }
 
-    fn file_length(&self) -> u64 {
-        self.fd.metadata().unwrap().len()
+    fn file_length(&self) -> Result<u64, anyhow::Error> {
+        Ok(self.fd.metadata()?.len())
     }
 }
 
