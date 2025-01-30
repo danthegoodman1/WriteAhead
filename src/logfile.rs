@@ -477,18 +477,23 @@ pub mod tests {
         path: PathBuf,
     ) {
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
+
         let (tx, rx) = flume::unbounded();
+
         writer
             .send(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
             .unwrap();
+        println!("Write command sent");
+
+        // TODO: hanging here
         let response = rx.recv().unwrap().unwrap();
+        println!("Response received");
         let offsets = response.offsets;
 
         let logfile: Logfile<ReadF> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "01");
         assert!(!logfile.sealed);
         assert_eq!(logfile.read_record(&offsets[0]).await.unwrap(), b"hello");
-
         std::fs::remove_file(&path).unwrap();
     }
 
