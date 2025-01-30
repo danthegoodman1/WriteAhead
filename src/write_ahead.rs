@@ -301,7 +301,7 @@ mod tests {
     use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, Layer};
 
     #[cfg(target_os = "linux")]
-    use crate::fileio::io_uring::{IOUringFile, GLOBAL_RING};
+    use crate::fileio::io_uring::IOUringFile;
 
     use crate::fileio::simple_file::SimpleFile;
     use std::sync::Once;
@@ -332,20 +332,6 @@ mod tests {
 
             tracing::subscriber::set_global_default(subscriber).unwrap();
         });
-
-        #[cfg(target_os = "linux")]
-        {
-            URING_ONCE.call_once(|| {
-                if GLOBAL_RING.get().is_none() {
-                    let _ = GLOBAL_RING.set(Arc::new(Mutex::new(
-                        IoUring::builder()
-                            .setup_sqpoll(2) // 2000ms timeout
-                            .build(100)
-                            .unwrap(),
-                    )));
-                }
-            });
-        }
     }
 
     #[tokio::test]
@@ -551,7 +537,9 @@ mod tests {
         let mut opts = WriteAheadOptions::default();
         opts.log_dir = PathBuf::from("./test_logs/test_write_ahead_large_data_uring_batch");
 
-        let mut write_ahead = WriteAhead::<SimpleFile, IOUringFile>::with_options(opts);
+        const BLOCK_SIZE: usize = 4096;
+
+        let mut write_ahead = WriteAhead::<SimpleFile, IOUringFile<BLOCK_SIZE>>::with_options(opts);
         write_ahead.start().await.unwrap();
 
         // Pre-build all the data
