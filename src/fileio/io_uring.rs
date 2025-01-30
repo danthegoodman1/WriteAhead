@@ -74,9 +74,9 @@ mod linux_impl {
 
         fn file_length(&self) -> Result<u64, anyhow::Error> {
             println!("file_length");
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+            // FIXME: blocking here
+            let rt = tokio::runtime::Handle::current();
+            println!("got rt");
 
             // Call the asynchronous connect method using the runtime.
             let metadata = rt.block_on(self.api.get_metadata())?;
@@ -101,10 +101,7 @@ mod tests {
     use crate::{fileio::simple_file::SimpleFile, logfile};
 
     use super::*;
-    use std::{
-        path::{Path, PathBuf},
-        sync::Arc,
-    };
+    use std::path::PathBuf;
 
     const BLOCK_SIZE: usize = 4096;
 
@@ -114,8 +111,11 @@ mod tests {
 
         let path = PathBuf::from("/tmp/01.log");
 
-        logfile::tests::test_write_without_sealing::<SimpleFile, IOUringFile<BLOCK_SIZE>>(path)
-            .await;
+        logfile::tests::test_write_without_sealing::<
+            IOUringFile<BLOCK_SIZE>,
+            IOUringFile<BLOCK_SIZE>,
+        >(path)
+        .await;
     }
 
     #[tokio::test]
