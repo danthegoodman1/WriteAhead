@@ -33,68 +33,6 @@ mod linux_impl {
 
             Ok(Self { api })
         }
-
-        /// Reads a block from the device into the given buffer.
-        #[instrument(skip(self, buffer), level = "trace")]
-        pub async fn read_block(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
-            let fd = io_uring::types::Fd(self.fd.as_raw_fd());
-
-            let read_e = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as _)
-                .offset(offset)
-                .build()
-                .user_data(0x42);
-
-            // Lock the ring for this operation
-            let mut ring = self.ring.lock().await;
-
-            unsafe {
-                ring.submission()
-                    .push(&read_e)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            }
-
-            ring.submit_and_wait(1)?;
-
-            // Process completion
-            while let Some(cqe) = ring.completion().next() {
-                if cqe.result() < 0 {
-                    return Err(std::io::Error::from_raw_os_error(-cqe.result()));
-                }
-            }
-
-            Ok(())
-        }
-
-        /// Writes multiple blocks to the device in a single submission
-        #[instrument(skip(self, data), level = "trace")]
-        pub async fn write_data(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
-            let fd = io_uring::types::Fd(self.fd.as_raw_fd());
-
-            let write_e = opcode::Write::new(fd, data.as_ptr(), data.len() as _)
-                .offset(offset)
-                .build()
-                .user_data(0x43);
-
-            // Lock the ring for this operation
-            let mut ring = self.ring.lock().await;
-
-            unsafe {
-                ring.submission()
-                    .push(&write_e)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            }
-
-            ring.submit_and_wait(1)?;
-
-            // Process completion
-            while let Some(cqe) = ring.completion().next() {
-                if cqe.result() < 0 {
-                    return Err(std::io::Error::from_raw_os_error(-cqe.result()));
-                }
-            }
-
-            Ok(())
-        }
     }
 
     use anyhow::Result;
@@ -107,9 +45,31 @@ mod linux_impl {
         }
 
         async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
-            let mut buffer = vec![0u8; size as usize];
-            self.read_block(offset, &mut buffer).await?;
+            let buffer = self.api.read(offset, size as usize).await?;
             Ok(buffer)
+        }
+
+        fn file_length(&self) -> Result<u64, anyhow::Error> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+
+            // Call the asynchronous connect method using the runtime.
+            let metadata = rt.block_on(self.api.get_metadata())?;
+            Ok(metadata.stx_size)
+        }
+    }
+
+    impl<const BLOCK_SIZE: usize> FileWriter for IOUringFile<BLOCK_SIZE> {
+        async fn open(path: &Path) -> Result<Self> {
+            // Already opened, just return
+            let file = Self::new(path).await?;
+            Ok(file)
+        }
+
+        async fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), anyhow::Error> {
+            self.api.write(offset, data.to_vec()).await?;
+            Ok(())
         }
 
         fn file_length(&self) -> Result<u64, anyhow::Error> {
