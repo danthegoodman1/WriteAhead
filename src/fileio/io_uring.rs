@@ -2,14 +2,22 @@
 mod linux_impl {
     use crate::fileio::{FileReader, FileWriter};
 
-    use io_uring::IoUring;
-    use io_uring_actor::io_uring::IOUringAPI;
+    use io_uring::types::Fd;
+    use io_uring::{opcode, IoUring};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
     use tracing::instrument;
 
     pub struct IOUringFile<const BLOCK_SIZE: usize> {
-        api: IOUringAPI<BLOCK_SIZE>,
+        fd: Fd,
+        ring: IoUring,
+    }
+
+    pub trait AlignedBuffer: Send {
+        fn as_ptr(&self) -> *const u8;
+        fn as_mut_ptr(&mut self) -> *mut u8;
+        fn len(&self) -> usize;
     }
 
     impl<const BLOCK_SIZE: usize> std::fmt::Debug for IOUringFile<BLOCK_SIZE> {
@@ -24,14 +32,12 @@ mod linux_impl {
                 .read(true)
                 .write(true)
                 .create(true)
-                .custom_flags(libc::O_DSYNC)
                 .open(device_path)?;
 
             let ring = IoUring::new(128)?;
+            let uring_fd = io_uring::types::Fd(fd.as_raw_fd());
 
-            let api = IOUringAPI::new(fd, ring, 128).await?;
-
-            Ok(Self { api })
+            Ok(Self { fd: uring_fd, ring })
         }
     }
 
@@ -45,7 +51,19 @@ mod linux_impl {
         }
 
         async fn read(&self, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
-            let buffer = self.api.read(offset, size as usize).await?;
+            let mut buffer = vec![0; size as usize];
+            let read_e = opcode::Read::new(self.fd, buffer.as_mut_ptr(), BLOCK_SIZE as _)
+                .offset(offset)
+                .build()
+                .user_data(0x42);
+
+            unsafe {
+                self.ring
+                    .submission()
+                    .push(&read_e)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
+
             Ok(buffer)
         }
 
