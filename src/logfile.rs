@@ -115,7 +115,7 @@ impl<F: FileReader> Logfile<F> {
 
     pub async fn from_file(path: &Path) -> Result<Self> {
         let fd = F::open(path).await?;
-        let file_length = fd.file_length();
+        let file_length = fd.file_length()?;
         let id = file_id_from_path(path)?;
 
         // Read the first 8 bytes of the file
@@ -212,7 +212,7 @@ impl<F: FileReader> Logfile<F> {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    fn file_length(&self) -> u64 {
+    fn file_length(&self) -> Result<u64, anyhow::Error> {
         self.fio.file_length()
     }
 }
@@ -254,9 +254,9 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
         let mut header = [0u8; 8];
         header[0..8].copy_from_slice(&MAGIC_NUMBER);
 
-        fio.write(0, &header).unwrap();
+        fio.write(0, &header).await?;
 
-        let file_length = fio.file_length();
+        let file_length = fio.file_length()?;
         let id = file_id_from_path(path)?;
         Ok(Self {
             id,
@@ -271,11 +271,11 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
     pub async fn launch(path: &Path) -> Result<flume::Sender<WriterCommand>> {
         let (tx, rx) = flume::unbounded();
         let logfile = Self::new(path, rx).await?;
-        thread::spawn(move || logfile.actor_loop());
+        tokio::spawn(async move { logfile.actor_loop().await });
         Ok(tx)
     }
 
-    fn actor_loop(mut self) {
+    async fn actor_loop(mut self) {
         loop {
             let msg = match self.recv.recv() {
                 Ok(msg) => msg,
@@ -287,7 +287,7 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
             match msg {
                 WriterCommand::Write(return_chan, data) => {
                     trace!("Writing {} records to logfile {}", data.len(), self.id);
-                    let offsets = match self.write_records(data) {
+                    let offsets = match self.write_records(data).await {
                         Ok(offsets) => offsets,
                         Err(e) => {
                             return_chan.send(Err(e)).unwrap();
@@ -303,13 +303,13 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
                 }
                 WriterCommand::Seal(return_chan) => {
                     trace!("Sealing logfile {}", self.id);
-                    return_chan.send(self.seal()).unwrap();
+                    return_chan.send(self.seal().await).unwrap();
                 }
             }
         }
     }
 
-    fn write_records(&mut self, records: Vec<Vec<u8>>) -> Result<Vec<u64>> {
+    async fn write_records(&mut self, records: Vec<Vec<u8>>) -> Result<Vec<u64>> {
         if self.sealed {
             return Err(anyhow!(LogfileError::WriteToSealed));
         }
@@ -366,13 +366,14 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
         // Write all records in one operation
         self.fio
             .write(self.file_length, &combined_buffer)
+            .await
             .context("Failed to write records")?;
 
         self.file_length = current_offset;
         Ok(offsets)
     }
 
-    pub fn seal(&mut self) -> Result<()> {
+    pub async fn seal(&mut self) -> Result<()> {
         if self.sealed {
             return Err(anyhow!(LogfileError::WriteToSealed));
         }
@@ -385,6 +386,7 @@ impl<F: FileWriter + 'static> LogFileWriter<F> {
 
         self.fio
             .write(self.file_length, &footer)
+            .await
             .context("Failed to write footer")?;
 
         self.file_length += 9;
@@ -423,9 +425,9 @@ impl<F: FileReader> Stream for LogFileStream<F> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        if this.logfile.sealed && this.offset >= this.logfile.file_length() - 9 {
+        if this.logfile.sealed && this.offset >= this.logfile.file_length()? - 9 {
             return Poll::Ready(None);
-        } else if this.offset >= this.logfile.file_length() {
+        } else if this.offset >= this.logfile.file_length()? {
             return Poll::Ready(None);
         }
 
@@ -475,18 +477,23 @@ pub mod tests {
         path: PathBuf,
     ) {
         let writer = LogFileWriter::<WriteF>::launch(&path).await.unwrap();
+
         let (tx, rx) = flume::unbounded();
+
         writer
             .send(WriterCommand::Write(tx, vec![b"hello".to_vec()]))
             .unwrap();
+        println!("Write command sent");
+
+        // TODO: hanging here
         let response = rx.recv().unwrap().unwrap();
+        println!("Response received");
         let offsets = response.offsets;
 
         let logfile: Logfile<ReadF> = Logfile::from_file(&path).await.unwrap();
         assert_eq!(logfile.id, "01");
         assert!(!logfile.sealed);
         assert_eq!(logfile.read_record(&offsets[0]).await.unwrap(), b"hello");
-
         std::fs::remove_file(&path).unwrap();
     }
 
