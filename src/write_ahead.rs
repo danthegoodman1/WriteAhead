@@ -221,6 +221,13 @@ impl<F: FileIo + 'static> WriteAhead<F> {
         self.writer()?.write_batch(data).await
     }
 
+    /// Deletes every sealed log file with id strictly below `file_id` (see
+    /// [WriteHandle::trim_before]). Convenience for
+    /// `self.writer()?.trim_before(file_id)`.
+    pub async fn trim_before(&self, file_id: u64) -> Result<crate::writer::TrimStats> {
+        self.writer()?.trim_before(file_id).await
+    }
+
     /// Applies pending writer lifecycle events to the reader cache.
     fn drain_events(&self) {
         let Some(events) = &self.writer_events else {
@@ -284,6 +291,8 @@ impl<F: FileIo + 'static> WriteAhead<F> {
     }
 
     /// Creates a stream over all records in all log files, oldest first.
+    /// Yields each record with its [RecordID], so consumers can checkpoint
+    /// their position and resume via [Self::create_stream_from].
     pub fn create_stream(&self) -> Result<WriteAheadStream<F>> {
         self.drain_events();
         let first = *self
@@ -335,7 +344,7 @@ pub struct WriteAheadStream<F: FileIo> {
 }
 
 impl<F: FileIo> Stream for WriteAheadStream<F> {
-    type Item = Result<Vec<u8>>;
+    type Item = Result<(RecordID, Vec<u8>)>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         loop {
@@ -438,8 +447,9 @@ mod tests {
 
         let mut stream = wal.create_stream().unwrap();
         for i in 0..100 {
-            let record = stream.next().await.unwrap().unwrap();
+            let (id, record) = stream.next().await.unwrap().unwrap();
             assert_eq!(record, format!("Hello, world! {}", i).into_bytes());
+            assert_eq!(wal.read(id.file_id, id.file_offset).unwrap(), record);
         }
         assert!(stream.next().await.is_none());
     }
@@ -459,8 +469,8 @@ mod tests {
             .unwrap();
 
         let mut stream = wal.create_stream().unwrap();
-        assert_eq!(stream.next().await.unwrap().unwrap(), rec1);
-        assert_eq!(stream.next().await.unwrap().unwrap(), rec2);
+        assert_eq!(stream.next().await.unwrap().unwrap().1, rec1);
+        assert_eq!(stream.next().await.unwrap().unwrap().1, rec2);
         assert!(stream.next().await.is_none());
     }
 
@@ -478,8 +488,9 @@ mod tests {
         let mut stream = wal
             .create_stream_from(ids[1].file_id, ids[1].file_offset)
             .unwrap();
-        assert_eq!(stream.next().await.unwrap().unwrap(), b"two");
-        assert_eq!(stream.next().await.unwrap().unwrap(), b"three");
+        let (id, record) = stream.next().await.unwrap().unwrap();
+        assert_eq!((id, record.as_slice()), (ids[1], b"two".as_slice()));
+        assert_eq!(stream.next().await.unwrap().unwrap().1, b"three");
         assert!(stream.next().await.is_none());
     }
 

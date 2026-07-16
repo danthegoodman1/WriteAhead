@@ -206,3 +206,32 @@ Status ledger:
 | Complete | Doc | 7G: README integration section (Arc<WriteAhead> + WriteHandle) | README.md Usage + Design + Integration sections rewritten; upstream-batching guidance removed. |
 | Complete | Work | 7H: Fix stream vs async-seal race found by proptest | `Logfile::refresh_seal` single-length-snapshot probe (src/logfile.rs); a stream tailing a file that rotation seals mid-replay now ends cleanly instead of parsing the footer as a torn record. Repro'd via tests/roundtrip_prop.rs; 30 consecutive runs clean after fix. |
 | Complete | Gate | Public-API coalescing ≫ serial rate; suite + crash matrix + clippy green | Bench table above; 5× full suite (35 tests) + 30× race-prone tests clean; `cargo clippy --all-targets -- -D warnings` zero errors. |
+
+## Phase 8: Consumer-driven trimming & compaction patterns
+
+Goal:
+Make log truncation expressible by the party that actually knows when data is consumed. Rationale: size/ttl retention is calendar/space policy, but the two real-world shapes — "my replay high-water mark passed this file" and "I rewrote the live records, drop the rest" — need (a) streams that tell consumers *where* each record lives and (b) an explicit trim primitive. Neither existed.
+
+Scope:
+- Stream items become `(RecordID, Vec<u8>)`: `LogFileStream`/`WriteAheadStream` yield each record with its address so consumers can checkpoint and resume (`create_stream_from`).
+- `trim_before(file_id)` on `WriteHandle` (+ `WriteAhead` convenience): deletes sealed files strictly below `file_id` via the writer actor (shared delete path with retention: registry removal, Deleted events, dir fsync, per-file failures retryable), returns `TrimStats { files_deleted, bytes_reclaimed }`. Active file untouchable; trims drained in a group-commit round run after the commit.
+- Runnable pattern examples: `examples/trim_hwm.rs` (high-water mark → trim, checkpoint/resume) and `examples/compaction.rs` (index over live records, rewrite-forward, trim below cutoff).
+- README "Patterns" section documenting both, with trim-after-durable-checkpoint and streams-keep-their-handles caveats.
+
+Out of scope:
+- Partial-file trimming (record-level truncation within a file) — file granularity is the design.
+- Automatic compaction scheduling — policy belongs to the embedding system.
+
+Completion gate:
+Trim tests green (sealed-only deletion, active-file immunity, restart survival, reader-cache eviction via cloned handles); prop suite extended to assert stream-yielded ids equal write-acked ids; both examples run with non-trivial output; clippy + full suite green.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 8A: Streams yield `(RecordID, bytes)` | src/logfile.rs `LogFileStream` Item change; src/write_ahead.rs `WriteAheadStream`; tests/roundtrip_prop.rs now asserts stream ids == write-acked ids (32 cases). |
+| Complete | Work | 8B: `trim_before` via writer actor + `TrimStats` | src/writer.rs `WriterCommand::Trim`, `WalWriter::trim_before`, shared `delete_files` with retention; exported `TrimStats`; `WriteHandle::trim_before` + `WriteAhead::trim_before`. |
+| Complete | Test | 8C: Trim semantics suite | tests/trim.rs: 5 tests — watermark deletion, active-file immunity, no-op below oldest, restart survival, reader-cache eviction through a cloned handle. |
+| Complete | Work | 8D: Pattern examples | examples/trim_hwm.rs (5000 records, 8 files trimmed in-flight, resume finds 5 late records); examples/compaction.rs (cold-keys-pin-old-files workload: 90 live records rewritten, 2 files trimmed, all 100 keys intact). |
+| Complete | Doc | 8E: README Patterns section | README.md "Patterns": HWM trimming + explicit compaction, durability-of-checkpoint caveat, stream/trim interaction. |
+| Complete | Gate | Suite + clippy green; examples verified | 40 tests + proptest green; `cargo clippy --all-targets -- -D warnings` clean; both examples run with the outputs quoted in 8D (2026-07-16, local). |

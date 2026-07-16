@@ -8,6 +8,7 @@ use tracing::{trace, warn};
 
 use crate::fileio::FileIo;
 use crate::murmur3::murmur3_128;
+use crate::record::RecordID;
 
 /// Logfile represents a log file on disk.
 ///
@@ -477,7 +478,7 @@ impl<F: FileIo> LogFileStream<F> {
         Ok(())
     }
 
-    fn next_record(&mut self) -> Result<Option<Vec<u8>>> {
+    fn next_record(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
         let records_end = self.records_end()?;
         if self.offset >= records_end {
             return Ok(None);
@@ -511,17 +512,23 @@ impl<F: FileIo> LogFileStream<F> {
             return Err(anyhow!(LogfileError::Corrupted));
         }
 
+        let record_offset = self.offset;
         self.offset = data_end;
-        Ok(Some(data))
+        Ok(Some((record_offset, data)))
     }
 }
 
 impl<F: FileIo> Stream for LogFileStream<F> {
-    type Item = Result<Vec<u8>>;
+    /// Each record with its stable address, so consumers can checkpoint
+    /// their replay position (see the high-water-mark pattern in the README).
+    type Item = Result<(RecordID, Vec<u8>)>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        match self.get_mut().next_record() {
-            Ok(Some(record)) => Poll::Ready(Some(Ok(record))),
+        let this = self.get_mut();
+        match this.next_record() {
+            Ok(Some((offset, record))) => {
+                Poll::Ready(Some(Ok((RecordID::new(this.logfile.id, offset), record))))
+            }
             Ok(None) => Poll::Ready(None),
             Err(e) => Poll::Ready(Some(Err(e))),
         }
@@ -684,12 +691,13 @@ mod tests {
         let records: Vec<Vec<u8>> = (0..10)
             .map(|i| format!("record_{}", i).into_bytes())
             .collect();
-        write_raw(&path, &records);
+        let offsets = write_raw(&path, &records);
 
         let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
         let mut stream = LogFileStream::new(logfile);
-        for i in 0..10 {
-            let record = stream.next().await.unwrap().unwrap();
+        for (i, offset) in offsets.iter().enumerate() {
+            let (id, record) = stream.next().await.unwrap().unwrap();
+            assert_eq!(id, RecordID::new(10, *offset));
             assert_eq!(String::from_utf8(record).unwrap(), format!("record_{}", i));
         }
         assert!(stream.next().await.is_none());

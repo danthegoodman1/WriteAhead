@@ -10,7 +10,7 @@ A great component for a (distributed) data store. For distributed usage, conside
 2. **Corruption detection** — every record carries a 128-bit murmur3 hash of its data; any bit-flip in a record (including its length header, caught via bounds check + hash mismatch) is detected on read.
 3. **Crash recovery** — `start()` restores a consistent WAL after a crash at any point: every file is validated, torn tails are truncated, files that missed their seal mid-rotation are healed and sealed, and sealed files are never appended to. Every acknowledged record survives.
 4. **Stable addressing** — `RecordID { file_id, file_offset }` stays valid for the life of the file (until retention deletes it).
-5. **Sequential streaming** — a stream replays all records across files in write order.
+5. **Sequential streaming** — a stream replays all records across files in write order, yielding each record with its `RecordID` so consumers can checkpoint their position.
 
 ## Quickstart
 
@@ -54,17 +54,60 @@ async fn main() -> anyhow::Result<()> {
     let record = wal.read(id.file_id, id.file_offset)?;
     assert_eq!(record, b"hello");
 
-    // Full replay, oldest record first
+    // Full replay, oldest first; each record comes with its address so
+    // consumers can checkpoint how far they've gotten
     let mut stream = wal.create_stream()?;
-    while let Some(record) = stream.next().await {
-        println!("replayed {} bytes", record?.len());
+    while let Some(entry) = stream.next().await {
+        let (id, record) = entry?;
+        println!("replayed {} bytes from {:?}", record.len(), id);
     }
 
     Ok(())
 }
 ```
 
-Retention is opt-in via `RetentionOptions`: `max_total_size` deletes the oldest sealed files once total disk usage exceeds the bound, and `ttl` deletes sealed files whose seal timestamp is older than the window. The active file is never deleted; reads into deleted files return `LogfileNotFound`.
+Retention is opt-in via `RetentionOptions`: `max_total_size` deletes the oldest sealed files once total disk usage exceeds the bound, and `ttl` deletes sealed files whose seal timestamp is older than the window. The active file is never deleted; reads into deleted files return `LogfileNotFound`. For consumer-driven cleanup, use `trim_before` instead — see the patterns below.
+
+## Patterns
+
+The WAL never decides on its own that a record is *done* — that knowledge lives with whatever consumes the log. `trim_before(file_id)` is the primitive that lets the consumer feed that knowledge back: it deletes every sealed file strictly below `file_id` (the active file is never touched) and returns how many files and bytes were reclaimed. Two common shapes, both runnable from `examples/`:
+
+### Trim by consumer high-water mark
+
+`cargo run --example trim_hwm` ([examples/trim_hwm.rs](examples/trim_hwm.rs))
+
+A replaying consumer tracks the `RecordID` of the last record it has applied — its high-water mark. Records are yielded in order, so the moment the mark crosses into file `N`, every file below `N` is fully consumed and can be dropped:
+
+```rust
+let mut hwm: Option<RecordID> = None;
+let mut stream = wal.create_stream()?;
+while let Some(entry) = stream.next().await {
+    let (id, record) = entry?;
+    apply(&record); // your state machine / downstream sink
+
+    if let Some(prev) = hwm {
+        if id.file_id > prev.file_id {
+            // Everything below the file we just entered is consumed
+            handle.trim_before(id.file_id).await?;
+        }
+    }
+    hwm = Some(id);
+}
+```
+
+Checkpoint the mark durably (wherever your consumer state lives), and a restart resumes with `create_stream_from(hwm.file_id, hwm.file_offset)` instead of replaying from the beginning. Trim only *after* the checkpoint is durable — the trim is what makes the pre-mark log unrecoverable. Streams created before a trim are undisturbed (they hold their own open file handles); new reads into trimmed files return `LogfileNotFound`.
+
+### Explicit compaction
+
+`cargo run --example compaction` ([examples/compaction.rs](examples/compaction.rs))
+
+The db-traditional shape, for when the log is the backing store of keyed state (an index maps each key to the `RecordID` of its latest value). Old files can't be trimmed by a high-water mark because a handful of cold, still-live records pin them while dead versions pile up around. Compaction rewrites the live records forward, then drops everything behind:
+
+1. Pick a cutoff file id (e.g. the newest file the index points into).
+2. Read every live record below the cutoff and `write_batch` the copies — they land in the active file, and the index is repointed at the new `RecordID`s.
+3. `trim_before(cutoff)` — nothing below it is referenced anymore.
+
+The rewrite goes through the normal durable write path, so a crash at any point is safe: before the trim, both copies exist and the index (rebuilt by replay or checkpointed) still resolves; the trim only happens after the new copies are acknowledged.
 
 ## Design
 

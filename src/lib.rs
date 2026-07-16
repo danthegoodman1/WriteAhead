@@ -9,4 +9,4 @@ pub use fileio::simple_file::SimpleFile;
 pub use fileio::FileIo;
 pub use record::RecordID;
 pub use write_ahead::{RetentionOptions, WriteAhead, WriteAheadOptions, WriteAheadStream};
-pub use writer::WriteHandle;
+pub use writer::{TrimStats, WriteHandle};

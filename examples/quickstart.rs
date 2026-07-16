@@ -27,10 +27,12 @@ async fn main() -> anyhow::Result<()> {
     let record = wal.read(id.file_id, id.file_offset)?;
     assert_eq!(record, b"hello");
 
-    // Full replay, oldest record first
+    // Full replay, oldest first; each record comes with its address so
+    // consumers can checkpoint how far they've gotten
     let mut stream = wal.create_stream()?;
-    while let Some(record) = stream.next().await {
-        println!("replayed {} bytes", record?.len());
+    while let Some(entry) = stream.next().await {
+        let (id, record) = entry?;
+        println!("replayed {} bytes from {:?}", record.len(), id);
     }
 
     Ok(())
