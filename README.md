@@ -12,29 +12,55 @@ A great component for a (distributed) data store. For distributed usage, conside
 4. **Stable addressing** — `RecordID { file_id, file_offset }` stays valid for the life of the file (until retention deletes it).
 5. **Sequential streaming** — a stream replays all records across files in write order.
 
-## Usage
+## Quickstart
+
+Not yet on crates.io — add it as a git dependency:
+
+```toml
+[dependencies]
+writeahead = { git = "https://github.com/danthegoodman1/WriteAhead" }
+anyhow = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "macros"] }
+```
+
+The full program below lives at [`examples/quickstart.rs`](examples/quickstart.rs) and runs with `cargo run --example quickstart`:
 
 ```rust
-use writeahead::{WriteAhead, WriteAheadOptions, SimpleFile};
-
-let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
-    log_dir: "./write_ahead".into(),
-    ..Default::default()
-});
-wal.start()?; // recovers existing state, must crash on error
-
-// Durable batch write (one pwrite + one fdatasync per batch)
-let ids = wal.write_batch(vec![b"hello".to_vec()]).await?;
-
-// Point read by address
-let record = wal.read(ids[0].file_id, ids[0].file_offset)?;
-
-// Full replay
 use futures::StreamExt;
-let mut stream = wal.create_stream()?;
-while let Some(record) = stream.next().await {
-    let record = record?;
-    // ...
+use std::sync::Arc;
+use writeahead::{SimpleFile, WriteAhead, WriteAheadOptions};
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> anyhow::Result<()> {
+    let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
+        log_dir: "./write_ahead".into(),
+        ..Default::default()
+    });
+    wal.start()?; // recovers existing state; if this errors, crash
+    let wal = Arc::new(wal); // WriteAhead is Sync: share it directly
+
+    // Durable writes from any task or thread: clone a WriteHandle per
+    // producer. Writes that arrive while an fsync is in flight coalesce
+    // into one group commit automatically.
+    let handle = wal.writer()?;
+    let id = handle.write(b"hello".to_vec()).await?;
+    let more = handle
+        .write_batch(vec![b"a".to_vec(), b"b".to_vec()])
+        .await?;
+    println!("wrote {:?} and {:?}", id, more);
+
+    // Point read by address
+    let record = wal.read(id.file_id, id.file_offset)?;
+    assert_eq!(record, b"hello");
+
+    // Full replay, oldest record first
+    let mut stream = wal.create_stream()?;
+    while let Some(record) = stream.next().await {
+        println!("replayed {} bytes", record?.len());
+    }
+
+    Ok(())
 }
 ```
 
@@ -44,7 +70,7 @@ Retention is opt-in via `RetentionOptions`: `max_total_size` deletes the oldest 
 
 ### Single writer, page-cache readers
 
-One dedicated writer thread owns the active file; callers talk to it over a channel, and `write_batch` awaits the response without blocking the async executor. Writes queued while an fsync is in flight are **group-committed**: the actor drains them into a single pwrite + fdatasync and fans replies back out, so concurrent producers coalesce automatically (see `actor_concurrent_8w` in the benchmarks).
+One dedicated writer thread owns the active file and the directory lifecycle: writes, rotation, and retention all happen there, so nothing ever contends on the write path. Any number of tasks submit through cloned `WriteHandle`s and await their acks without blocking the async executor. Writes queued while an fsync is in flight are **group-committed**: the writer drains them into a single pwrite + fdatasync and fans replies back out, so concurrent producers coalesce automatically (see `handle_concurrent_8w` in the benchmarks). Each ack names the file the records landed in, so handles stay valid across rotations.
 
 Readers use positional reads (`pread`) straight from the page cache — for WAL access patterns readers mostly want recently written data, which the page cache serves far better than direct-IO schemes like io_uring + O_DIRECT. Point reads speculatively fetch one small block so most records cost a single syscall; streams parse records out of 128 KiB readahead chunks.
 
@@ -59,7 +85,7 @@ footer: | 8B magic | 8B seal timestamp (unix ms) | 8B records-end offset | 16B m
 
 Data is stored raw — no escaping. A file is sealed iff its trailing 40 bytes parse as a footer whose own hash verifies and whose records-end field equals the footer's position, so record payloads (which may contain the magic bytes) cannot be mistaken for a seal.
 
-The log directory is a sequence of `0000000000.log`, `0000000001.log`, … files. The highest id is the active file; rotation seals the current file (footer carries the seal timestamp used by ttl retention) and starts the next one. Directory entries are fsync'd on file creation.
+The log directory is a sequence of `0000000000.log`, `0000000001.log`, … files. The highest id is the active file; rotation creates the next file first, then seals the previous one (the footer carries the seal timestamp used by ttl retention), so a crash mid-rotation always lands in a state recovery heals. Directory entries are fsync'd on file creation.
 
 ### Recovery
 
@@ -82,12 +108,14 @@ Snapshot from a desktop NVMe/ext4 box, 64-byte payloads:
 | `batch_write` | 1,000-record batches through `write_batch`: one pwrite + one fdatasync per batch | ~225k records/s |
 | `read_by_id` | point reads of individual records by `RecordID`, served from the page cache | ~2.1M/s |
 | `stream_replay` | full sequential replay of the log through `create_stream()` | ~34M/s (~2.1GB/s) |
-| `actor_concurrent_8w` | 8 threads each submitting single-record writes to one writer actor and awaiting their acks; queued writes share fsyncs via group commit | ~950/s |
+| `handle_concurrent_8w` | 8 threads each writing through cloned public `WriteHandle`s and awaiting their acks; queued writes share fsyncs via group commit | ~940/s |
 
-Durable-write rates are dominated by fdatasync latency, so they scale with batch/group size, not payload size — compare `seq_write_1rec` (1 record per sync) against `batch_write` (1,000 per sync) and `actor_concurrent_8w` (however many are queued per sync).
+Durable-write rates are dominated by fdatasync latency, so they scale with batch/group size, not payload size — compare `seq_write_1rec` (1 record per sync) against `batch_write` (1,000 per sync) and `handle_concurrent_8w` (however many are queued per sync).
 
 ## Integrating with a thread-safe API framework (Axum, tonic, etc.)
 
-`WriteAhead` has a single-owner API to keep the write path contention-free. Spawn a task/thread that owns it and communicate over a channel; you can micro-batch incoming writes (e.g. at most 500µs) into `write_batch` calls for extra throughput — and writes that arrive while an fsync is in flight already coalesce via group commit.
+Put the started `WriteAhead` in an `Arc` and share it — it's `Sync`. Clone a `WriteHandle` into each request handler (or once into your app state) and call `handle.write(...)` directly; there is no owner task to build and no upstream batching needed, because writes that arrive while a commit is in flight coalesce into the next group commit automatically.
 
 `WriteAheadStream` is `Send` and owns its file handles, so you can create a stream and hand it to a response body directly (see `test_write_ahead_stream_is_send`). Use a bounded channel if you bridge it manually so you don't bloat memory.
+
+Note: streams snapshot the set of log files at creation time and replay records acknowledged before that point; readers tailing the unsealed active file are best-effort and may surface transient errors if they race an in-flight write.

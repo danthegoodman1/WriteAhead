@@ -2,8 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use futures::Stream;
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     pin::Pin,
+    sync::{Arc, RwLock},
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -12,27 +13,31 @@ use tracing::{debug, warn};
 use crate::{
     fileio::{simple_file::SimpleFile, FileIo},
     logfile::{
-        file_id_from_path, now_ms, recover_and_seal, recover_unsealed, LogFileStream,
-        LogFileWriter, Logfile, WriterCommand, FILE_HEADER_SIZE,
+        file_id_from_path, log_file_path, now_ms, recover_and_seal, recover_unsealed,
+        LogFileStream, Logfile, FILE_HEADER_SIZE,
     },
     record::RecordID,
+    writer::{WalWriter, WriteHandle, WriterEvent},
 };
 
-/// Manager that owns log file rotation, recovery, and retention.
+/// The WAL manager: recovers on-disk state at startup, hands out
+/// [WriteHandle]s for writing, and serves reads and streams.
 ///
-/// A single owner drives all writes (one writer thread per active file, so
-/// disk writes never contend); `write_batch` is async only so it can await
-/// the writer's fsync without blocking the executor. Reads go straight to
-/// the page cache via positional reads and are synchronous.
+/// `WriteAhead` is `Sync` — wrap it in an `Arc` and share it across tasks
+/// and threads directly. Writes go through a dedicated writer thread that
+/// owns the active file, group-committing everything queued behind one
+/// fdatasync; rotation and retention happen on that thread too. Reads are
+/// synchronous positional reads served by the page cache.
 #[derive(Debug)]
 pub struct WriteAhead<F: FileIo = SimpleFile> {
     options: WriteAheadOptions,
-    log_files: BTreeMap<u64, Logfile<F>>,
-    active_writer: Option<flume::Sender<WriterCommand>>,
-    active_log_id: u64,
+    /// Reader cache, kept in sync with the writer via events and lazy opens.
+    readers: RwLock<BTreeMap<u64, Arc<Logfile<F>>>>,
+    writer_tx: Option<flume::Sender<crate::writer::WriterCommand>>,
+    writer_events: Option<flume::Receiver<WriterEvent>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WriteAheadOptions {
     pub log_dir: PathBuf,
     /// Rotate the active log file after its length exceeds this.
@@ -50,7 +55,7 @@ impl Default for WriteAheadOptions {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct RetentionOptions {
     /// The maximum total size of all log files. The oldest sealed files are
     /// deleted first; the active file is never deleted. Set to `0` to disable.
@@ -75,31 +80,14 @@ pub enum WriteAheadError {
     DuplicateLogfileId(u64),
 }
 
-fn padded_u64_string(id: u64) -> String {
-    format!("{:010}", id)
-}
-
-fn sync_dir(dir: &Path) -> Result<()> {
-    std::fs::File::open(dir)
-        .and_then(|f| f.sync_all())
-        .with_context(|| format!("Failed to fsync directory {}", dir.display()))?;
-    Ok(())
-}
-
 impl<F: FileIo + 'static> WriteAhead<F> {
     pub fn with_options(options: WriteAheadOptions) -> Self {
         Self {
             options,
-            log_files: BTreeMap::new(),
-            active_writer: None,
-            active_log_id: 0,
+            readers: RwLock::new(BTreeMap::new()),
+            writer_tx: None,
+            writer_events: None,
         }
-    }
-
-    fn path_for(&self, id: u64) -> PathBuf {
-        self.options
-            .log_dir
-            .join(format!("{}.log", padded_u64_string(id)))
     }
 
     /// Starts the write ahead log manager, recovering existing state:
@@ -110,6 +98,7 @@ impl<F: FileIo + 'static> WriteAhead<F> {
     /// - The active (highest-id) file gets its torn tail truncated; if it
     ///   was already sealed, a new active file is created instead.
     /// - Files that don't look like log files (`<digits>.log`) are skipped.
+    /// - Startup retention is applied before this returns.
     pub fn start(&mut self) -> Result<()> {
         std::fs::create_dir_all(&self.options.log_dir).context("Failed to create log directory")?;
 
@@ -132,26 +121,36 @@ impl<F: FileIo + 'static> WriteAhead<F> {
             }
         }
 
-        match found.last().cloned() {
+        // Recover every file and build the writer's file registry
+        let mut registry: BTreeMap<u64, crate::writer::FileMeta> = BTreeMap::new();
+        let (active_id, active_path) = match found.last().cloned() {
             None => {
                 debug!("creating initial log file");
-                self.create_active(0)?;
+                (0, log_file_path(&self.options.log_dir, 0))
             }
             Some((last_id, last_path)) => {
                 for (id, path) in found.iter().filter(|(id, _)| *id != last_id) {
                     debug!("loading existing logfile {}", id);
-                    let logfile = Logfile::open(path)?;
-                    let logfile = if logfile.sealed {
-                        logfile
+                    let logfile: Logfile<F> = Logfile::open(path)?;
+                    let seal_ts = if logfile.sealed {
+                        logfile.seal_timestamp_ms
                     } else {
-                        // Crash happened between sealing and creating the next
-                        // file, or the seal itself was torn: heal it now.
+                        // Crash between sealing and creating the next file,
+                        // or the seal itself was torn: heal it now.
                         warn!("healing unsealed non-active logfile {}", id);
                         drop(logfile);
-                        recover_and_seal::<F>(path, now_ms())?;
-                        Logfile::open(path)?
+                        let ts = now_ms();
+                        recover_and_seal::<F>(path, ts)?;
+                        Some(ts)
                     };
-                    self.log_files.insert(*id, logfile);
+                    registry.insert(
+                        *id,
+                        crate::writer::FileMeta {
+                            path: path.clone(),
+                            size: std::fs::metadata(path)?.len(),
+                            seal_timestamp_ms: seal_ts,
+                        },
+                    );
                 }
 
                 let last_len = std::fs::metadata(&last_path)
@@ -161,161 +160,136 @@ impl<F: FileIo + 'static> WriteAhead<F> {
                     // Crash between file creation and header write
                     debug!("recovering empty/partial active logfile {}", last_id);
                     recover_unsealed::<F>(&last_path)?;
-                    self.create_active_at(last_id, &last_path)?;
+                    (last_id, last_path)
                 } else {
-                    let logfile = Logfile::open(&last_path)?;
+                    let logfile: Logfile<F> = Logfile::open(&last_path)?;
                     if logfile.sealed {
-                        // Crash after seal but before the next file was created
+                        // Crash after seal but before the next file existed
                         debug!("last logfile {} is sealed, rotating", last_id);
-                        self.log_files.insert(last_id, logfile);
-                        self.create_active(last_id + 1)?;
+                        registry.insert(
+                            last_id,
+                            crate::writer::FileMeta {
+                                path: last_path.clone(),
+                                size: last_len,
+                                seal_timestamp_ms: logfile.seal_timestamp_ms,
+                            },
+                        );
+                        (
+                            last_id + 1,
+                            log_file_path(&self.options.log_dir, last_id + 1),
+                        )
                     } else {
                         drop(logfile);
                         recover_unsealed::<F>(&last_path)?;
-                        self.create_active_at(last_id, &last_path)?;
+                        (last_id, last_path)
                     }
                 }
             }
+        };
+
+        // Launch the writer: creates/initializes the active file and applies
+        // startup retention synchronously before returning.
+        let (tx, events) =
+            WalWriter::<F>::launch(self.options.clone(), active_id, active_path, registry)?;
+        self.writer_tx = Some(tx);
+        self.writer_events = Some(events);
+
+        // Populate the reader cache from what survived recovery + retention
+        let mut cache = BTreeMap::new();
+        for entry in std::fs::read_dir(&self.options.log_dir)? {
+            let path = entry?.path();
+            if file_id_from_path(&path).is_some() {
+                let logfile: Logfile<F> = Logfile::open(&path)?;
+                cache.insert(logfile.id, Arc::new(logfile));
+            }
         }
+        *self.readers.write().expect("reader cache poisoned") = cache;
 
-        self.apply_retention()?;
         Ok(())
     }
 
-    fn create_active(&mut self, id: u64) -> Result<()> {
-        let path = self.path_for(id);
-        self.create_active_at(id, &path)
+    /// A cloneable handle for writing from any task or thread.
+    pub fn writer(&self) -> Result<WriteHandle> {
+        Ok(WriteHandle {
+            tx: self.writer_tx.clone().ok_or(WriteAheadError::NotStarted)?,
+        })
     }
 
-    fn create_active_at(&mut self, id: u64, path: &Path) -> Result<()> {
-        let writer = LogFileWriter::<F>::launch(path)?;
-        // Make sure a newly created file's directory entry survives a crash
-        sync_dir(&self.options.log_dir)?;
-        let reader = Logfile::open(path)?;
-        self.log_files.insert(id, reader);
-        self.active_writer = Some(writer);
-        self.active_log_id = id;
-        Ok(())
+    /// Writes a batch of records durably (fsync'd before returning) and
+    /// returns their addresses. Convenience for `self.writer()?.write_batch()`.
+    pub async fn write_batch(&self, data: Vec<Vec<u8>>) -> Result<Vec<RecordID>> {
+        self.writer()?.write_batch(data).await
+    }
+
+    /// Applies pending writer lifecycle events to the reader cache.
+    fn drain_events(&self) {
+        let Some(events) = &self.writer_events else {
+            return;
+        };
+        if events.is_empty() {
+            return;
+        }
+        let mut cache = self.readers.write().expect("reader cache poisoned");
+        while let Ok(event) = events.try_recv() {
+            match event {
+                WriterEvent::Created(id, path) => match Logfile::open(&path) {
+                    Ok(logfile) => {
+                        cache.insert(id, Arc::new(logfile));
+                    }
+                    Err(e) => warn!("failed to open new logfile {}: {e:#}", id),
+                },
+                WriterEvent::Sealed(id) => {
+                    // Reopen so the reader caches the sealed record region
+                    if let Some(existing) = cache.get(&id) {
+                        match Logfile::open(existing.path()) {
+                            Ok(logfile) => {
+                                cache.insert(id, Arc::new(logfile));
+                            }
+                            Err(e) => warn!("failed to reopen sealed logfile {}: {e:#}", id),
+                        }
+                    }
+                }
+                WriterEvent::Deleted(id) => {
+                    cache.remove(&id);
+                }
+            }
+        }
+    }
+
+    fn reader(&self, logfile_id: u64) -> Result<Arc<Logfile<F>>> {
+        self.drain_events();
+        if let Some(logfile) = self
+            .readers
+            .read()
+            .expect("reader cache poisoned")
+            .get(&logfile_id)
+        {
+            return Ok(Arc::clone(logfile));
+        }
+        // Miss: the file may have been created since our last event drain
+        let path = log_file_path(&self.options.log_dir, logfile_id);
+        let logfile: Logfile<F> =
+            Logfile::open(&path).map_err(|_| WriteAheadError::LogfileNotFound)?;
+        let logfile = Arc::new(logfile);
+        self.readers
+            .write()
+            .expect("reader cache poisoned")
+            .insert(logfile_id, Arc::clone(&logfile));
+        Ok(logfile)
     }
 
     /// Reads a single record by its location.
     pub fn read(&self, logfile_id: u64, offset: u64) -> Result<Vec<u8>> {
-        let logfile = self
-            .log_files
-            .get(&logfile_id)
-            .ok_or(WriteAheadError::LogfileNotFound)?;
-        logfile.read_record(offset)
-    }
-
-    /// Writes a batch of records durably (fsync'd before returning) and
-    /// returns their addresses. Rotates the log file afterwards if it
-    /// exceeded `max_file_size`.
-    pub async fn write_batch(&mut self, data: Vec<Vec<u8>>) -> Result<Vec<RecordID>> {
-        let writer = self
-            .active_writer
-            .as_ref()
-            .ok_or(WriteAheadError::NotStarted)?;
-        let (tx, rx) = flume::bounded(1);
-        writer
-            .send(WriterCommand::Write(tx, data))
-            .map_err(|_| WriteAheadError::WriterClosed)?;
-        let response = rx
-            .recv_async()
-            .await
-            .map_err(|_| WriteAheadError::WriterClosed)??;
-
-        let ids = response
-            .offsets
-            .iter()
-            .map(|offset| RecordID::new(self.active_log_id, *offset))
-            .collect();
-
-        if response.file_length > self.options.max_file_size {
-            self.rotate_log_file().await?;
-        }
-
-        Ok(ids)
-    }
-
-    async fn rotate_log_file(&mut self) -> Result<()> {
-        let writer = self
-            .active_writer
-            .as_ref()
-            .ok_or(WriteAheadError::NotStarted)?;
-        let old_id = self.active_log_id;
-        debug!("rotating log file {}", old_id);
-
-        let (tx, rx) = flume::bounded(1);
-        writer
-            .send(WriterCommand::Seal(tx))
-            .map_err(|_| WriteAheadError::WriterClosed)?;
-        rx.recv_async()
-            .await
-            .map_err(|_| WriteAheadError::WriterClosed)??;
-
-        // Refresh the reader so it knows the file is sealed
-        if let Some(old) = self.log_files.get(&old_id) {
-            let path = old.path().to_path_buf();
-            self.log_files.insert(old_id, Logfile::open(&path)?);
-        }
-
-        self.create_active(old_id + 1)?;
-        self.apply_retention()?;
-        Ok(())
-    }
-
-    /// Deletes sealed files per `RetentionOptions`. The active file is never
-    /// deleted. Reads into deleted files return `LogfileNotFound`.
-    fn apply_retention(&mut self) -> Result<()> {
-        let mut to_delete: Vec<u64> = Vec::new();
-
-        let ttl_ms = self.options.retention.ttl.as_millis() as u64;
-        if ttl_ms > 0 {
-            let cutoff = now_ms().saturating_sub(ttl_ms);
-            for (id, logfile) in &self.log_files {
-                if *id != self.active_log_id
-                    && logfile.sealed
-                    && logfile.seal_timestamp_ms.is_some_and(|ts| ts < cutoff)
-                {
-                    to_delete.push(*id);
-                }
-            }
-        }
-
-        let max_total = self.options.retention.max_total_size;
-        if max_total > 0 {
-            let mut sizes: BTreeMap<u64, u64> = BTreeMap::new();
-            for (id, logfile) in &self.log_files {
-                sizes.insert(*id, logfile.file_len()?);
-            }
-            let mut total: u64 = sizes.values().sum();
-            for (id, size) in &sizes {
-                if total <= max_total || *id == self.active_log_id || to_delete.contains(id) {
-                    continue;
-                }
-                to_delete.push(*id);
-                total -= size;
-            }
-        }
-
-        if to_delete.is_empty() {
-            return Ok(());
-        }
-        for id in &to_delete {
-            if let Some(logfile) = self.log_files.remove(id) {
-                debug!("retention: deleting logfile {}", id);
-                std::fs::remove_file(logfile.path())
-                    .with_context(|| format!("Failed to delete logfile {}", id))?;
-            }
-        }
-        sync_dir(&self.options.log_dir)?;
-        Ok(())
+        self.reader(logfile_id)?.read_record(offset)
     }
 
     /// Creates a stream over all records in all log files, oldest first.
     pub fn create_stream(&self) -> Result<WriteAheadStream<F>> {
+        self.drain_events();
         let first = *self
-            .log_files
+            .readers
+            .read()
+            .expect("reader cache poisoned")
             .keys()
             .next()
             .ok_or(WriteAheadError::NotStarted)?;
@@ -326,15 +300,22 @@ impl<F: FileIo + 'static> WriteAhead<F> {
     /// The stream gets its own file handles, so it can be sent to another
     /// thread and consumed while writes continue.
     pub fn create_stream_from(&self, logfile_id: u64, offset: u64) -> Result<WriteAheadStream<F>> {
-        if !self.log_files.contains_key(&logfile_id) {
-            return Err(anyhow!(WriteAheadError::LogfileNotFound));
-        }
+        self.drain_events();
+        let paths: Vec<(u64, PathBuf)> = {
+            let cache = self.readers.read().expect("reader cache poisoned");
+            if !cache.contains_key(&logfile_id) {
+                return Err(anyhow!(WriteAheadError::LogfileNotFound));
+            }
+            cache
+                .range(logfile_id..)
+                .map(|(id, logfile)| (*id, logfile.path().to_path_buf()))
+                .collect()
+        };
 
         let mut streams = BTreeMap::new();
-        for (id, logfile) in self.log_files.range(logfile_id..) {
-            streams.insert(*id, LogFileStream::new(Logfile::open(logfile.path())?));
+        for (id, path) in paths {
+            streams.insert(id, LogFileStream::new(Logfile::open(&path)?));
         }
-
         let mut current = streams.remove(&logfile_id).expect("checked above");
         current.set_stream_offset(offset);
         Ok(WriteAheadStream {
@@ -389,6 +370,7 @@ mod tests {
     use super::*;
     use crate::fileio::simple_file::SimpleFile;
     use futures::stream::StreamExt;
+    use std::path::Path;
 
     fn test_wal(dir: &Path) -> WriteAhead<SimpleFile> {
         WriteAhead::with_options(WriteAheadOptions {
@@ -501,10 +483,46 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
+    #[tokio::test]
+    async fn test_write_handle_shared_across_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = test_wal(dir.path());
+        wal.start().unwrap();
+        let wal = std::sync::Arc::new(wal);
+
+        let mut joins = Vec::new();
+        for t in 0..4 {
+            let handle = wal.writer().unwrap();
+            joins.push(tokio::spawn(async move {
+                let mut out = Vec::new();
+                for i in 0..25 {
+                    let payload = format!("task {t} record {i}").into_bytes();
+                    let id = handle.write(payload.clone()).await.unwrap();
+                    out.push((id, payload));
+                }
+                out
+            }));
+        }
+        for join in joins {
+            for (id, payload) in join.await.unwrap() {
+                assert_eq!(wal.read(id.file_id, id.file_offset).unwrap(), payload);
+            }
+        }
+    }
+
     #[test]
     fn test_write_ahead_stream_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<WriteAheadStream<SimpleFile>>();
+    }
+
+    #[test]
+    fn test_write_ahead_is_sync_and_handle_clonable() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_clone<T: Clone>() {}
+        assert_send_sync::<WriteAhead<SimpleFile>>();
+        assert_send_sync::<WriteHandle>();
+        assert_clone::<WriteHandle>();
     }
 
     #[test]
@@ -513,5 +531,6 @@ mod tests {
         let wal = test_wal(dir.path());
         assert!(wal.read(0, FILE_HEADER_SIZE).is_err());
         assert!(wal.create_stream().is_err());
+        assert!(wal.writer().is_err());
     }
 }

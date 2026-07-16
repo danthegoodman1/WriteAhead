@@ -19,7 +19,11 @@ pub trait FileIo
 where
     Self: Sized + Send + Sync + std::fmt::Debug,
 {
+    /// Opens a file for writing, creating it if missing.
     fn open(path: &Path) -> Result<Self>;
+    /// Opens an existing file; errors if it does not exist. Read and
+    /// recovery paths use this so they can never create stray files.
+    fn open_existing(path: &Path) -> Result<Self>;
     /// Read exactly `buf.len()` bytes at `offset`. Errors if the file is too short.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
     /// Write all of `data` at `offset`. Durability requires a subsequent `sync`.
@@ -31,3 +35,12 @@ where
 }
 
 pub mod simple_file;
+
+/// fsyncs a directory so newly created/removed entries survive a crash.
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    use anyhow::Context;
+    std::fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("Failed to fsync directory {}", dir.display()))?;
+    Ok(())
+}
