@@ -167,3 +167,41 @@ Status ledger:
 | Complete | Work | 6D: GitHub Actions CI (fmt, clippy, test) | .github/workflows/ci.yml (ubuntu + macos matrix). |
 | Complete | Doc | 6E: README rewrite | README.md: guarantees, format v2 layout, recovery contract, bench table; io_uring section replaced with a one-line design note. |
 | In Progress | Gate | 20× clean test runs; CI green; docs match code | 20 consecutive `cargo test` runs with zero failures + clean `git status` (2026-07-16, local). Remaining: first CI run goes green on the PR. |
+
+## Phase 7: First-class concurrent writes (WriteHandle)
+
+Goal:
+Make group commit reachable through the public API: a cheaply cloneable `WriteHandle` usable from any task or thread, with rotation and retention moved into the writer actor so handles stay valid across file boundaries. Rationale: today the only concurrent-submission path is the semi-internal actor sender, which bypasses rotation — the library's headline throughput mechanism is unreachable through its supported API, and every integration must hand-write the same batching owner task.
+
+Scope:
+- Writer actor owns the directory lifecycle: rotation (create next file → seal old → swap), startup + post-rotation retention, and directory fsyncs all happen inside the actor. Create-before-seal ordering keeps every crash window inside states Phase 2 recovery already heals.
+- `WriteHandle`: `Clone + Send + Sync`, `write(record)` / `write_batch(records)`, acks carry the file id (rotation can happen between submission and commit).
+- Manager becomes recovery + read side: `&self` reads via an `RwLock` reader cache kept in sync by actor events (Created/Sealed/Deleted), lazy opens on miss, eviction on delete. `WriteAhead` becomes `Sync` — share it via `Arc`, no owner task, no mutex.
+- `WriteAhead::write_batch` takes `&self` (thin wrapper over the same channel); `rotate_log_file` and manager-side retention are deleted.
+- Bench: replace `actor_concurrent_8w` with `handle_concurrent_8w` going through the public API.
+- README integration section rewritten around `Arc<WriteAhead>` + `WriteHandle` (drop the upstream-batching guidance).
+
+Out of scope:
+- Multi-process locking (single-process ownership assumed, as before).
+- Explicit seal/rotate/flush public API.
+
+Completion gate:
+Multi-producer bench through the public API shows fsync coalescing well above the serial rate; concurrent writes crossing a rotation boundary all read back by their returned `RecordID`s; full suite (incl. crash matrix) + clippy green.
+
+Testing plan:
+- Public-API concurrency test: 8 tasks × N writes through cloned `WriteHandle`s with a small `max_file_size`, verify unique (file_id, offset) pairs and every record readable.
+- Retention tests updated for actor-side application (barrier write to settle in-flight rotation before asserting).
+- Existing recovery/roundtrip/stream suites pass unchanged in behavior.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 7A: Actor owns rotation (create → seal → swap) + dir fsync | Missing: WalWriter implementation. |
+| Incomplete | Work | 7B: Retention moves into the actor (startup + post-rotation) | Missing: implementation + event emission. |
+| Incomplete | Work | 7C: Public `WriteHandle` (Clone), acks carry file id | Missing: implementation + exports. |
+| Incomplete | Work | 7D: Manager read side: RwLock cache, event drain, lazy open, eviction; `&self` write_batch; `WriteAhead: Sync` | Missing: implementation + compile-time Send/Sync assertion. |
+| Incomplete | Work | 7E: Bench `handle_concurrent_8w` through public API | Missing: bench update + recorded numbers. |
+| Incomplete | Test | 7F: Concurrency-across-rotation test via public API | Missing: test. |
+| Incomplete | Doc | 7G: README integration section (Arc<WriteAhead> + WriteHandle) | Missing: doc update. |
+| Incomplete | Gate | Public-API coalescing ≫ serial rate; suite + crash matrix + clippy green | Missing: bench evidence + green run. |
