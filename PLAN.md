@@ -166,7 +166,7 @@ Status ledger:
 | Complete | Test | 6C: Proptest roundtrip suite (read-by-id + stream, across rotation) | tests/roundtrip_prop.rs (32 cases, arbitrary payload batches, forced rotations). |
 | Complete | Work | 6D: GitHub Actions CI (fmt, clippy, test) | .github/workflows/ci.yml (ubuntu + macos matrix). |
 | Complete | Doc | 6E: README rewrite | README.md: guarantees, format v2 layout, recovery contract, bench table; io_uring section replaced with a one-line design note. |
-| In Progress | Gate | 20× clean test runs; CI green; docs match code | 20 consecutive `cargo test` runs with zero failures + clean `git status` (2026-07-16, local). Remaining: first CI run goes green on the PR. |
+| Complete | Gate | 20× clean test runs; CI green; docs match code | 20 consecutive `cargo test` runs with zero failures + clean `git status` (2026-07-16, local). CI (fmt, clippy, test on ubuntu + macos) green on PRs #11, #12, and #13 (2026-07-16). |
 
 ## Phase 7: First-class concurrent writes (WriteHandle)
 
