@@ -13,7 +13,7 @@ fn opts(dir: &std::path::Path) -> WriteAheadOptions {
     }
 }
 
-async fn write_str(wal: &mut WriteAhead<SimpleFile>, s: &str) -> writeahead::RecordID {
+async fn write_str(wal: &WriteAhead<SimpleFile>, s: &str) -> writeahead::RecordID {
     wal.write_batch(vec![s.as_bytes().to_vec()])
         .await
         .unwrap()
@@ -34,12 +34,12 @@ async fn restart_resumes_appending() {
     let dir = tempfile::tempdir().unwrap();
     let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
     wal.start().unwrap();
-    let id1 = write_str(&mut wal, "before restart").await;
+    let id1 = write_str(&wal, "before restart").await;
     drop(wal);
 
     let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
     wal.start().unwrap();
-    let id2 = write_str(&mut wal, "after restart").await;
+    let id2 = write_str(&wal, "after restart").await;
 
     assert_eq!(
         wal.read(id1.file_id, id1.file_offset).unwrap(),
@@ -58,7 +58,7 @@ async fn crash_after_seal_before_next_file_rotates() {
     let dir = tempfile::tempdir().unwrap();
     let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
     wal.start().unwrap();
-    let id1 = write_str(&mut wal, "sealed away").await;
+    let id1 = write_str(&wal, "sealed away").await;
     drop(wal);
 
     // Seal file 0 out-of-band (as rotation would, crashing right after)
@@ -69,7 +69,7 @@ async fn crash_after_seal_before_next_file_rotates() {
     wal.start().unwrap();
 
     // Must NOT have appended to the sealed file: new writes go to file 1
-    let id2 = write_str(&mut wal, "fresh file").await;
+    let id2 = write_str(&wal, "fresh file").await;
     assert_eq!(id2.file_id, 1, "writer must rotate off a sealed file");
     assert_eq!(
         wal.read(id1.file_id, id1.file_offset).unwrap(),
@@ -84,8 +84,8 @@ async fn crash_mid_record_truncates_torn_tail() {
     let dir = tempfile::tempdir().unwrap();
     let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
     wal.start().unwrap();
-    let id1 = write_str(&mut wal, "acknowledged").await;
-    write_str(&mut wal, "will be torn").await;
+    let id1 = write_str(&wal, "acknowledged").await;
+    write_str(&wal, "will be torn").await;
     drop(wal);
 
     // Tear the last record mid-write
@@ -103,7 +103,7 @@ async fn crash_mid_record_truncates_torn_tail() {
         wal.read(id1.file_id, id1.file_offset).unwrap(),
         b"acknowledged"
     );
-    let id3 = write_str(&mut wal, "appended after recovery").await;
+    let id3 = write_str(&wal, "appended after recovery").await;
     assert_eq!(id3.file_id, 0);
     let all = collect_stream(&wal).await;
     assert_eq!(
@@ -122,7 +122,7 @@ async fn crash_before_header_heals_empty_active_file() {
     let dir = tempfile::tempdir().unwrap();
     let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
     wal.start().unwrap();
-    let id1 = write_str(&mut wal, "in file zero").await;
+    let id1 = write_str(&wal, "in file zero").await;
     drop(wal);
 
     recover_and_seal::<SimpleFile>(&dir.path().join("0000000000.log"), 1).unwrap();
@@ -131,7 +131,7 @@ async fn crash_before_header_heals_empty_active_file() {
     let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
     wal.start().unwrap();
 
-    let id2 = write_str(&mut wal, "in file one").await;
+    let id2 = write_str(&wal, "in file one").await;
     assert_eq!(id2.file_id, 1);
     assert_eq!(id2.file_offset, FILE_HEADER_SIZE);
     assert_eq!(
@@ -148,7 +148,7 @@ async fn torn_footer_on_non_active_file_is_healed() {
     let dir = tempfile::tempdir().unwrap();
     let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
     wal.start().unwrap();
-    let id1 = write_str(&mut wal, "old file record").await;
+    let id1 = write_str(&wal, "old file record").await;
     drop(wal);
 
     let path0 = dir.path().join("0000000000.log");
@@ -166,7 +166,7 @@ async fn torn_footer_on_non_active_file_is_healed() {
     let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
     wal.start().unwrap();
 
-    let id2 = write_str(&mut wal, "active file record").await;
+    let id2 = write_str(&wal, "active file record").await;
     assert_eq!(id2.file_id, 1);
     assert_eq!(
         wal.read(id1.file_id, id1.file_offset).unwrap(),
@@ -188,6 +188,6 @@ async fn stray_files_are_skipped() {
 
     let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
     wal.start().unwrap();
-    let id = write_str(&mut wal, "works").await;
+    let id = write_str(&wal, "works").await;
     assert_eq!(wal.read(id.file_id, id.file_offset).unwrap(), b"works");
 }

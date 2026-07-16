@@ -1,5 +1,5 @@
 /// RecordID represents a record's location in a log file.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RecordID {
     pub file_id: u64,
     pub file_offset: u64,

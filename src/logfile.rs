@@ -3,7 +3,6 @@ use futures::Stream;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
-use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{trace, warn};
 
@@ -73,9 +72,6 @@ pub enum LogfileError {
     #[error("Record extends past the end of the record region: partial write or invalid offset")]
     PartialWrite,
 
-    #[error("Cannot write to sealed logfile")]
-    WriteToSealed,
-
     #[error("Invalid magic number")]
     InvalidMagicNumber,
 
@@ -93,6 +89,11 @@ pub enum LogfileError {
 
     #[error("Record is too large, must be less than {} bytes", u32::MAX)]
     RecordTooLarge,
+}
+
+/// The canonical path of a log file id inside a log directory.
+pub(crate) fn log_file_path(dir: &Path, id: u64) -> PathBuf {
+    dir.join(format!("{:010}.log", id))
 }
 
 /// Parses a log file id from a `<digits>.log` file name.
@@ -222,12 +223,44 @@ fn validate_header<F: FileIo>(fio: &F) -> Result<()> {
     Ok(())
 }
 
-fn write_header<F: FileIo>(fio: &mut F) -> Result<()> {
+pub(crate) fn write_header<F: FileIo>(fio: &mut F) -> Result<()> {
     let mut header = [0u8; FILE_HEADER_SIZE as usize];
     header[0..8].copy_from_slice(&MAGIC_NUMBER);
     header[8] = FORMAT_VERSION;
     fio.write_at(0, &header).context("Failed to write header")?;
     Ok(())
+}
+
+/// Appends a seal footer at `records_end` and syncs. The caller must ensure
+/// the file's record region actually ends there.
+pub(crate) fn append_footer<F: FileIo>(fio: &mut F, records_end: u64, ts_ms: u64) -> Result<()> {
+    fio.write_at(records_end, &build_footer(records_end, ts_ms))
+        .context("Failed to write footer")?;
+    fio.sync().context("Failed to sync footer")?;
+    Ok(())
+}
+
+/// Encodes `records` into `buf` as they would sit on disk starting at
+/// `start_offset`, returning each record's file offset. Records must already
+/// be validated (< u32::MAX bytes each).
+pub(crate) fn encode_records(
+    buf: &mut Vec<u8>,
+    records: &[Vec<u8>],
+    start_offset: u64,
+) -> Vec<u64> {
+    let mut offsets = Vec::with_capacity(records.len());
+    let mut current = start_offset;
+    for record in records {
+        let (hash1, hash2) = murmur3_128(record);
+        offsets.push(current);
+        current += RECORD_HEADER_SIZE + record.len() as u64;
+
+        buf.extend_from_slice(&hash1.to_le_bytes());
+        buf.extend_from_slice(&hash2.to_le_bytes());
+        buf.extend_from_slice(&(record.len() as u32).to_le_bytes());
+        buf.extend_from_slice(record);
+    }
+    offsets
 }
 
 /// Recovers an unsealed file in place: validates the header, scans for the
@@ -238,7 +271,7 @@ fn write_header<F: FileIo>(fio: &mut F) -> Result<()> {
 /// Must NOT be called on a sealed file — the scan would treat the footer as
 /// a torn record and truncate it off.
 pub fn recover_unsealed<F: FileIo>(path: &Path) -> Result<u64> {
-    let mut fio = F::open(path)?;
+    let mut fio = F::open_existing(path)?;
     let len = fio.len()?;
     if len < FILE_HEADER_SIZE {
         if len > 0 {
@@ -272,13 +305,12 @@ pub fn recover_unsealed<F: FileIo>(path: &Path) -> Result<u64> {
 /// sealed but crashed mid-rotation, and by tests to craft aged files.
 pub fn recover_and_seal<F: FileIo>(path: &Path, ts_ms: u64) -> Result<u64> {
     let mut records_end = recover_unsealed::<F>(path)?;
-    let mut fio = F::open(path)?;
+    let mut fio = F::open_existing(path)?;
     if records_end == 0 {
         write_header(&mut fio)?;
         records_end = FILE_HEADER_SIZE;
     }
-    fio.write_at(records_end, &build_footer(records_end, ts_ms))?;
-    fio.sync()?;
+    append_footer(&mut fio, records_end, ts_ms)?;
     Ok(records_end)
 }
 
@@ -288,34 +320,48 @@ impl<F: FileIo> Logfile<F> {
     pub fn open(path: &Path) -> Result<Self> {
         let id = file_id_from_path(path)
             .ok_or_else(|| LogfileError::InvalidFileName(path.display().to_string()))?;
-        let fio = F::open(path)?;
+        let fio = F::open_existing(path)?;
         let len = fio.len()?;
         if len < FILE_HEADER_SIZE {
             return Err(anyhow!(LogfileError::InvalidHeader));
         }
         validate_header(&fio)?;
 
-        let mut sealed = false;
-        let mut seal_timestamp_ms = None;
-        let mut records_end = None;
-        if len >= FILE_HEADER_SIZE + FOOTER_SIZE {
-            let mut fbuf = [0u8; FOOTER_SIZE as usize];
-            fio.read_at(len - FOOTER_SIZE, &mut fbuf)?;
-            if let Some(ts) = parse_footer(&fbuf, len) {
-                sealed = true;
-                seal_timestamp_ms = Some(ts);
-                records_end = Some(len - FOOTER_SIZE);
-            }
-        }
-
-        Ok(Self {
+        let mut logfile = Self {
             id,
-            sealed,
-            seal_timestamp_ms,
-            records_end,
+            sealed: false,
+            seal_timestamp_ms: None,
+            records_end: None,
             path: path.to_path_buf(),
             fio,
-        })
+        };
+        logfile.refresh_seal()?;
+        Ok(logfile)
+    }
+
+    /// Re-checks for a seal footer on an unsealed file and returns the
+    /// record-region end from that same single length observation. Rotation
+    /// seals the previously active file asynchronously, so a long-lived
+    /// reader or stream can watch a file transition to sealed; the appended
+    /// footer bytes must not be parsed as a record. Callers must use the
+    /// returned end (not a fresh `len()`) — a second length observation
+    /// could already include a footer this probe never saw.
+    pub(crate) fn refresh_seal(&mut self) -> Result<u64> {
+        if self.sealed {
+            return self.records_end();
+        }
+        let len = self.fio.len()?;
+        if len >= FILE_HEADER_SIZE + FOOTER_SIZE {
+            let mut fbuf = [0u8; FOOTER_SIZE as usize];
+            self.fio.read_at(len - FOOTER_SIZE, &mut fbuf)?;
+            if let Some(ts) = parse_footer(&fbuf, len) {
+                self.sealed = true;
+                self.seal_timestamp_ms = Some(ts);
+                self.records_end = Some(len - FOOTER_SIZE);
+                return Ok(len - FOOTER_SIZE);
+            }
+        }
+        Ok(len)
     }
 
     /// Reads and verifies the record at `offset`.
@@ -353,211 +399,6 @@ impl<F: FileIo> Logfile<F> {
     /// Raw positional read within the file, for buffered streaming.
     pub(crate) fn read_into(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.fio.read_at(offset, buf)
-    }
-}
-
-pub enum WriterCommand {
-    Write(flume::Sender<Result<WriteResponse>>, Vec<Vec<u8>>),
-    Seal(flume::Sender<Result<()>>),
-}
-
-type ReplyTx = flume::Sender<Result<WriteResponse>>;
-
-/// Stop draining a group-commit round once this many payload bytes are
-/// queued, so latency stays bounded under a firehose of writers.
-const MAX_GROUP_COMMIT_BYTES: usize = 4 * 1024 * 1024;
-
-fn batch_bytes(records: &[Vec<u8>]) -> usize {
-    records
-        .iter()
-        .map(|r| RECORD_HEADER_SIZE as usize + r.len())
-        .sum()
-}
-
-#[derive(Debug)]
-pub struct WriteResponse {
-    pub offsets: Vec<u64>,
-    pub file_length: u64,
-}
-
-/// Single-threaded writer actor that owns the write handle of the active
-/// log file. Communicate with it via the `flume::Sender` from [Self::launch];
-/// dropping all senders shuts the actor down.
-#[derive(Debug)]
-pub struct LogFileWriter<F: FileIo> {
-    id: u64,
-    fio: F,
-    recv: flume::Receiver<WriterCommand>,
-    sealed: bool,
-    file_length: u64,
-}
-
-impl<F: FileIo + 'static> LogFileWriter<F> {
-    fn new(path: &Path, recv: flume::Receiver<WriterCommand>) -> Result<Self> {
-        let id = file_id_from_path(path)
-            .ok_or_else(|| LogfileError::InvalidFileName(path.display().to_string()))?;
-        let mut fio = F::open(path)?;
-        let len = fio.len()?;
-        let file_length = if len == 0 {
-            write_header(&mut fio)?;
-            fio.sync()?;
-            FILE_HEADER_SIZE
-        } else if len < FILE_HEADER_SIZE {
-            // The manager recovers files before attaching a writer, so a
-            // partial header here means that contract was violated.
-            return Err(anyhow!(LogfileError::InvalidHeader));
-        } else {
-            len
-        };
-        Ok(Self {
-            id,
-            fio,
-            recv,
-            sealed: false,
-            file_length,
-        })
-    }
-
-    /// Creates the file (writing the header if it's empty) and spawns the
-    /// writer thread. The file must be recovered (no torn tail, not sealed)
-    /// before calling this.
-    pub fn launch(path: &Path) -> Result<flume::Sender<WriterCommand>> {
-        let (tx, rx) = flume::unbounded();
-        let writer = Self::new(path, rx)?;
-        thread::Builder::new()
-            .name(format!("wal-writer-{}", writer.id))
-            .spawn(move || writer.actor_loop())
-            .context("Failed to spawn writer thread")?;
-        Ok(tx)
-    }
-
-    fn actor_loop(mut self) {
-        while let Ok(first) = self.recv.recv() {
-            let mut writes: Vec<(ReplyTx, Vec<Vec<u8>>)> = Vec::new();
-            let mut seal_reply = None;
-            let mut queued_bytes = 0usize;
-
-            match first {
-                WriterCommand::Write(reply, data) => {
-                    queued_bytes += batch_bytes(&data);
-                    writes.push((reply, data));
-                }
-                WriterCommand::Seal(reply) => seal_reply = Some(reply),
-            }
-
-            // Group commit: drain whatever else is already queued so all
-            // pending writes share a single write+fsync. Stop at a Seal to
-            // preserve command order.
-            if seal_reply.is_none() {
-                while queued_bytes < MAX_GROUP_COMMIT_BYTES {
-                    match self.recv.try_recv() {
-                        Ok(WriterCommand::Write(reply, data)) => {
-                            queued_bytes += batch_bytes(&data);
-                            writes.push((reply, data));
-                        }
-                        Ok(WriterCommand::Seal(reply)) => {
-                            seal_reply = Some(reply);
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-
-            if !writes.is_empty() {
-                self.write_group(writes);
-            }
-            if let Some(reply) = seal_reply {
-                let _ = reply.send(self.seal());
-            }
-        }
-        trace!("logfile {} writer actor disconnected", self.id);
-    }
-
-    /// Encodes every queued batch into one buffer, does one write and one
-    /// fsync, then answers each caller with its own offsets.
-    fn write_group(&mut self, group: Vec<(ReplyTx, Vec<Vec<u8>>)>) {
-        // The caller may have given up on any reply; a dropped receiver is
-        // not our error, hence the ignored send results throughout.
-        if self.sealed {
-            for (reply, _) in group {
-                let _ = reply.send(Err(anyhow!(LogfileError::WriteToSealed)));
-            }
-            return;
-        }
-
-        let mut valid: Vec<(ReplyTx, Vec<Vec<u8>>)> = Vec::with_capacity(group.len());
-        let mut total = 0usize;
-        for (reply, records) in group {
-            if records.iter().any(|r| r.len() > u32::MAX as usize) {
-                let _ = reply.send(Err(anyhow!(LogfileError::RecordTooLarge)));
-                continue;
-            }
-            total += batch_bytes(&records);
-            valid.push((reply, records));
-        }
-        if valid.is_empty() {
-            return;
-        }
-
-        let mut buf = Vec::with_capacity(total);
-        let mut current_offset = self.file_length;
-        let mut per_caller_offsets: Vec<Vec<u64>> = Vec::with_capacity(valid.len());
-        for (_, records) in &valid {
-            let mut offsets = Vec::with_capacity(records.len());
-            for record in records {
-                let (hash1, hash2) = murmur3_128(record);
-                offsets.push(current_offset);
-                current_offset += RECORD_HEADER_SIZE + record.len() as u64;
-
-                buf.extend_from_slice(&hash1.to_le_bytes());
-                buf.extend_from_slice(&hash2.to_le_bytes());
-                buf.extend_from_slice(&(record.len() as u32).to_le_bytes());
-                buf.extend_from_slice(record);
-            }
-            per_caller_offsets.push(offsets);
-        }
-
-        let result = self
-            .fio
-            .write_at(self.file_length, &buf)
-            .context("Failed to write records")
-            .and_then(|_| self.fio.sync().context("Failed to sync records"));
-
-        match result {
-            Ok(()) => {
-                self.file_length = current_offset;
-                for ((reply, _), offsets) in valid.into_iter().zip(per_caller_offsets) {
-                    let _ = reply.send(Ok(WriteResponse {
-                        offsets,
-                        file_length: current_offset,
-                    }));
-                }
-            }
-            Err(e) => {
-                // Nothing was acknowledged: file_length stays put, so any
-                // partially written bytes are outside the record region and
-                // get truncated by recovery. anyhow::Error isn't Clone, so
-                // each caller gets its own copy of the message.
-                let msg = format!("{e:#}");
-                for (reply, _) in valid {
-                    let _ = reply.send(Err(anyhow!("{}", msg.clone())));
-                }
-            }
-        }
-    }
-
-    fn seal(&mut self) -> Result<()> {
-        if self.sealed {
-            return Err(anyhow!(LogfileError::WriteToSealed));
-        }
-        self.fio
-            .write_at(self.file_length, &build_footer(self.file_length, now_ms()))
-            .context("Failed to write footer")?;
-        self.fio.sync().context("Failed to sync footer")?;
-        self.sealed = true;
-        self.file_length += FOOTER_SIZE;
-        Ok(())
     }
 }
 
@@ -608,7 +449,9 @@ impl<F: FileIo> LogFileStream<F> {
     }
 
     /// Record-region end. For unsealed files, only re-stats the file once
-    /// the previously observed end has been consumed.
+    /// the previously observed end has been consumed — and re-probes the
+    /// seal footer first, since rotation may have sealed the file while we
+    /// were streaming it (the footer must not be parsed as a record).
     fn records_end(&mut self) -> Result<u64> {
         if self.logfile.sealed {
             return self.logfile.records_end();
@@ -616,7 +459,7 @@ impl<F: FileIo> LogFileStream<F> {
         if self.offset < self.known_end {
             return Ok(self.known_end);
         }
-        self.known_end = self.logfile.records_end()?;
+        self.known_end = self.logfile.refresh_seal()?;
         Ok(self.known_end)
     }
 
@@ -700,26 +543,34 @@ mod tests {
         (dir, path)
     }
 
-    fn write(
-        writer: &flume::Sender<WriterCommand>,
-        records: Vec<Vec<u8>>,
-    ) -> Result<WriteResponse> {
-        let (tx, rx) = flume::bounded(1);
-        writer.send(WriterCommand::Write(tx, records)).unwrap();
-        rx.recv().unwrap()
+    /// Appends records to a (possibly new) log file the same way the writer
+    /// actor does: header if empty, encoded batch, one write + sync.
+    fn write_raw(path: &Path, records: &[Vec<u8>]) -> Vec<u64> {
+        let mut fio = SimpleFile::open(path).unwrap();
+        let mut end = fio.len().unwrap();
+        if end == 0 {
+            write_header(&mut fio).unwrap();
+            end = FILE_HEADER_SIZE;
+        }
+        let mut buf = Vec::new();
+        let offsets = encode_records(&mut buf, records, end);
+        fio.write_at(end, &buf).unwrap();
+        fio.sync().unwrap();
+        offsets
     }
 
-    fn seal(writer: &flume::Sender<WriterCommand>) -> Result<()> {
-        let (tx, rx) = flume::bounded(1);
-        writer.send(WriterCommand::Seal(tx)).unwrap();
-        rx.recv().unwrap()
+    fn seal_raw(path: &Path) {
+        let fio = SimpleFile::open(path).unwrap();
+        let end = fio.len().unwrap();
+        drop(fio);
+        let mut fio = SimpleFile::open(path).unwrap();
+        append_footer(&mut fio, end, now_ms()).unwrap();
     }
 
     #[test]
     fn test_write_without_sealing() {
         let (_dir, path) = temp_log("0000000001.log");
-        let writer = LogFileWriter::<SimpleFile>::launch(&path).unwrap();
-        let offsets = write(&writer, vec![b"hello".to_vec()]).unwrap().offsets;
+        let offsets = write_raw(&path, &[b"hello".to_vec()]);
 
         let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
         assert_eq!(logfile.id, 1);
@@ -730,16 +581,8 @@ mod tests {
     #[test]
     fn test_write_with_sealing() {
         let (_dir, path) = temp_log("0000000002.log");
-        let writer = LogFileWriter::<SimpleFile>::launch(&path).unwrap();
-        let offsets = write(&writer, vec![b"hello".to_vec()]).unwrap().offsets;
-        seal(&writer).unwrap();
-
-        // Writing after sealing fails with an error, not a panic
-        let err = write(&writer, vec![b"world".to_vec()]).unwrap_err();
-        assert!(matches!(
-            err.downcast_ref::<LogfileError>(),
-            Some(LogfileError::WriteToSealed)
-        ));
+        let offsets = write_raw(&path, &[b"hello".to_vec()]);
+        seal_raw(&path);
 
         let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
         assert_eq!(logfile.id, 2);
@@ -752,8 +595,7 @@ mod tests {
     fn test_corrupted_record() {
         use std::io::{Seek, Write};
         let (_dir, path) = temp_log("0000000003.log");
-        let writer = LogFileWriter::<SimpleFile>::launch(&path).unwrap();
-        let offsets = write(&writer, vec![b"hello".to_vec()]).unwrap().offsets;
+        let offsets = write_raw(&path, &[b"hello".to_vec()]);
 
         let mut tmp = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         tmp.seek(std::io::SeekFrom::Start(
@@ -774,9 +616,8 @@ mod tests {
     fn test_corrupted_length_is_bounded() {
         use std::io::{Seek, Write};
         let (_dir, path) = temp_log("0000000004.log");
-        let writer = LogFileWriter::<SimpleFile>::launch(&path).unwrap();
-        let offsets = write(&writer, vec![b"hello".to_vec()]).unwrap().offsets;
-        seal(&writer).unwrap();
+        let offsets = write_raw(&path, &[b"hello".to_vec()]);
+        seal_raw(&path);
 
         // Blow up the length field to u32::MAX
         let mut tmp = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -794,12 +635,11 @@ mod tests {
     #[test]
     fn test_100_records() {
         let (_dir, path) = temp_log("0000000006.log");
-        let writer = LogFileWriter::<SimpleFile>::launch(&path).unwrap();
         let records: Vec<Vec<u8>> = (0..100)
             .map(|i| format!("record_{}", i).into_bytes())
             .collect();
-        let offsets = write(&writer, records).unwrap().offsets;
-        seal(&writer).unwrap();
+        let offsets = write_raw(&path, &records);
+        seal_raw(&path);
 
         let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
         for (i, offset) in offsets.iter().enumerate() {
@@ -812,15 +652,14 @@ mod tests {
     fn test_magic_number_payload_roundtrip() {
         // Payloads full of magic bytes must not confuse framing or seal detection
         let (_dir, path) = temp_log("0000000008.log");
-        let writer = LogFileWriter::<SimpleFile>::launch(&path).unwrap();
         let payload = MAGIC_NUMBER.repeat(4);
-        let offsets = write(&writer, vec![payload.clone()]).unwrap().offsets;
+        let offsets = write_raw(&path, std::slice::from_ref(&payload));
 
         let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
         assert!(!logfile.sealed, "magic-byte payload misdetected as seal");
         assert_eq!(logfile.read_record(offsets[0]).unwrap(), payload);
 
-        seal(&writer).unwrap();
+        seal_raw(&path);
         let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
         assert!(logfile.sealed);
         assert_eq!(logfile.read_record(offsets[0]).unwrap(), payload);
@@ -829,9 +668,8 @@ mod tests {
     #[test]
     fn test_bulk_writes() {
         let (_dir, path) = temp_log("0000000011.log");
-        let writer = LogFileWriter::<SimpleFile>::launch(&path).unwrap();
         let records = vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()];
-        let offsets = write(&writer, records).unwrap().offsets;
+        let offsets = write_raw(&path, &records);
 
         let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
         assert_eq!(offsets.len(), 3);
@@ -843,11 +681,10 @@ mod tests {
     #[tokio::test]
     async fn test_stream() {
         let (_dir, path) = temp_log("0000000010.log");
-        let writer = LogFileWriter::<SimpleFile>::launch(&path).unwrap();
         let records: Vec<Vec<u8>> = (0..10)
             .map(|i| format!("record_{}", i).into_bytes())
             .collect();
-        write(&writer, records).unwrap();
+        write_raw(&path, &records);
 
         let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
         let mut stream = LogFileStream::new(logfile);
@@ -861,11 +698,7 @@ mod tests {
     #[test]
     fn test_recover_truncates_torn_tail() {
         let (_dir, path) = temp_log("0000000012.log");
-        let writer = LogFileWriter::<SimpleFile>::launch(&path).unwrap();
-        let offsets = write(&writer, vec![b"keep-me".to_vec(), b"torn".to_vec()])
-            .unwrap()
-            .offsets;
-        drop(writer);
+        let offsets = write_raw(&path, &[b"keep-me".to_vec(), b"torn".to_vec()]);
 
         // Tear the second record: cut the file 3 bytes short
         let full_len = std::fs::metadata(&path).unwrap().len();
@@ -883,10 +716,9 @@ mod tests {
     #[test]
     fn test_recover_and_seal_torn_footer() {
         let (_dir, path) = temp_log("0000000013.log");
-        let writer = LogFileWriter::<SimpleFile>::launch(&path).unwrap();
-        let response = write(&writer, vec![b"hello".to_vec()]).unwrap();
-        let records_end = response.file_length;
-        seal(&writer).unwrap();
+        let offsets = write_raw(&path, &[b"hello".to_vec()]);
+        let records_end = std::fs::metadata(&path).unwrap().len();
+        seal_raw(&path);
 
         // Tear the footer: cut it in half
         let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -901,7 +733,7 @@ mod tests {
         let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
         assert!(logfile.sealed);
         assert_eq!(logfile.seal_timestamp_ms, Some(12345));
-        assert_eq!(logfile.read_record(response.offsets[0]).unwrap(), b"hello");
+        assert_eq!(logfile.read_record(offsets[0]).unwrap(), b"hello");
     }
 
     #[test]
@@ -912,9 +744,8 @@ mod tests {
         assert_eq!(end, 0);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 
-        // Writer can take over the healed file
-        let writer = LogFileWriter::<SimpleFile>::launch(&path).unwrap();
-        let offsets = write(&writer, vec![b"fresh".to_vec()]).unwrap().offsets;
+        // A fresh write can take over the healed (empty) file
+        let offsets = write_raw(&path, &[b"fresh".to_vec()]);
         let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
         assert_eq!(logfile.read_record(offsets[0]).unwrap(), b"fresh");
     }

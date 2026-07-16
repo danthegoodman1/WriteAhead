@@ -28,6 +28,15 @@ impl FileIo for SimpleFile {
         Ok(Self { fd })
     }
 
+    fn open_existing(path: &Path) -> Result<Self> {
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("Failed to open existing {}", path.display()))?;
+        Ok(Self { fd })
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.fd
             .read_exact_at(buf, offset)

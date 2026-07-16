@@ -1,4 +1,6 @@
 //! Retention enforcement: size- and ttl-based deletion of sealed files.
+//! Retention runs on the writer thread — at startup (synchronously, before
+//! `start()` returns) and after each rotation.
 
 use std::time::Duration;
 use writeahead::logfile::{now_ms, recover_and_seal};
@@ -25,8 +27,13 @@ async fn size_retention_deletes_oldest_sealed_files() {
                 .unwrap(),
         );
     }
+    // Rotation/retention for the last write may still be in flight on the
+    // writer thread; one more ack guarantees everything before it settled.
+    wal.write_batch(vec![b"barrier".to_vec()]).await.unwrap();
 
     // Old sealed files must have been deleted to hold the size bound
+    // (slack: the bound is enforced at rotation time, before the current
+    // file grows past max_file_size again)
     let total: u64 = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|e| e.unwrap().metadata().unwrap().len())
@@ -64,6 +71,7 @@ async fn ttl_retention_deletes_aged_files_on_start() {
         now_ms().saturating_sub(3 * hour_ms),
     )
     .unwrap();
+    std::fs::write(dir.path().join("0000000001.log"), b"").unwrap();
     recover_and_seal::<SimpleFile>(&dir.path().join("0000000001.log"), now_ms()).unwrap();
 
     let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {

@@ -4,7 +4,6 @@
 //! before/after comparisons are a diff of two runs.
 
 use std::time::Instant;
-use writeahead::logfile::{LogFileWriter, WriterCommand};
 use writeahead::{SimpleFile, WriteAhead, WriteAheadOptions};
 
 const SEQ_WRITES: usize = 2_000;
@@ -112,35 +111,30 @@ async fn bench_stream_replay(wal: &WriteAhead<SimpleFile>, expected: usize) {
     );
 }
 
-/// N threads submitting single-record writes concurrently to one writer
-/// actor: measures fsync coalescing (group commit).
-fn bench_actor_concurrent(dir: &std::path::Path) {
-    std::fs::create_dir_all(dir).unwrap();
-    let path = dir.join("0000000000.log");
-    let writer = LogFileWriter::<SimpleFile>::launch(&path).unwrap();
+/// N threads submitting single-record writes concurrently through cloned
+/// public WriteHandles: measures fsync coalescing (group commit).
+fn bench_handle_concurrent(dir: &std::path::Path) {
+    let mut wal = wal_in(dir);
+    wal.start().unwrap();
     let start = Instant::now();
-    let mut handles = Vec::new();
+    let mut threads = Vec::new();
     for t in 0..CONCURRENT_THREADS {
-        let writer = writer.clone();
-        handles.push(std::thread::spawn(move || {
+        let handle = wal.writer().unwrap();
+        threads.push(std::thread::spawn(move || {
             for i in 0..CONCURRENT_WRITES_PER_THREAD {
-                let (tx, rx) = flume::bounded(1);
-                writer
-                    .send(WriterCommand::Write(
-                        tx,
-                        vec![payload(t * CONCURRENT_WRITES_PER_THREAD + i)],
-                    ))
-                    .unwrap();
-                rx.recv().unwrap().unwrap();
+                futures::executor::block_on(
+                    handle.write(payload(t * CONCURRENT_WRITES_PER_THREAD + i)),
+                )
+                .unwrap();
             }
         }));
     }
-    for h in handles {
-        h.join().unwrap();
+    for t in threads {
+        t.join().unwrap();
     }
     let ops = CONCURRENT_THREADS * CONCURRENT_WRITES_PER_THREAD;
     report(
-        "actor_concurrent_8w",
+        "handle_concurrent_8w",
         start.elapsed(),
         ops,
         ops * PAYLOAD_LEN,
@@ -169,5 +163,5 @@ async fn main() {
     bench_read_by_id(&wal, &ids);
     bench_stream_replay(&wal, BATCHES * BATCH_SIZE).await;
 
-    bench_actor_concurrent(&dir.path().join("actor"));
+    bench_handle_concurrent(&dir.path().join("handle"));
 }

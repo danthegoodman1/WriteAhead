@@ -197,11 +197,12 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 7A: Actor owns rotation (create → seal → swap) + dir fsync | Missing: WalWriter implementation. |
-| Incomplete | Work | 7B: Retention moves into the actor (startup + post-rotation) | Missing: implementation + event emission. |
-| Incomplete | Work | 7C: Public `WriteHandle` (Clone), acks carry file id | Missing: implementation + exports. |
-| Incomplete | Work | 7D: Manager read side: RwLock cache, event drain, lazy open, eviction; `&self` write_batch; `WriteAhead: Sync` | Missing: implementation + compile-time Send/Sync assertion. |
-| Incomplete | Work | 7E: Bench `handle_concurrent_8w` through public API | Missing: bench update + recorded numbers. |
-| Incomplete | Test | 7F: Concurrency-across-rotation test via public API | Missing: test. |
-| Incomplete | Doc | 7G: README integration section (Arc<WriteAhead> + WriteHandle) | Missing: doc update. |
-| Incomplete | Gate | Public-API coalescing ≫ serial rate; suite + crash matrix + clippy green | Missing: bench evidence + green run. |
+| Complete | Work | 7A: Actor owns rotation (create → seal → swap) + dir fsync | src/writer.rs `WalWriter::maybe_rotate`; create-before-seal keeps crash windows inside Phase 2's healed states (tests/recovery.rs still green). |
+| Complete | Work | 7B: Retention moves into the actor (startup + post-rotation) | src/writer.rs `apply_retention` (startup application is synchronous in `launch`, so `start()` returns with it done); tests/retention.rs updated + green. |
+| Complete | Work | 7C: Public `WriteHandle` (Clone), acks carry file id | src/writer.rs `WriteHandle::{write, write_batch}`; `WriteAck.file_id`; exported from lib.rs. |
+| Complete | Work | 7D: Manager read side: RwLock cache, event drain, lazy open, eviction; `&self` write_batch; `WriteAhead: Sync` | src/write_ahead.rs `drain_events`/`reader`; `FileIo::open_existing` added so read paths can never create stray files; `test_write_ahead_is_sync_and_handle_clonable` compile-time assertion. |
+| Complete | Work | 7E: Bench `handle_concurrent_8w` through public API | examples/bench.rs; ~940/s vs ~230/s serial (3 runs: 944/939/935) — the ~4x coalescing previously only reachable via the internal actor sender. |
+| Complete | Test | 7F: Concurrency-across-rotation test via public API | tests/group_commit.rs: 8 tasks × 200 writes, max_file_size=4096, unique RecordIDs, all intact across rotations; also `test_write_handle_shared_across_tasks`. |
+| Complete | Doc | 7G: README integration section (Arc<WriteAhead> + WriteHandle) | README.md Usage + Design + Integration sections rewritten; upstream-batching guidance removed. |
+| Complete | Work | 7H: Fix stream vs async-seal race found by proptest | `Logfile::refresh_seal` single-length-snapshot probe (src/logfile.rs); a stream tailing a file that rotation seals mid-replay now ends cleanly instead of parsing the footer as a torn record. Repro'd via tests/roundtrip_prop.rs; 30 consecutive runs clean after fix. |
+| Complete | Gate | Public-API coalescing ≫ serial rate; suite + crash matrix + clippy green | Bench table above; 5× full suite (35 tests) + 30× race-prone tests clean; `cargo clippy --all-targets -- -D warnings` zero errors. |
