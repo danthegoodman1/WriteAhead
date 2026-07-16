@@ -1,74 +1,91 @@
 # WriteAhead
 
-A partitioned WAL crate for building append-only high throughput durability systems.
+A partitioned WAL crate for building append-only, high-throughput durability systems.
 
-A great component for a (distributed) data store.
+A great component for a (distributed) data store. For distributed usage, consider FDB's model (you may want a custom in-memory index in front for custom ID→offset mappings).
 
-For distributed usage, consider FDB's model (may want to place a custom in-memory index in front for custom ID->offset mappings)
+## Guarantees
 
-Almost always under 200us persistence on my M3 MBP, rarely breaking the 1ms mark when a log rotation occurrs.
+1. **Durability** — a write is acknowledged only after it is fdatasync'd to the active log file.
+2. **Corruption detection** — every record carries a 128-bit murmur3 hash of its data; any bit-flip in a record (including its length header, caught via bounds check + hash mismatch) is detected on read.
+3. **Crash recovery** — `start()` restores a consistent WAL after a crash at any point: every file is validated, torn tails are truncated, files that missed their seal mid-rotation are healed and sealed, and sealed files are never appended to. Every acknowledged record survives.
+4. **Stable addressing** — `RecordID { file_id, file_offset }` stays valid for the life of the file (until retention deletes it).
+5. **Sequential streaming** — a stream replays all records across files in write order.
 
-This is an aggressive log rotation test where each write is a `Hello world! {i}` record, and log rotation occurs every 4 writes due to log file size restrictions:
+## Usage
 
-```
-2025-01-04T20:07:40.161477Z DEBUG src/write_ahead.rs:610: Write time taken: 1.003083ms
-2025-01-04T20:07:40.161649Z DEBUG src/write_ahead.rs:610: Write time taken: 154.542µs
-2025-01-04T20:07:40.161817Z DEBUG src/write_ahead.rs:610: Write time taken: 148.125µs
-2025-01-04T20:07:40.162006Z DEBUG src/write_ahead.rs:610: Write time taken: 177.584µs
-2025-01-04T20:07:40.162882Z DEBUG src/write_ahead.rs:610: Write time taken: 864.125µs
-2025-01-04T20:07:40.163141Z DEBUG src/write_ahead.rs:610: Write time taken: 242.292µs
-2025-01-04T20:07:40.163355Z DEBUG src/write_ahead.rs:610: Write time taken: 195.208µs
-2025-01-04T20:07:40.163544Z DEBUG src/write_ahead.rs:610: Write time taken: 175µs
-2025-01-04T20:07:40.164352Z DEBUG src/write_ahead.rs:610: Write time taken: 795.958µs
-2025-01-04T20:07:40.164517Z DEBUG src/write_ahead.rs:610: Write time taken: 152.125µs
-2025-01-04T20:07:40.164672Z DEBUG src/write_ahead.rs:610: Write time taken: 141.5µs
-2025-01-04T20:07:40.164813Z DEBUG src/write_ahead.rs:610: Write time taken: 129.125µs
-2025-01-04T20:07:40.165483Z DEBUG src/write_ahead.rs:610: Write time taken: 657.542µs
-2025-01-04T20:07:40.165636Z DEBUG src/write_ahead.rs:610: Write time taken: 141.333µs
-2025-01-04T20:07:40.165784Z DEBUG src/write_ahead.rs:610: Write time taken: 138.042µs
-2025-01-04T20:07:40.165942Z DEBUG src/write_ahead.rs:610: Write time taken: 144.083µs
-2025-01-04T20:07:40.166539Z DEBUG src/write_ahead.rs:610: Write time taken: 586.75µs
-2025-01-04T20:07:40.166691Z DEBUG src/write_ahead.rs:610: Write time taken: 139.666µs
-2025-01-04T20:07:40.166834Z DEBUG src/write_ahead.rs:610: Write time taken: 132.917µs
-2025-01-04T20:07:40.167017Z DEBUG src/write_ahead.rs:610: Write time taken: 173.042µs
-```
+```rust
+use writeahead::{WriteAhead, WriteAheadOptions, SimpleFile};
 
-TLDR it's super fast.
+let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
+    log_dir: "./write_ahead".into(),
+    ..Default::default()
+});
+wal.start()?; // recovers existing state, must crash on error
 
-# Notes
+// Durable batch write (one pwrite + one fdatasync per batch)
+let ids = wal.write_batch(vec![b"hello".to_vec()]).await?;
 
-## Separating writers and readers
+// Point read by address
+let record = wal.read(ids[0].file_id, ids[0].file_offset)?;
 
-By using a single writer, we can increase throughput via batching with simplicity (`io_uring` does not provide as significant benefit for a single writer with a dedicated thread, only if you can't coalesce writes really, and if you have fewer threads than disks).
-
-With a separate reader, can we have a single writer using the `sfd::fs::File`, while readers can use `io_uring` to prevent blocking each other. This means the writer never waits for readers, and the readers never wait for each other.
-
-### Some thoughts on io_uring
-
-io_uring for fileio is only particularly useful if using direct IO, which generally is good for a data storage system that intends to store a large amount of data.
-
-However, one use case where it's not a good fit is for a WAL. That's because in the normal case, we expect readers will likely be reading very recently written data, and as you can tell from tests, `SimpleFile` which uses the page cache reads back faster so much faster than the `IOUringFile` package:
-
-`SimpleFile`:
-```
-2025-01-19T00:35:31.122171Z DEBUG src/write_ahead.rs:92: Creating initial log file
-2025-01-19T00:35:31.206835Z DEBUG src/write_ahead.rs:445: Write time taken: 83.650875ms
-2025-01-19T00:35:31.208957Z DEBUG src/write_ahead.rs:457: Read time taken: 2.086291ms
+// Full replay
+use futures::StreamExt;
+let mut stream = wal.create_stream()?;
+while let Some(record) = stream.next().await {
+    let record = record?;
+    // ...
+}
 ```
 
-`IOUringFile` (which uses `SimpleFile` for writing):
-```
-2025-01-19T00:35:21.075255Z DEBUG src/write_ahead.rs:92: Creating initial log file
-2025-01-19T00:35:21.154822Z DEBUG src/write_ahead.rs:484: Write time taken: 79.14325ms
-2025-01-19T00:35:21.280025Z DEBUG src/write_ahead.rs:496: Read time taken: 125.154709ms
+Retention is opt-in via `RetentionOptions`: `max_total_size` deletes the oldest sealed files once total disk usage exceeds the bound, and `ttl` deletes sealed files whose seal timestamp is older than the window. The active file is never deleted; reads into deleted files return `LogfileNotFound`.
+
+## Design
+
+### Single writer, page-cache readers
+
+One dedicated writer thread owns the active file; callers talk to it over a channel, and `write_batch` awaits the response without blocking the async executor. Writes queued while an fsync is in flight are **group-committed**: the actor drains them into a single pwrite + fdatasync and fans replies back out, so concurrent producers coalesce automatically (~4x throughput with 8 producers in the included bench).
+
+Readers use positional reads (`pread`) straight from the page cache — for WAL access patterns readers mostly want recently written data, which the page cache serves far faster than any direct-IO scheme (we measured io_uring + O_DIRECT reads at ~60x slower for this workload before removing that path). Point reads speculatively fetch one small block so most records cost a single syscall; streams parse records out of 128 KiB readahead chunks.
+
+### File format (version 2)
+
+```text
+| 8B magic | 1B version | records ... | 40B seal footer (sealed files only) |
+
+record: | 16B murmur3_128(data) | 4B length (u32 LE) | data |
+footer: | 8B magic | 8B seal timestamp (unix ms) | 8B records-end offset | 16B murmur3_128 of the previous 24B |
 ```
 
-As you can see, reading recently written files is quite a bit faster with the page cache. As a result, `IOUringFile` is more likely to be removed than completed.
+Data is stored raw — no escaping. A file is sealed iff its trailing 40 bytes parse as a footer whose own hash verifies and whose records-end field equals the footer's position, so record payloads (which may contain the magic bytes) cannot be mistaken for a seal.
+
+The log directory is a sequence of `0000000000.log`, `0000000001.log`, … files. The highest id is the active file; rotation seals the current file (footer carries the seal timestamp used by ttl retention) and starts the next one. Directory entries are fsync'd on file creation.
+
+### Recovery
+
+On `start()`:
+
+- Non-active files that aren't sealed (crash mid-rotation, torn footer) are healed: valid record prefix kept, garbage truncated, footer written.
+- The active file gets a tail scan; a torn last record is truncated away. Since writes are only acknowledged after fsync, nothing acknowledged is ever lost.
+- If the active file turns out to be sealed (crash between seal and next-file creation), a fresh file is started rather than appending to it.
+- Non-log files in the directory are skipped.
+
+## Benchmarks
+
+`cargo run --release --example bench` (writes to the current directory — don't run it on tmpfs, where fsync is free and write numbers become fiction).
+
+Numbers from a desktop NVMe/ext4 box (64B payloads):
+
+| scenario | rate | notes |
+| --- | --- | --- |
+| `seq_write_1rec` | ~235/s (~4.2ms/op) | fsync-bound: one record per batch, strict ack-then-next |
+| `batch_write` (1000/batch) | ~210k records/s | one pwrite + one fdatasync per batch |
+| `read_by_id` | ~2.0M/s | point reads through the page cache |
+| `stream_replay` | ~35M/s (~2.2GB/s) | readahead streaming |
+| `actor_concurrent_8w` | ~940/s | 8 producers, group commit (~4x the serial rate) |
 
 ## Integrating with a thread-safe API framework (Axum, tonic, etc.)
 
-Since WriteAhead is single-threaded, to preserve performance it's probably best to spawn off a thread dedicated for this, and use a channel to communicate writes and reads. Then you can even buffer them up in memory and micro-batch them (e.g. at most 500us) for increased throughput.
+`WriteAhead` has a single-owner API to keep the write path contention-free. Spawn a task/thread that owns it and communicate over a channel; you can micro-batch incoming writes (e.g. at most 500µs) into `write_batch` calls for extra throughput — and writes that arrive while an fsync is in flight already coalesce via group commit.
 
-If you need to stream a WriteAheadStream back to a response, you can use either a stream helper, or write a little helper that will turn that stream into a channel, then use something like `flume::Receiver::into_stream` to respond. Should use a bounded channel so you don't bloat memory.
-
-WriteAheadStream is also Send (see `test_write_ahead_stream_is_send`), so you can actually send it over the channel back to the API handler, and feed that stream directly to the response as well if you don't need as much control (e.g. you can just stream to the end)
+`WriteAheadStream` is `Send` and owns its file handles, so you can create a stream and hand it to a response body directly (see `test_write_ahead_stream_is_send`). Use a bounded channel if you bridge it manually so you don't bloat memory.
