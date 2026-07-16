@@ -44,9 +44,9 @@ Retention is opt-in via `RetentionOptions`: `max_total_size` deletes the oldest 
 
 ### Single writer, page-cache readers
 
-One dedicated writer thread owns the active file; callers talk to it over a channel, and `write_batch` awaits the response without blocking the async executor. Writes queued while an fsync is in flight are **group-committed**: the actor drains them into a single pwrite + fdatasync and fans replies back out, so concurrent producers coalesce automatically (~4x throughput with 8 producers in the included bench).
+One dedicated writer thread owns the active file; callers talk to it over a channel, and `write_batch` awaits the response without blocking the async executor. Writes queued while an fsync is in flight are **group-committed**: the actor drains them into a single pwrite + fdatasync and fans replies back out, so concurrent producers coalesce automatically (see `actor_concurrent_8w` in the benchmarks).
 
-Readers use positional reads (`pread`) straight from the page cache — for WAL access patterns readers mostly want recently written data, which the page cache serves far faster than any direct-IO scheme (we measured io_uring + O_DIRECT reads at ~60x slower for this workload before removing that path). Point reads speculatively fetch one small block so most records cost a single syscall; streams parse records out of 128 KiB readahead chunks.
+Readers use positional reads (`pread`) straight from the page cache — for WAL access patterns readers mostly want recently written data, which the page cache serves far better than direct-IO schemes like io_uring + O_DIRECT. Point reads speculatively fetch one small block so most records cost a single syscall; streams parse records out of 128 KiB readahead chunks.
 
 ### File format (version 2)
 
@@ -74,15 +74,17 @@ On `start()`:
 
 `cargo run --release --example bench` (writes to the current directory — don't run it on tmpfs, where fsync is free and write numbers become fiction).
 
-Numbers from a desktop NVMe/ext4 box (64B payloads):
+Snapshot from a desktop NVMe/ext4 box, 64-byte payloads:
 
-| scenario | rate | notes |
+| scenario | what it measures | rate |
 | --- | --- | --- |
-| `seq_write_1rec` | ~235/s (~4.2ms/op) | fsync-bound: one record per batch, strict ack-then-next |
-| `batch_write` (1000/batch) | ~210k records/s | one pwrite + one fdatasync per batch |
-| `read_by_id` | ~2.0M/s | point reads through the page cache |
-| `stream_replay` | ~35M/s (~2.2GB/s) | readahead streaming |
-| `actor_concurrent_8w` | ~940/s | 8 producers, group commit (~4x the serial rate) |
+| `seq_write_1rec` | one record per `write_batch`, strict ack-then-next: the floor set by one fdatasync per write | ~230/s (~4.4ms/op) |
+| `batch_write` | 1,000-record batches through `write_batch`: one pwrite + one fdatasync per batch | ~225k records/s |
+| `read_by_id` | point reads of individual records by `RecordID`, served from the page cache | ~2.1M/s |
+| `stream_replay` | full sequential replay of the log through `create_stream()` | ~34M/s (~2.1GB/s) |
+| `actor_concurrent_8w` | 8 threads each submitting single-record writes to one writer actor and awaiting their acks; queued writes share fsyncs via group commit | ~950/s |
+
+Durable-write rates are dominated by fdatasync latency, so they scale with batch/group size, not payload size — compare `seq_write_1rec` (1 record per sync) against `batch_write` (1,000 per sync) and `actor_concurrent_8w` (however many are queued per sync).
 
 ## Integrating with a thread-safe API framework (Axum, tonic, etc.)
 
