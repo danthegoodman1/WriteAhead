@@ -151,7 +151,12 @@ fn bench_actor_concurrent(dir: &std::path::Path) {
 async fn main() {
     println!(
         "writeahead bench: {} seq writes, {}x{} batch, {} threads x {} concurrent, {}B payloads",
-        SEQ_WRITES, BATCHES, BATCH_SIZE, CONCURRENT_THREADS, CONCURRENT_WRITES_PER_THREAD, PAYLOAD_LEN
+        SEQ_WRITES,
+        BATCHES,
+        BATCH_SIZE,
+        CONCURRENT_THREADS,
+        CONCURRENT_WRITES_PER_THREAD,
+        PAYLOAD_LEN
     );
 
     // Run on the real filesystem, not /tmp: tmpfs makes fsync free and

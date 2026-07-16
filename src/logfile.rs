@@ -114,6 +114,12 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Point reads speculatively fetch this much in one pread: records smaller
+/// than this cost one syscall instead of two (header, then data). Kept small
+/// because the buffer is zero-initialized per read — a large window costs
+/// more in memory traffic than the saved syscall.
+const SPECULATIVE_READ: u64 = 512;
+
 /// Reads and verifies the record at `offset`, returning the data and the
 /// offset of the next record.
 fn read_record_at<F: FileIo>(fio: &F, offset: u64, records_end: u64) -> Result<(Vec<u8>, u64)> {
@@ -127,12 +133,14 @@ fn read_record_at<F: FileIo>(fio: &F, offset: u64, records_end: u64) -> Result<(
         return Err(anyhow!(LogfileError::PartialWrite));
     }
 
-    let mut header = [0u8; RECORD_HEADER_SIZE as usize];
-    fio.read_at(offset, &mut header)
+    // One speculative pread covers the header plus (usually) the whole record
+    let first_len = (records_end - offset).min(SPECULATIVE_READ.max(RECORD_HEADER_SIZE));
+    let mut first = vec![0u8; first_len as usize];
+    fio.read_at(offset, &mut first)
         .context("Failed to read record header")?;
-    let hash1 = i64::from_le_bytes(header[0..8].try_into().unwrap());
-    let hash2 = i64::from_le_bytes(header[8..16].try_into().unwrap());
-    let length = u32::from_le_bytes(header[16..20].try_into().unwrap()) as u64;
+    let hash1 = i64::from_le_bytes(first[0..8].try_into().unwrap());
+    let hash2 = i64::from_le_bytes(first[8..16].try_into().unwrap());
+    let length = u32::from_le_bytes(first[16..20].try_into().unwrap()) as u64;
 
     // Bounds check before allocating: a corrupted length must not drive a
     // giant allocation or a read past the record region.
@@ -143,9 +151,16 @@ fn read_record_at<F: FileIo>(fio: &F, offset: u64, records_end: u64) -> Result<(
         return Err(anyhow!(LogfileError::PartialWrite));
     }
 
-    let mut data = vec![0u8; length as usize];
-    fio.read_at(data_start, &mut data)
-        .context("Failed to read record data")?;
+    let data = if RECORD_HEADER_SIZE + length <= first_len {
+        first[RECORD_HEADER_SIZE as usize..(RECORD_HEADER_SIZE + length) as usize].to_vec()
+    } else {
+        let mut data = vec![0u8; length as usize];
+        let have = (first_len - RECORD_HEADER_SIZE) as usize;
+        data[..have].copy_from_slice(&first[RECORD_HEADER_SIZE as usize..]);
+        fio.read_at(offset + first_len, &mut data[have..])
+            .context("Failed to read record data")?;
+        data
+    };
 
     let (computed1, computed2) = murmur3_128(&data);
     if computed1 != hash1 || computed2 != hash2 {
@@ -334,11 +349,29 @@ impl<F: FileIo> Logfile<F> {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Raw positional read within the file, for buffered streaming.
+    pub(crate) fn read_into(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.fio.read_at(offset, buf)
+    }
 }
 
 pub enum WriterCommand {
     Write(flume::Sender<Result<WriteResponse>>, Vec<Vec<u8>>),
     Seal(flume::Sender<Result<()>>),
+}
+
+type ReplyTx = flume::Sender<Result<WriteResponse>>;
+
+/// Stop draining a group-commit round once this many payload bytes are
+/// queued, so latency stays bounded under a firehose of writers.
+const MAX_GROUP_COMMIT_BYTES: usize = 4 * 1024 * 1024;
+
+fn batch_bytes(records: &[Vec<u8>]) -> usize {
+    records
+        .iter()
+        .map(|r| RECORD_HEADER_SIZE as usize + r.len())
+        .sum()
 }
 
 #[derive(Debug)]
@@ -399,58 +432,119 @@ impl<F: FileIo + 'static> LogFileWriter<F> {
     }
 
     fn actor_loop(mut self) {
-        while let Ok(msg) = self.recv.recv() {
-            match msg {
+        while let Ok(first) = self.recv.recv() {
+            let mut writes: Vec<(ReplyTx, Vec<Vec<u8>>)> = Vec::new();
+            let mut seal_reply = None;
+            let mut queued_bytes = 0usize;
+
+            match first {
                 WriterCommand::Write(reply, data) => {
-                    // The caller may have given up; a dropped receiver is not our error.
-                    let _ = reply.send(self.write_records(data));
+                    queued_bytes += batch_bytes(&data);
+                    writes.push((reply, data));
                 }
-                WriterCommand::Seal(reply) => {
-                    let _ = reply.send(self.seal());
+                WriterCommand::Seal(reply) => seal_reply = Some(reply),
+            }
+
+            // Group commit: drain whatever else is already queued so all
+            // pending writes share a single write+fsync. Stop at a Seal to
+            // preserve command order.
+            if seal_reply.is_none() {
+                while queued_bytes < MAX_GROUP_COMMIT_BYTES {
+                    match self.recv.try_recv() {
+                        Ok(WriterCommand::Write(reply, data)) => {
+                            queued_bytes += batch_bytes(&data);
+                            writes.push((reply, data));
+                        }
+                        Ok(WriterCommand::Seal(reply)) => {
+                            seal_reply = Some(reply);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
                 }
+            }
+
+            if !writes.is_empty() {
+                self.write_group(writes);
+            }
+            if let Some(reply) = seal_reply {
+                let _ = reply.send(self.seal());
             }
         }
         trace!("logfile {} writer actor disconnected", self.id);
     }
 
-    fn write_records(&mut self, records: Vec<Vec<u8>>) -> Result<WriteResponse> {
+    /// Encodes every queued batch into one buffer, does one write and one
+    /// fsync, then answers each caller with its own offsets.
+    fn write_group(&mut self, group: Vec<(ReplyTx, Vec<Vec<u8>>)>) {
+        // The caller may have given up on any reply; a dropped receiver is
+        // not our error, hence the ignored send results throughout.
         if self.sealed {
-            return Err(anyhow!(LogfileError::WriteToSealed));
+            for (reply, _) in group {
+                let _ = reply.send(Err(anyhow!(LogfileError::WriteToSealed)));
+            }
+            return;
         }
 
+        let mut valid: Vec<(ReplyTx, Vec<Vec<u8>>)> = Vec::with_capacity(group.len());
         let mut total = 0usize;
-        for record in &records {
-            if record.len() > u32::MAX as usize {
-                return Err(anyhow!(LogfileError::RecordTooLarge));
+        for (reply, records) in group {
+            if records.iter().any(|r| r.len() > u32::MAX as usize) {
+                let _ = reply.send(Err(anyhow!(LogfileError::RecordTooLarge)));
+                continue;
             }
-            total += RECORD_HEADER_SIZE as usize + record.len();
+            total += batch_bytes(&records);
+            valid.push((reply, records));
+        }
+        if valid.is_empty() {
+            return;
         }
 
         let mut buf = Vec::with_capacity(total);
-        let mut offsets = Vec::with_capacity(records.len());
         let mut current_offset = self.file_length;
+        let mut per_caller_offsets: Vec<Vec<u64>> = Vec::with_capacity(valid.len());
+        for (_, records) in &valid {
+            let mut offsets = Vec::with_capacity(records.len());
+            for record in records {
+                let (hash1, hash2) = murmur3_128(record);
+                offsets.push(current_offset);
+                current_offset += RECORD_HEADER_SIZE + record.len() as u64;
 
-        for record in &records {
-            let (hash1, hash2) = murmur3_128(record);
-            offsets.push(current_offset);
-            current_offset += RECORD_HEADER_SIZE + record.len() as u64;
-
-            buf.extend_from_slice(&hash1.to_le_bytes());
-            buf.extend_from_slice(&hash2.to_le_bytes());
-            buf.extend_from_slice(&(record.len() as u32).to_le_bytes());
-            buf.extend_from_slice(record);
+                buf.extend_from_slice(&hash1.to_le_bytes());
+                buf.extend_from_slice(&hash2.to_le_bytes());
+                buf.extend_from_slice(&(record.len() as u32).to_le_bytes());
+                buf.extend_from_slice(record);
+            }
+            per_caller_offsets.push(offsets);
         }
 
-        self.fio
+        let result = self
+            .fio
             .write_at(self.file_length, &buf)
-            .context("Failed to write records")?;
-        self.fio.sync().context("Failed to sync records")?;
+            .context("Failed to write records")
+            .and_then(|_| self.fio.sync().context("Failed to sync records"));
 
-        self.file_length = current_offset;
-        Ok(WriteResponse {
-            offsets,
-            file_length: current_offset,
-        })
+        match result {
+            Ok(()) => {
+                self.file_length = current_offset;
+                for ((reply, _), offsets) in valid.into_iter().zip(per_caller_offsets) {
+                    let _ = reply.send(Ok(WriteResponse {
+                        offsets,
+                        file_length: current_offset,
+                    }));
+                }
+            }
+            Err(e) => {
+                // Nothing was acknowledged: file_length stays put, so any
+                // partially written bytes are outside the record region and
+                // get truncated by recovery. anyhow::Error isn't Clone, so
+                // each caller gets its own copy of the message.
+                let msg = format!("{e:#}");
+                for (reply, _) in valid {
+                    let _ = reply.send(Err(anyhow!("{}", msg.clone())));
+                }
+            }
+        }
     }
 
     fn seal(&mut self) -> Result<()> {
@@ -475,20 +569,29 @@ impl<F: FileIo + 'static> LogFileWriter<F> {
 pub struct LogFileStream<F: FileIo> {
     logfile: Logfile<F>,
     offset: u64,
+    buf: Vec<u8>,
+    /// Absolute file offset of `buf[0]`.
+    buf_start: u64,
+    /// Last observed record-region end for unsealed files (see records_end).
+    known_end: u64,
 }
+
+/// Readahead chunk for sequential streaming: records are parsed out of this
+/// buffer instead of paying two preads per record.
+const STREAM_CHUNK: u64 = 128 * 1024;
 
 impl<F: FileIo> LogFileStream<F> {
     pub fn new(logfile: Logfile<F>) -> Self {
-        Self {
-            logfile,
-            offset: FILE_HEADER_SIZE,
-        }
+        Self::new_with_offset(logfile, FILE_HEADER_SIZE)
     }
 
     pub fn new_with_offset(logfile: Logfile<F>, offset: u64) -> Self {
         Self {
             logfile,
             offset: offset.max(FILE_HEADER_SIZE),
+            buf: Vec::new(),
+            buf_start: 0,
+            known_end: 0,
         }
     }
 
@@ -503,27 +606,80 @@ impl<F: FileIo> LogFileStream<F> {
     pub fn set_stream_offset(&mut self, offset: u64) {
         self.offset = offset.max(FILE_HEADER_SIZE);
     }
+
+    /// Record-region end. For unsealed files, only re-stats the file once
+    /// the previously observed end has been consumed.
+    fn records_end(&mut self) -> Result<u64> {
+        if self.logfile.sealed {
+            return self.logfile.records_end();
+        }
+        if self.offset < self.known_end {
+            return Ok(self.known_end);
+        }
+        self.known_end = self.logfile.records_end()?;
+        Ok(self.known_end)
+    }
+
+    /// Makes `buf` cover `[start, start + need)`. The caller must have
+    /// checked that the range lies within the record region.
+    fn ensure_buffered(&mut self, start: u64, need: u64, records_end: u64) -> Result<()> {
+        let have_end = self.buf_start + self.buf.len() as u64;
+        if start >= self.buf_start && start + need <= have_end {
+            return Ok(());
+        }
+        let read_len = need.max((records_end - start).min(STREAM_CHUNK));
+        self.buf.resize(read_len as usize, 0);
+        self.logfile.read_into(start, &mut self.buf)?;
+        self.buf_start = start;
+        Ok(())
+    }
+
+    fn next_record(&mut self) -> Result<Option<Vec<u8>>> {
+        let records_end = self.records_end()?;
+        if self.offset >= records_end {
+            return Ok(None);
+        }
+        if self.offset + RECORD_HEADER_SIZE > records_end {
+            return Err(anyhow!(LogfileError::PartialWrite));
+        }
+
+        self.ensure_buffered(self.offset, RECORD_HEADER_SIZE, records_end)?;
+        let base = (self.offset - self.buf_start) as usize;
+        let hash1 = i64::from_le_bytes(self.buf[base..base + 8].try_into().unwrap());
+        let hash2 = i64::from_le_bytes(self.buf[base + 8..base + 16].try_into().unwrap());
+        let length = u32::from_le_bytes(self.buf[base + 16..base + 20].try_into().unwrap()) as u64;
+
+        let data_end = self
+            .offset
+            .checked_add(RECORD_HEADER_SIZE + length)
+            .ok_or(LogfileError::PartialWrite)?;
+        if data_end > records_end {
+            return Err(anyhow!(LogfileError::PartialWrite));
+        }
+
+        // May refill (and move) the buffer, so recompute the base offset
+        self.ensure_buffered(self.offset, RECORD_HEADER_SIZE + length, records_end)?;
+        let base = (self.offset - self.buf_start) as usize;
+        let data_base = base + RECORD_HEADER_SIZE as usize;
+        let data = self.buf[data_base..data_base + length as usize].to_vec();
+
+        let (computed1, computed2) = murmur3_128(&data);
+        if computed1 != hash1 || computed2 != hash2 {
+            return Err(anyhow!(LogfileError::Corrupted));
+        }
+
+        self.offset = data_end;
+        Ok(Some(data))
+    }
 }
 
 impl<F: FileIo> Stream for LogFileStream<F> {
     type Item = Result<Vec<u8>>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
-        let records_end = match this.logfile.records_end() {
-            Ok(end) => end,
-            Err(e) => return Poll::Ready(Some(Err(e))),
-        };
-        if this.offset >= records_end {
-            return Poll::Ready(None);
-        }
-
-        match this.logfile.read_record_and_next(this.offset) {
-            Ok((record, next)) => {
-                this.offset = next;
-                Poll::Ready(Some(Ok(record)))
-            }
+        match self.get_mut().next_record() {
+            Ok(Some(record)) => Poll::Ready(Some(Ok(record))),
+            Ok(None) => Poll::Ready(None),
             Err(e) => Poll::Ready(Some(Err(e))),
         }
     }

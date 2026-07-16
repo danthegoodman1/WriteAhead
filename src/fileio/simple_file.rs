@@ -43,7 +43,9 @@ impl FileIo for SimpleFile {
     }
 
     fn sync(&mut self) -> Result<()> {
-        self.fd.sync_all().context("Failed to fsync")?;
+        // fdatasync: flushes data and the metadata needed to read it back
+        // (including file size), skipping timestamp-only metadata updates.
+        self.fd.sync_data().context("Failed to fdatasync")?;
         Ok(())
     }
 
