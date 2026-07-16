@@ -1,34 +1,33 @@
 use std::path::Path;
 
 use anyhow::Result;
-use std::future::Future;
 
-/// A trait for file operations.
+/// Positional, synchronous file IO.
 ///
-/// # Why
+/// # Why a trait
 ///
-/// Abstracting this to a trait has a few benefits:
+/// 1. Lets tests substitute fault-injecting or in-memory implementations.
+/// 2. Lets integrators add use-case specific behavior (write-through caching,
+///    custom placement, etc.) without forking the crate.
 ///
-/// 1. Can easily integrate into any storage system, like io_uring for linux
-/// 2. Allows developers to create custom implementations with various use-case specific optimizations such as pre-fetching for iterators and batching
-/// 3. Allows for customization like write-through caching, or prefetching for iterators
-pub trait FileWriter
+/// All reads and writes are positional (pread/pwrite style) so a single
+/// handle can serve concurrent readers without a shared cursor. `write_at`
+/// does not flush: callers that need durability must call `sync`, which is
+/// what lets the log writer batch many writes under one fsync.
+#[allow(clippy::len_without_is_empty)]
+pub trait FileIo
 where
     Self: Sized + Send + Sync + std::fmt::Debug,
 {
-    fn open(path: &Path) -> impl Future<Output = Result<Self>> + Send;
-    fn write(&mut self, offset: u64, data: &[u8]) -> Result<()>;
-    fn file_length(&self) -> u64;
+    fn open(path: &Path) -> Result<Self>;
+    /// Read exactly `buf.len()` bytes at `offset`. Errors if the file is too short.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
+    /// Write all of `data` at `offset`. Durability requires a subsequent `sync`.
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<()>;
+    /// Flush written data (and the metadata needed to read it back) to disk.
+    fn sync(&mut self) -> Result<()>;
+    fn len(&self) -> Result<u64>;
+    fn set_len(&mut self, len: u64) -> Result<()>;
 }
 
-pub trait FileReader
-where
-    Self: Sized + Send + Sync + std::fmt::Debug,
-{
-    fn open(path: &Path) -> impl Future<Output = Result<Self>> + Send;
-    fn read(&self, offset: u64, size: u64) -> impl Future<Output = Result<Vec<u8>>> + Send;
-    fn file_length(&self) -> u64;
-}
-
-pub mod io_uring;
 pub mod simple_file;
