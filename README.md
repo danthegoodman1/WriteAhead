@@ -12,35 +12,55 @@ A great component for a (distributed) data store. For distributed usage, conside
 4. **Stable addressing** — `RecordID { file_id, file_offset }` stays valid for the life of the file (until retention deletes it).
 5. **Sequential streaming** — a stream replays all records across files in write order.
 
-## Usage
+## Quickstart
+
+Not yet on crates.io — add it as a git dependency:
+
+```toml
+[dependencies]
+writeahead = { git = "https://github.com/danthegoodman1/WriteAhead" }
+anyhow = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "macros"] }
+```
+
+The full program below lives at [`examples/quickstart.rs`](examples/quickstart.rs) and runs with `cargo run --example quickstart`:
 
 ```rust
-use std::sync::Arc;
-use writeahead::{WriteAhead, WriteAheadOptions, SimpleFile};
-
-let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
-    log_dir: "./write_ahead".into(),
-    ..Default::default()
-});
-wal.start()?; // recovers existing state, must crash on error
-let wal = Arc::new(wal); // WriteAhead is Sync: share it directly
-
-// Durable writes from any task or thread: clone a WriteHandle per
-// producer. Writes that arrive while an fsync is in flight coalesce
-// into one group commit automatically.
-let handle = wal.writer()?;
-let id = handle.write(b"hello".to_vec()).await?;
-let ids = handle.write_batch(vec![b"a".to_vec(), b"b".to_vec()]).await?;
-
-// Point read by address
-let record = wal.read(id.file_id, id.file_offset)?;
-
-// Full replay
 use futures::StreamExt;
-let mut stream = wal.create_stream()?;
-while let Some(record) = stream.next().await {
-    let record = record?;
-    // ...
+use std::sync::Arc;
+use writeahead::{SimpleFile, WriteAhead, WriteAheadOptions};
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> anyhow::Result<()> {
+    let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
+        log_dir: "./write_ahead".into(),
+        ..Default::default()
+    });
+    wal.start()?; // recovers existing state; if this errors, crash
+    let wal = Arc::new(wal); // WriteAhead is Sync: share it directly
+
+    // Durable writes from any task or thread: clone a WriteHandle per
+    // producer. Writes that arrive while an fsync is in flight coalesce
+    // into one group commit automatically.
+    let handle = wal.writer()?;
+    let id = handle.write(b"hello".to_vec()).await?;
+    let more = handle
+        .write_batch(vec![b"a".to_vec(), b"b".to_vec()])
+        .await?;
+    println!("wrote {:?} and {:?}", id, more);
+
+    // Point read by address
+    let record = wal.read(id.file_id, id.file_offset)?;
+    assert_eq!(record, b"hello");
+
+    // Full replay, oldest record first
+    let mut stream = wal.create_stream()?;
+    while let Some(record) = stream.next().await {
+        println!("replayed {} bytes", record?.len());
+    }
+
+    Ok(())
 }
 ```
 
