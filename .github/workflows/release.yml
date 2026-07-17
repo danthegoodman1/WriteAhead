@@ -1,13 +1,23 @@
 name: Release
 
-# Publishes to crates.io when a v* tag is pushed, via crates.io Trusted
-# Publishing (OIDC — no long-lived token secret). One-time setup after the
-# first manual publish: crates.io -> writeahead -> Settings -> Trusted
-# Publishing -> GitHub: danthegoodman1/WriteAhead, workflow release.yml.
+# Publishes to crates.io via Trusted Publishing (OIDC — no long-lived token
+# secret). Runs when a v* tag is pushed, or as a reusable workflow from
+# bump.yml (tags pushed by a workflow's GITHUB_TOKEN don't trigger tag
+# workflows, so the bump path calls this directly).
+#
+# crates.io setup: writeahead -> Settings -> Trusted Publishing -> GitHub:
+# danthegoodman1/WriteAhead with workflow release.yml, and a second entry
+# for bump.yml (the OIDC claim names the top-level workflow).
 
 on:
   push:
     tags: ["v*"]
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to release (the tag created by the bump workflow)
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +30,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || '' }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -39,8 +51,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || '' }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
         run: |
           crate_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           tag_version="${GITHUB_REF_NAME#v}"

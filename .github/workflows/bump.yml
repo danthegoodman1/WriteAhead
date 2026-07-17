@@ -1,0 +1,75 @@
+name: Bump & Release
+
+# One-click releasing: Actions -> Bump & Release -> Run workflow -> pick a
+# bump level. This bumps Cargo.toml, verifies the chosen level actually
+# covers the public-API diff since the last published release
+# (cargo-semver-checks — a breaking change can't sneak out as a patch),
+# commits and tags on main, then runs the release workflow (test matrix ->
+# trusted publishing). If any step fails, nothing is pushed or published.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump to apply
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compute new version
+        id: version
+        run: |
+          current=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          IFS=. read -r major minor patch <<< "$current"
+          case "${{ inputs.bump }}" in
+            major) new="$((major + 1)).0.0" ;;
+            minor) new="${major}.$((minor + 1)).0" ;;
+            patch) new="${major}.${minor}.$((patch + 1))" ;;
+          esac
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "tag=v$new" >> "$GITHUB_OUTPUT"
+          echo "Bumping $current -> $new"
+      - name: Apply version
+        run: |
+          sed -i "0,/^version = \"${{ steps.version.outputs.current }}\"/s//version = \"${{ steps.version.outputs.new }}\"/" Cargo.toml
+          cargo update --workspace
+          grep -m1 '^version' Cargo.toml
+      - name: Verify bump level covers the API diff since the last release
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): ${{ steps.version.outputs.tag }}"
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin main "refs/tags/${{ steps.version.outputs.tag }}"
+
+  release:
+    needs: bump
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/release.yml
+    with:
+      ref: ${{ needs.bump.outputs.tag }}
