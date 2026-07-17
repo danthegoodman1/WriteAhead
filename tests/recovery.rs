@@ -24,7 +24,7 @@ async fn collect_stream(wal: &WriteAhead<SimpleFile>) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut stream = wal.create_stream().unwrap();
     while let Some(r) = stream.next().await {
-        out.push(r.unwrap());
+        out.push(r.unwrap().1);
     }
     out
 }

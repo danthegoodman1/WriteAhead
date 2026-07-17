@@ -24,6 +24,14 @@ use crate::write_ahead::{WriteAheadError, WriteAheadOptions};
 
 pub(crate) enum WriterCommand {
     Write(flume::Sender<Result<WriteAck>>, Vec<Vec<u8>>),
+    Trim(flume::Sender<TrimStats>, u64),
+}
+
+/// What an explicit [WriteHandle::trim_before] call deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrimStats {
+    pub files_deleted: u64,
+    pub bytes_reclaimed: u64,
 }
 
 #[derive(Debug)]
@@ -85,6 +93,27 @@ impl WriteHandle {
             .iter()
             .map(|offset| RecordID::new(ack.file_id, *offset))
             .collect())
+    }
+
+    /// Deletes every sealed log file with id strictly below `file_id`,
+    /// reclaiming disk space the consumer no longer needs — e.g. once a
+    /// replay high-water mark has moved past a rotated file, or after an
+    /// explicit compaction rewrote its live records. The active file and
+    /// records at or above `file_id` are never touched.
+    ///
+    /// Resolves after the files are gone; failures to delete individual
+    /// files are logged and skipped (retryable). Streams created before the
+    /// trim keep their open file handles and finish undisturbed; new reads
+    /// into trimmed files return `LogfileNotFound`.
+    pub async fn trim_before(&self, file_id: u64) -> Result<TrimStats> {
+        let (tx, rx) = flume::bounded(1);
+        self.tx
+            .send(WriterCommand::Trim(tx, file_id))
+            .map_err(|_| WriteAheadError::WriterClosed)?;
+        Ok(rx
+            .recv_async()
+            .await
+            .map_err(|_| WriteAheadError::WriterClosed)?)
     }
 }
 
@@ -172,11 +201,18 @@ impl<F: FileIo + 'static> WalWriter<F> {
     fn actor_loop(mut self) {
         while let Ok(first) = self.recv.recv() {
             let mut writes: Vec<(ReplyTx, Vec<Vec<u8>>)> = Vec::new();
+            // Trims drained alongside writes run after the commit, so a trim
+            // submitted after a write never races that write's file.
+            let mut trims: Vec<(flume::Sender<TrimStats>, u64)> = Vec::new();
             let mut queued_bytes = 0usize;
 
-            let WriterCommand::Write(reply, data) = first;
-            queued_bytes += batch_bytes(&data);
-            writes.push((reply, data));
+            match first {
+                WriterCommand::Write(reply, data) => {
+                    queued_bytes += batch_bytes(&data);
+                    writes.push((reply, data));
+                }
+                WriterCommand::Trim(reply, upto) => trims.push((reply, upto)),
+            }
 
             // Group commit: drain whatever else is already queued so all
             // pending writes share a single write+fsync.
@@ -186,11 +222,17 @@ impl<F: FileIo + 'static> WalWriter<F> {
                         queued_bytes += batch_bytes(&data);
                         writes.push((reply, data));
                     }
+                    Ok(WriterCommand::Trim(reply, upto)) => trims.push((reply, upto)),
                     Err(_) => break,
                 }
             }
 
-            self.commit_group(writes);
+            if !writes.is_empty() {
+                self.commit_group(writes);
+            }
+            for (reply, upto) in trims {
+                let _ = reply.send(self.trim_before(upto));
+            }
 
             // Rotation failure is not fatal: the current file keeps
             // accepting writes and rotation retries on the next commit.
@@ -361,22 +403,47 @@ impl<F: FileIo + 'static> WalWriter<F> {
             }
         }
 
+        self.delete_files(doomed, "retention");
+    }
+
+    /// Deletes every sealed file with id strictly below `upto`. The active
+    /// file is never deleted; a non-active file that missed its seal (failed
+    /// rotation) is skipped until recovery heals it.
+    fn trim_before(&mut self, upto: u64) -> TrimStats {
+        let doomed: Vec<u64> = self
+            .files
+            .iter()
+            .filter(|(id, meta)| {
+                **id < upto && **id != self.file_id && meta.seal_timestamp_ms.is_some()
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        self.delete_files(doomed, "trim")
+    }
+
+    /// Removes files from disk and the registry, notifying the read side.
+    /// Per-file failures are logged and the file is kept (retryable).
+    fn delete_files(&mut self, doomed: Vec<u64>, why: &str) -> TrimStats {
+        let mut stats = TrimStats::default();
         if doomed.is_empty() {
-            return;
+            return stats;
         }
         for id in doomed {
             if let Some(meta) = self.files.remove(&id) {
-                debug!("retention: deleting logfile {}", id);
+                debug!("{}: deleting logfile {}", why, id);
                 if let Err(e) = std::fs::remove_file(&meta.path) {
-                    warn!("retention: failed to delete {}: {e}", meta.path.display());
+                    warn!("{}: failed to delete {}: {e}", why, meta.path.display());
                     self.files.insert(id, meta);
                     continue;
                 }
+                stats.files_deleted += 1;
+                stats.bytes_reclaimed += meta.size;
                 let _ = self.events.send(WriterEvent::Deleted(id));
             }
         }
         if let Err(e) = sync_dir(&self.options.log_dir) {
-            warn!("retention: failed to sync log dir: {e:#}");
+            warn!("{}: failed to sync log dir: {e:#}", why);
         }
+        stats
     }
 }

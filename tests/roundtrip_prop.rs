@@ -41,13 +41,18 @@ proptest! {
                 prop_assert_eq!(&got, want);
             }
 
-            // Full stream replay
+            // Full stream replay must yield the same data AND the same
+            // addresses the writes were acknowledged with
             let mut stream = wal.create_stream().unwrap();
             let mut got = Vec::new();
+            let mut got_ids = Vec::new();
             while let Some(r) = stream.next().await {
-                got.push(r.unwrap());
+                let (id, data) = r.unwrap();
+                got_ids.push(id);
+                got.push(data);
             }
             prop_assert_eq!(got, expected);
+            prop_assert_eq!(got_ids, ids);
             Ok(())
         })?;
     }

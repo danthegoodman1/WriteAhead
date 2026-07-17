@@ -100,7 +100,7 @@ async fn bench_stream_replay(wal: &WriteAhead<SimpleFile>, expected: usize) {
     let mut stream = wal.create_stream().unwrap();
     let mut n = 0usize;
     while let Some(r) = stream.next().await {
-        n += r.unwrap().len();
+        n += r.unwrap().1.len();
     }
     assert_eq!(n, expected * PAYLOAD_LEN);
     report(
