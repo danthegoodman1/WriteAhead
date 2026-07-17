@@ -1,9 +1,10 @@
 name: Release
 
 # Publishes to crates.io via Trusted Publishing (OIDC — no long-lived token
-# secret). Runs when a v* tag is pushed, or as a reusable workflow from
-# bump.yml (tags pushed by a workflow's GITHUB_TOKEN don't trigger tag
-# workflows, so the bump path calls this directly).
+# secret). Runs when a v* tag is pushed, as a reusable workflow from bump.yml
+# (tags pushed by a workflow's GITHUB_TOKEN don't trigger tag workflows, so
+# the bump path calls this directly), or manually via workflow_dispatch to
+# (re-)release an existing tag whose publish never landed.
 #
 # crates.io setup: writeahead -> Settings -> Trusted Publishing -> GitHub:
 # danthegoodman1/WriteAhead with workflow release.yml, and a second entry
@@ -16,6 +17,12 @@ on:
     inputs:
       ref:
         description: Git ref to release (the tag created by the bump workflow)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Existing v* tag to release (publish is skipped if that version is already on crates.io)
         required: true
         type: string
 

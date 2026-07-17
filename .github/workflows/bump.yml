@@ -1,10 +1,15 @@
 name: Auto Release
 
-# Auto-release on every green CI run on main (durust-style), with a semver
-# safety net: the bump level defaults to "auto" — start at patch and escalate
+# Auto-release on every push to main (durust-style), with a semver safety
+# net: the bump level defaults to "auto" — start at patch and escalate
 # (patch -> minor -> major) until cargo-semver-checks agrees the level covers
 # the public-API diff since the last published release. A breaking change
 # auto-releases as 0.(x+1).0 instead of sneaking out as a patch.
+#
+# This triggers on push directly (not workflow_run chained off CI) because
+# crates.io Trusted Publishing rejects workflow_run-triggered workflows; the
+# bump job runs the tests itself before tagging, and release.yml runs the
+# full matrix again before publishing.
 #
 # Controls, via the head commit message (PR title, for squash merges):
 #   "#major" / "#minor"  force a bump level (fails if it can't cover the diff)
@@ -12,14 +17,12 @@ name: Auto Release
 # Manual runs (Actions -> Auto Release -> Run workflow) can also force a level.
 #
 # The chore(release) commit and tag are pushed with GITHUB_TOKEN, which never
-# triggers CI, so this can't loop. Publishing happens in the called
+# triggers workflows, so this can't loop. Publishing happens in the called
 # release.yml, but the OIDC claim names the top-level workflow — crates.io
 # Trusted Publishing must list this file (bump.yml) as a workflow.
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
+  push:
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -40,7 +43,6 @@ concurrency:
 
 jobs:
   bump:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -56,7 +58,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           INPUT_BUMP: ${{ inputs.bump }}
-          HEAD_MSG: ${{ github.event.workflow_run.head_commit.message }}
+          HEAD_MSG: ${{ github.event.head_commit.message }}
         run: |
           if [ "$EVENT" = "workflow_dispatch" ]; then
             level="$INPUT_BUMP"
@@ -82,10 +84,15 @@ jobs:
           echo "Bump level: $level"
       - uses: dtolnay/rust-toolchain@stable
         if: steps.decide.outputs.release == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.decide.outputs.release == 'true'
       - uses: taiki-e/install-action@v2
         if: steps.decide.outputs.release == 'true'
         with:
           tool: cargo-semver-checks
+      - name: Test before tagging (full matrix runs again before publish)
+        if: steps.decide.outputs.release == 'true'
+        run: cargo test
       - name: Bump version, escalating until the level covers the API diff
         id: version
         if: steps.decide.outputs.release == 'true'
