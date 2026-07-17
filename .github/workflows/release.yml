@@ -61,8 +61,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || '' }}
       - uses: dtolnay/rust-toolchain@stable
+      # workflow_call children inherit the caller's event context, so a
+      # push-to-main auto-release also reports event_name == 'push'; only a
+      # real tag push (ref_type == 'tag') has a tag name to verify against.
       - name: Verify tag matches Cargo.toml version
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: |
           crate_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           tag_version="${GITHUB_REF_NAME#v}"
