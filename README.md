@@ -155,6 +155,19 @@ Snapshot from a desktop NVMe/ext4 box, 64-byte payloads:
 
 Durable-write rates are dominated by fdatasync latency, so they scale with batch/group size, not payload size — compare `seq_write_1rec` (1 record per sync) against `batch_write` (1,000 per sync) and `handle_concurrent_8w` (however many are queued per sync).
 
+### Throughput scales with in-flight writes
+
+`handle_concurrent_8w` is not a ceiling — it's the throughput of exactly 8 in-flight writers. Group commit converts *concurrency* into batch size: every write queued while an fsync is in flight rides the next one, so single-record `handle.write()` calls (each individually fsync'd before its ack) scale with the number of concurrent writers. Measured on the same box:
+
+| concurrent writers | durable writes/s |
+| --- | --- |
+| 8 | ~950 |
+| 64 | ~7.2k |
+| 512 | ~79k |
+| 2,048 | ~290k |
+
+Per-write latency stays at flush scale (a few ms) throughout — concurrency buys throughput, never latency. If your data already arrives in batches, `write_batch` is the same lever with bigger settings: ~760k records/s at 4,096-record batches and ~2M records/s at 16,384 on this disk, every record fsync'd before ack.
+
 ## Integrating with a thread-safe API framework (Axum, tonic, etc.)
 
 Put the started `WriteAhead` in an `Arc` and share it — it's `Sync`. Clone a `WriteHandle` into each request handler (or once into your app state) and call `handle.write(...)` directly; there is no owner task to build and no upstream batching needed, because writes that arrive while a commit is in flight coalesce into the next group commit automatically.
