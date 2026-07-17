@@ -1,21 +1,35 @@
-name: Bump & Release
+name: Auto Release
 
-# One-click releasing: Actions -> Bump & Release -> Run workflow -> pick a
-# bump level. This bumps Cargo.toml, verifies the chosen level actually
-# covers the public-API diff since the last published release
-# (cargo-semver-checks — a breaking change can't sneak out as a patch),
-# commits and tags on main, then runs the release workflow (test matrix ->
-# trusted publishing). If any step fails, nothing is pushed or published.
+# Auto-release on every green CI run on main (durust-style), with a semver
+# safety net: the bump level defaults to "auto" — start at patch and escalate
+# (patch -> minor -> major) until cargo-semver-checks agrees the level covers
+# the public-API diff since the last published release. A breaking change
+# auto-releases as 0.(x+1).0 instead of sneaking out as a patch.
+#
+# Controls, via the head commit message (PR title, for squash merges):
+#   "#major" / "#minor"  force a bump level (fails if it can't cover the diff)
+#   "[skip release]"     skip releasing this push
+# Manual runs (Actions -> Auto Release -> Run workflow) can also force a level.
+#
+# The chore(release) commit and tag are pushed with GITHUB_TOKEN, which never
+# triggers CI, so this can't loop. Publishing happens in the called
+# release.yml, but the OIDC claim names the top-level workflow — crates.io
+# Trusted Publishing must list this file (bump.yml) as a workflow.
 
 on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       bump:
-        description: Version bump to apply
+        description: Version bump (auto = patch, escalated if the API diff demands more)
         required: true
-        default: patch
+        default: auto
         type: choice
         options:
+          - auto
           - patch
           - minor
           - major
@@ -26,38 +40,93 @@ concurrency:
 
 jobs:
   bump:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     outputs:
+      release: ${{ steps.version.outputs.release }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
+      - name: Decide bump level
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_BUMP: ${{ inputs.bump }}
+          HEAD_MSG: ${{ github.event.workflow_run.head_commit.message }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            level="$INPUT_BUMP"
+          else
+            case "$HEAD_MSG" in
+              "chore(release):"*)
+                echo "Release commit; skipping"
+                echo "release=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+            if grep -qF '[skip release]' <<< "$HEAD_MSG"; then
+              echo "[skip release] marker; skipping"
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            level=auto
+            grep -qF '#minor' <<< "$HEAD_MSG" && level=minor
+            grep -qF '#major' <<< "$HEAD_MSG" && level=major
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "level=$level" >> "$GITHUB_OUTPUT"
+          echo "Bump level: $level"
       - uses: dtolnay/rust-toolchain@stable
-      - name: Compute new version
+        if: steps.decide.outputs.release == 'true'
+      - uses: taiki-e/install-action@v2
+        if: steps.decide.outputs.release == 'true'
+        with:
+          tool: cargo-semver-checks
+      - name: Bump version, escalating until the level covers the API diff
         id: version
+        if: steps.decide.outputs.release == 'true'
         run: |
           current=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           IFS=. read -r major minor patch <<< "$current"
-          case "${{ inputs.bump }}" in
-            major) new="$((major + 1)).0.0" ;;
-            minor) new="${major}.$((minor + 1)).0" ;;
-            patch) new="${major}.${minor}.$((patch + 1))" ;;
+          next() {
+            case "$1" in
+              major) echo "$((major + 1)).0.0" ;;
+              minor) echo "${major}.$((minor + 1)).0" ;;
+              patch) echo "${major}.${minor}.$((patch + 1))" ;;
+            esac
+          }
+          case "${{ steps.decide.outputs.level }}" in
+            auto) candidates="patch minor major" ;;
+            *) candidates="${{ steps.decide.outputs.level }}" ;;
           esac
-          echo "current=$current" >> "$GITHUB_OUTPUT"
+          chosen=""
+          for level in $candidates; do
+            new=$(next "$level")
+            echo "::group::Trying $level: $current -> $new"
+            sed -i "0,/^version = \"${current}\"/s//version = \"${new}\"/" Cargo.toml
+            cargo update --workspace
+            if cargo semver-checks check-release; then
+              chosen="$level"
+              echo "::endgroup::"
+              break
+            fi
+            echo "::endgroup::"
+            git checkout -- Cargo.toml Cargo.lock
+          done
+          if [ -z "$chosen" ]; then
+            echo "::error::None of [$candidates] covers the public-API diff since the last published release" >&2
+            exit 1
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
           echo "new=$new" >> "$GITHUB_OUTPUT"
           echo "tag=v$new" >> "$GITHUB_OUTPUT"
-          echo "Bumping $current -> $new"
-      - name: Apply version
-        run: |
-          sed -i "0,/^version = \"${{ steps.version.outputs.current }}\"/s//version = \"${{ steps.version.outputs.new }}\"/" Cargo.toml
-          cargo update --workspace
-          grep -m1 '^version' Cargo.toml
-      - name: Verify bump level covers the API diff since the last release
-        uses: obi1kenobi/cargo-semver-checks-action@v2
+          echo "Releasing $current -> $new ($chosen)"
       - name: Commit and tag
+        if: steps.decide.outputs.release == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -67,6 +136,7 @@ jobs:
 
   release:
     needs: bump
+    if: needs.bump.outputs.release == 'true'
     permissions:
       id-token: write
       contents: read
