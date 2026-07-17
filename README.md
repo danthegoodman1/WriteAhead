@@ -14,15 +14,15 @@ A great component for a (distributed) data store. For distributed usage, conside
 
 ## Quickstart
 
-Not yet on crates.io — add it as a git dependency:
-
 ```toml
 [dependencies]
-writeahead = { git = "https://github.com/danthegoodman1/WriteAhead" }
+writeahead = "0.2"
 anyhow = "1"
 futures = "0.3"
 tokio = { version = "1", features = ["rt", "macros"] }
 ```
+
+(Or track main directly: `writeahead = { git = "https://github.com/danthegoodman1/WriteAhead" }`.)
 
 The full program below lives at [`examples/quickstart.rs`](examples/quickstart.rs) and runs with `cargo run --example quickstart`:
 

@@ -2,6 +2,13 @@
 name = "writeahead"
 version = "0.2.0"
 edition = "2021"
+description = "A partitioned write-ahead log (WAL) for building append-only, high-throughput durability systems"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/danthegoodman1/WriteAhead"
+readme = "README.md"
+keywords = ["wal", "write-ahead-log", "durability", "log", "storage"]
+categories = ["database-implementations", "filesystem"]
+exclude = [".github/", ".devcontainer/", ".vscode/"]
 
 [dependencies]
 anyhow = "1.0.95"
