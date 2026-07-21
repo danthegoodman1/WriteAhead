@@ -31,6 +31,9 @@ where
     /// Flush written data (and the metadata needed to read it back) to disk.
     fn sync(&mut self) -> Result<()>;
     fn len(&self) -> Result<u64>;
+    /// Changes the physical file length. The writer uses growth as sparse
+    /// preallocation and shrinkage to remove allocation tails during recovery
+    /// and sealing.
     fn set_len(&mut self, len: u64) -> Result<()>;
 }
 

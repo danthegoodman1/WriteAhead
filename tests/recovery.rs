@@ -3,7 +3,11 @@
 //! WAL where every acknowledged record is readable and new writes work.
 
 use futures::StreamExt;
-use writeahead::logfile::{recover_and_seal, FILE_HEADER_SIZE, FOOTER_SIZE};
+use writeahead::logfile::{
+    recover_and_seal, FILE_HEADER_SIZE, FOOTER_SIZE, FORMAT_VERSION, MAGIC_NUMBER,
+    RECORD_HEADER_SIZE,
+};
+use writeahead::write_ahead::WriteAheadError;
 use writeahead::{SimpleFile, WriteAhead, WriteAheadOptions};
 
 fn opts(dir: &std::path::Path) -> WriteAheadOptions {
@@ -11,6 +15,20 @@ fn opts(dir: &std::path::Path) -> WriteAheadOptions {
         log_dir: dir.to_path_buf(),
         ..Default::default()
     }
+}
+
+fn create_max_id_active(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
+        log_dir: dir.to_path_buf(),
+        preallocation_chunk_size: None,
+        ..Default::default()
+    });
+    wal.start().unwrap();
+    drop(wal);
+    let source = dir.join("0000000000.log");
+    let target = dir.join(format!("{}.log", u64::MAX));
+    std::fs::rename(source, &target).unwrap();
+    target
 }
 
 async fn write_str(wal: &WriteAhead<SimpleFile>, s: &str) -> writeahead::RecordID {
@@ -85,14 +103,15 @@ async fn crash_mid_record_truncates_torn_tail() {
     let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
     wal.start().unwrap();
     let id1 = write_str(&wal, "acknowledged").await;
-    write_str(&wal, "will be torn").await;
+    let id2 = write_str(&wal, "will be torn").await;
     drop(wal);
 
-    // Tear the last record mid-write
+    // Tear the last record mid-write. The physical EOF is an allocation
+    // window, so truncate relative to the record's logical end.
     let path = dir.path().join("0000000000.log");
-    let len = std::fs::metadata(&path).unwrap().len();
+    let logical_end = id2.file_offset + RECORD_HEADER_SIZE + b"will be torn".len() as u64;
     let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-    f.set_len(len - 5).unwrap();
+    f.set_len(logical_end - 5).unwrap();
 
     let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
     wal.start().unwrap();
@@ -139,6 +158,68 @@ async fn crash_before_header_heals_empty_active_file() {
         b"in file zero"
     );
     assert_eq!(collect_stream(&wal).await.len(), 2);
+}
+
+#[tokio::test]
+async fn full_reserved_header_without_valid_slot_is_reinitialized() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("0000000000.log");
+    let mut torn = vec![0u8; FILE_HEADER_SIZE as usize];
+    torn[0..8].copy_from_slice(&MAGIC_NUMBER);
+    torn[8] = FORMAT_VERSION;
+    std::fs::write(&path, torn).unwrap();
+
+    let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
+    wal.start().unwrap();
+    let id = write_str(&wal, "after torn header").await;
+    assert_eq!(id.file_id, 0);
+    assert_eq!(id.file_offset, FILE_HEADER_SIZE);
+    assert_eq!(
+        wal.read(id.file_id, id.file_offset).unwrap(),
+        b"after torn header"
+    );
+}
+
+#[tokio::test]
+async fn max_file_id_stream_exhaustion_and_writer_rotation_are_controlled() {
+    let dir = tempfile::tempdir().unwrap();
+    create_max_id_active(dir.path());
+    let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
+        log_dir: dir.path().to_path_buf(),
+        max_file_size: FILE_HEADER_SIZE - 1,
+        preallocation_chunk_size: None,
+        ..Default::default()
+    });
+    wal.start().unwrap();
+
+    // Exhausting a stream at u64::MAX must not overflow while looking for a
+    // successor file.
+    let mut stream = wal.create_stream().unwrap();
+    assert!(stream.next().await.is_none());
+
+    // An oversized first group is acknowledged in the empty file. Subsequent
+    // rotation cannot allocate max+1 and returns a controlled error.
+    let first = write_str(&wal, "fills tiny max").await;
+    assert_eq!(first.file_id, u64::MAX);
+    let err = wal
+        .write_batch(vec![b"needs rotation".to_vec()])
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("Log file id space exhausted"));
+}
+
+#[test]
+fn sealed_max_file_id_fails_start_without_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = create_max_id_active(dir.path());
+    recover_and_seal::<SimpleFile>(&path, 1).unwrap();
+
+    let mut wal = WriteAhead::<SimpleFile>::with_options(opts(dir.path()));
+    let err = wal.start().unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<WriteAheadError>(),
+        Some(WriteAheadError::FileIdExhausted)
+    ));
 }
 
 #[tokio::test]

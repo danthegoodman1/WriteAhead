@@ -3,6 +3,7 @@
 
 use futures::StreamExt;
 use proptest::prelude::*;
+use writeahead::logfile::FILE_HEADER_SIZE;
 use writeahead::{SimpleFile, WriteAhead, WriteAheadOptions};
 
 proptest! {
@@ -23,7 +24,7 @@ proptest! {
             let dir = tempfile::tempdir().unwrap();
             let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
                 log_dir: dir.path().to_path_buf(),
-                max_file_size: 512, // force rotations
+                max_file_size: FILE_HEADER_SIZE + 512, // force rotations
                 ..Default::default()
             });
             wal.start().unwrap();

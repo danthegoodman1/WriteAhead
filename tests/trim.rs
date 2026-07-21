@@ -3,12 +3,13 @@
 //! result survives restart.
 
 use futures::StreamExt;
+use writeahead::logfile::FILE_HEADER_SIZE;
 use writeahead::{SimpleFile, WriteAhead, WriteAheadOptions};
 
 fn rotating_wal(dir: &std::path::Path, max_file_size: u64) -> WriteAhead<SimpleFile> {
     WriteAhead::with_options(WriteAheadOptions {
         log_dir: dir.to_path_buf(),
-        max_file_size,
+        max_file_size: FILE_HEADER_SIZE + max_file_size,
         ..Default::default()
     })
 }
@@ -88,7 +89,10 @@ async fn trim_never_deletes_the_active_file() {
         .write_batch(vec![b"still alive".to_vec()])
         .await
         .unwrap()[0];
-    assert_eq!(id.file_id, remaining[0]);
+    assert!(
+        id.file_id >= remaining[0],
+        "a full active file may rotate before this write"
+    );
     assert_eq!(
         wal.read(id.file_id, id.file_offset).unwrap(),
         b"still alive"

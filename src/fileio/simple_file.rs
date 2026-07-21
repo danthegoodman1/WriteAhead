@@ -65,7 +65,7 @@ impl FileIo for SimpleFile {
     fn set_len(&mut self, len: u64) -> Result<()> {
         self.fd
             .set_len(len)
-            .with_context(|| format!("Failed to truncate file to {}", len))?;
+            .with_context(|| format!("Failed to resize file to {}", len))?;
         Ok(())
     }
 }

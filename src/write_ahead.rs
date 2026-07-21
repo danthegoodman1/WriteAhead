@@ -40,8 +40,17 @@ pub struct WriteAhead<F: FileIo = SimpleFile> {
 #[derive(Debug, Clone)]
 pub struct WriteAheadOptions {
     pub log_dir: PathBuf,
-    /// Rotate the active log file after its length exceeds this.
+    /// Soft limit for the logical record region. The writer rotates before a
+    /// commit group would cross it. A group larger than an empty file's
+    /// capacity is kept intact in one oversized file, then rotated. The limit
+    /// includes the format header; values below FILE_HEADER_SIZE therefore
+    /// treat every non-empty group as oversized without truncating the header.
     pub max_file_size: u64,
+    /// Sparse allocation-window size for active files. Ahead-of-time growth
+    /// avoids persisting an EOF change on every fdatasync while committed-end
+    /// metadata keeps the unused tail invisible to readers and recovery.
+    /// None disables preallocation; Some(0) is also treated as disabled.
+    pub preallocation_chunk_size: Option<u64>,
     pub retention: RetentionOptions,
 }
 
@@ -49,7 +58,8 @@ impl Default for WriteAheadOptions {
     fn default() -> Self {
         Self {
             log_dir: PathBuf::from("./write_ahead"),
-            max_file_size: 1024 * 1024 * 1024, // 1GB
+            max_file_size: 1024 * 1024 * 1024,                // 1GB
+            preallocation_chunk_size: Some(64 * 1024 * 1024), // 64MiB
             retention: RetentionOptions::default(),
         }
     }
@@ -78,6 +88,9 @@ pub enum WriteAheadError {
 
     #[error("Duplicate log file id {0} in log directory")]
     DuplicateLogfileId(u64),
+
+    #[error("Log file id space exhausted")]
+    FileIdExhausted,
 }
 
 impl<F: FileIo + 'static> WriteAhead<F> {
@@ -156,9 +169,10 @@ impl<F: FileIo + 'static> WriteAhead<F> {
                 let last_len = std::fs::metadata(&last_path)
                     .with_context(|| format!("Failed to stat {}", last_path.display()))?
                     .len();
-                if last_len < FILE_HEADER_SIZE {
-                    // Crash between file creation and header write
-                    debug!("recovering empty/partial active logfile {}", last_id);
+                if last_len <= FILE_HEADER_SIZE {
+                    // Crash between file creation and a durable header, or a
+                    // valid empty active file.
+                    debug!("recovering empty/header-only active logfile {}", last_id);
                     recover_unsealed::<F>(&last_path)?;
                     (last_id, last_path)
                 } else {
@@ -174,10 +188,10 @@ impl<F: FileIo + 'static> WriteAhead<F> {
                                 seal_timestamp_ms: logfile.seal_timestamp_ms,
                             },
                         );
-                        (
-                            last_id + 1,
-                            log_file_path(&self.options.log_dir, last_id + 1),
-                        )
+                        let next_id = last_id
+                            .checked_add(1)
+                            .ok_or(WriteAheadError::FileIdExhausted)?;
+                        (next_id, log_file_path(&self.options.log_dir, next_id))
                     } else {
                         drop(logfile);
                         recover_unsealed::<F>(&last_path)?;
@@ -354,7 +368,10 @@ impl<F: FileIo> Stream for WriteAheadStream<F> {
                     // Current file exhausted, move to the next one
                     let next_id = self
                         .logfiles
-                        .range((self.active_log_id + 1)..)
+                        .range((
+                            std::ops::Bound::Excluded(self.active_log_id),
+                            std::ops::Bound::Unbounded,
+                        ))
                         .next()
                         .map(|(k, _)| *k);
                     match next_id {
@@ -391,7 +408,7 @@ mod tests {
     fn test_wal_rotating(dir: &Path, max_file_size: u64) -> WriteAhead<SimpleFile> {
         WriteAhead::with_options(WriteAheadOptions {
             log_dir: dir.to_path_buf(),
-            max_file_size,
+            max_file_size: FILE_HEADER_SIZE + max_file_size,
             ..Default::default()
         })
     }
@@ -456,8 +473,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_with_0xff_records() {
-        // Regression: records full of 0xff bytes used to break stream offset
-        // arithmetic under the v1 escaping scheme.
+        // Regression coverage: raw 0xff bytes must not affect stream offset
+        // arithmetic.
         let dir = tempfile::tempdir().unwrap();
         let mut wal = test_wal(dir.path());
         wal.start().unwrap();

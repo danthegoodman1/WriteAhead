@@ -1,7 +1,7 @@
 //! The write-side actor: owns the active log file and the directory
 //! lifecycle. All writes funnel through one thread, which group-commits
 //! queued batches (one pwrite + one fdatasync for everything pending),
-//! rotates the file when it exceeds `max_file_size`, and applies retention.
+//! rotates before a commit would exceed `max_file_size`, and applies retention.
 //!
 //! Rotation creates the next file *before* sealing the old one, so every
 //! crash window lands in a state startup recovery already heals: an
@@ -16,8 +16,8 @@ use tracing::{debug, error, trace, warn};
 
 use crate::fileio::{sync_dir, FileIo};
 use crate::logfile::{
-    append_footer, encode_records, log_file_path, now_ms, write_header, LogfileError,
-    FILE_HEADER_SIZE, FOOTER_SIZE, RECORD_HEADER_SIZE,
+    append_footer, encode_records, log_file_path, now_ms, read_commit_state, write_committed_end,
+    write_header, CommitState, LogfileError, FILE_HEADER_SIZE, FOOTER_SIZE, RECORD_HEADER_SIZE,
 };
 use crate::record::RecordID;
 use crate::write_ahead::{WriteAheadError, WriteAheadOptions};
@@ -134,7 +134,11 @@ pub(crate) struct WalWriter<F: FileIo> {
     options: WriteAheadOptions,
     fio: F,
     file_id: u64,
-    file_length: u64,
+    /// Logical end of committed records. Physical file length may be ahead
+    /// because the active file is sparsely grown in allocation windows.
+    records_end: u64,
+    allocated_end: u64,
+    commit_state: CommitState,
     /// Every live log file (including the active one), for retention.
     files: BTreeMap<u64, FileMeta>,
     recv: flume::Receiver<WriterCommand>,
@@ -158,23 +162,25 @@ impl<F: FileIo + 'static> WalWriter<F> {
 
         let mut fio = F::open(&active_path)?;
         let len = fio.len()?;
-        let file_length = if len == 0 {
+        let (records_end, commit_state) = if len == 0 {
             write_header(&mut fio)?;
             fio.sync()?;
             sync_dir(&options.log_dir)?;
-            FILE_HEADER_SIZE
+            (FILE_HEADER_SIZE, read_commit_state(&fio)?)
         } else if len < FILE_HEADER_SIZE {
             // The manager recovers files before launching the writer, so a
             // partial header here means that contract was violated.
             return Err(anyhow!(LogfileError::InvalidHeader));
         } else {
-            len
+            let state = read_commit_state(&fio)?;
+            (state.records_end, state)
         };
+        let allocated_end = len.max(records_end);
         files.insert(
             active_id,
             FileMeta {
                 path: active_path,
-                size: file_length,
+                size: records_end,
                 seal_timestamp_ms: None,
             },
         );
@@ -183,11 +189,17 @@ impl<F: FileIo + 'static> WalWriter<F> {
             options,
             fio,
             file_id: active_id,
-            file_length,
+            records_end,
+            allocated_end,
+            commit_state,
             files,
             recv: rx,
             events: event_tx,
         };
+        // Grow the active file after its header is durable. The allocation
+        // itself is covered by the next record sync and is never used as a
+        // logical record boundary.
+        writer.ensure_preallocated(records_end)?;
         // Synchronous so `start()` returns with retention already applied
         writer.apply_retention();
 
@@ -251,7 +263,7 @@ impl<F: FileIo + 'static> WalWriter<F> {
         let mut valid: Vec<(ReplyTx, Vec<Vec<u8>>)> = Vec::with_capacity(group.len());
         let mut total = 0usize;
         for (reply, records) in group {
-            if records.iter().any(|r| r.len() > u32::MAX as usize) {
+            if records.iter().any(|r| r.len() >= u32::MAX as usize) {
                 let _ = reply.send(Err(anyhow!(LogfileError::RecordTooLarge)));
                 continue;
             }
@@ -272,8 +284,27 @@ impl<F: FileIo + 'static> WalWriter<F> {
             return;
         }
 
+        // Keep the entire group in one file. If it does not fit in a
+        // non-empty active file, rotate before assigning offsets. A group
+        // larger than an empty file's capacity is accepted as a soft-cap
+        // exception, then the oversized file is rotated after the commit.
+        let total_u64 = total as u64;
+        let proposed_end = self.records_end.checked_add(total_u64);
+        let would_exceed = proposed_end
+            .map(|end| end > self.options.max_file_size)
+            .unwrap_or(true);
+        if would_exceed && self.records_end > FILE_HEADER_SIZE {
+            if let Err(e) = self.rotate() {
+                let msg = format!("Failed to rotate before commit: {e:#}");
+                for (reply, _) in valid {
+                    let _ = reply.send(Err(anyhow!("{}", msg.clone())));
+                }
+                return;
+            }
+        }
+
         let mut buf = Vec::with_capacity(total);
-        let mut current_offset = self.file_length;
+        let mut current_offset = self.records_end;
         let mut per_caller_offsets: Vec<Vec<u64>> = Vec::with_capacity(valid.len());
         for (_, records) in &valid {
             let offsets = encode_records(&mut buf, records, current_offset);
@@ -281,15 +312,22 @@ impl<F: FileIo + 'static> WalWriter<F> {
             per_caller_offsets.push(offsets);
         }
 
-        let result = self
-            .fio
-            .write_at(self.file_length, &buf)
-            .context("Failed to write records")
-            .and_then(|_| self.fio.sync().context("Failed to sync records"));
+        let result = (|| -> Result<CommitState> {
+            self.ensure_preallocated(current_offset)?;
+            self.fio
+                .write_at(self.records_end, &buf)
+                .context("Failed to write records")?;
+            let state = write_committed_end(&mut self.fio, self.commit_state, current_offset)?;
+            // The record bytes, logical-end slot, and any allocation-window
+            // extension are made durable by this single fdatasync.
+            self.fio.sync().context("Failed to sync records")?;
+            Ok(state)
+        })();
 
         match result {
-            Ok(()) => {
-                self.file_length = current_offset;
+            Ok(commit_state) => {
+                self.records_end = current_offset;
+                self.commit_state = commit_state;
                 if let Some(meta) = self.files.get_mut(&self.file_id) {
                     meta.size = current_offset;
                 }
@@ -301,9 +339,9 @@ impl<F: FileIo + 'static> WalWriter<F> {
                 }
             }
             Err(e) => {
-                // Nothing was acknowledged: file_length stays put, so any
-                // partially written bytes are outside the record region and
-                // get truncated by recovery. anyhow::Error isn't Clone, so
+                // Nothing was acknowledged: records_end and commit_state stay
+                // put. Any partial bytes are beyond the committed boundary and
+                // are discarded by recovery. anyhow::Error isn't Clone, so
                 // each caller gets its own copy of the message.
                 let msg = format!("{e:#}");
                 for (reply, _) in valid {
@@ -314,19 +352,27 @@ impl<F: FileIo + 'static> WalWriter<F> {
     }
 
     fn maybe_rotate(&mut self) -> Result<()> {
-        if self.file_length <= self.options.max_file_size {
+        if self.records_end <= self.options.max_file_size {
             return Ok(());
         }
 
+        self.rotate()
+    }
+
+    fn rotate(&mut self) -> Result<()> {
         // Create the next file first: if we crash (or fail) between here and
         // the seal below, recovery sees an unsealed non-active file and
         // heals it, and an empty highest file becomes the active file.
-        let next_id = self.file_id + 1;
+        let next_id = self
+            .file_id
+            .checked_add(1)
+            .ok_or(WriteAheadError::FileIdExhausted)?;
         let path = log_file_path(&self.options.log_dir, next_id);
         let mut fio = F::open(&path)?;
         write_header(&mut fio)?;
         fio.sync()?;
         sync_dir(&self.options.log_dir)?;
+        let commit_state = read_commit_state(&fio)?;
         self.files.insert(
             next_id,
             FileMeta {
@@ -340,10 +386,10 @@ impl<F: FileIo + 'static> WalWriter<F> {
         // Seal the old file. On failure it stays unsealed and recovery
         // heals it at the next start; new writes still go to the new file.
         let ts = now_ms();
-        match append_footer(&mut self.fio, self.file_length, ts) {
+        match append_footer(&mut self.fio, self.records_end, ts) {
             Ok(()) => {
                 if let Some(meta) = self.files.get_mut(&self.file_id) {
-                    meta.size = self.file_length + FOOTER_SIZE;
+                    meta.size = self.records_end + FOOTER_SIZE;
                     meta.seal_timestamp_ms = Some(ts);
                 }
                 let _ = self.events.send(WriterEvent::Sealed(self.file_id));
@@ -354,9 +400,45 @@ impl<F: FileIo + 'static> WalWriter<F> {
 
         self.fio = fio;
         self.file_id = next_id;
-        self.file_length = FILE_HEADER_SIZE;
+        self.records_end = FILE_HEADER_SIZE;
+        self.allocated_end = FILE_HEADER_SIZE;
+        self.commit_state = commit_state;
+        self.ensure_preallocated(FILE_HEADER_SIZE)?;
 
         self.apply_retention();
+        Ok(())
+    }
+
+    /// Grows the active file to the allocation window covering required_end.
+    /// None (and defensively Some(0)) leaves normal EOF-extending writes in
+    /// place. Windows never extend beyond max_file_size unless a single
+    /// oversized group is already past that soft cap.
+    fn ensure_preallocated(&mut self, required_end: u64) -> Result<()> {
+        let Some(chunk) = self
+            .options
+            .preallocation_chunk_size
+            .filter(|size| *size > 0)
+        else {
+            return Ok(());
+        };
+        let rounded = required_end
+            .checked_add(chunk - 1)
+            .map(|value| value / chunk * chunk)
+            .unwrap_or(u64::MAX);
+        let target = if required_end <= self.options.max_file_size {
+            rounded.min(self.options.max_file_size).max(required_end)
+        } else {
+            // Oversized batches retain the existing soft-cap behavior but do
+            // not allocate still farther past the cap.
+            required_end
+        };
+        if target <= self.allocated_end {
+            return Ok(());
+        }
+        self.fio
+            .set_len(target)
+            .with_context(|| format!("Failed to preallocate active logfile to {target} bytes"))?;
+        self.allocated_end = target;
         Ok(())
     }
 
@@ -365,7 +447,7 @@ impl<F: FileIo + 'static> WalWriter<F> {
     /// next rotation.
     fn apply_retention(&mut self) {
         if let Some(meta) = self.files.get_mut(&self.file_id) {
-            meta.size = self.file_length;
+            meta.size = self.records_end;
         }
 
         let mut doomed: Vec<u64> = Vec::new();

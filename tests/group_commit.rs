@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use writeahead::logfile::FILE_HEADER_SIZE;
 use writeahead::{RecordID, SimpleFile, WriteAhead, WriteAheadOptions};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -12,7 +13,7 @@ async fn concurrent_handles_get_unique_intact_records() {
     let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
         log_dir: dir.path().to_path_buf(),
         // Small enough that concurrent writes cross many rotations
-        max_file_size: 4096,
+        max_file_size: FILE_HEADER_SIZE + 4096,
         ..Default::default()
     });
     wal.start().unwrap();

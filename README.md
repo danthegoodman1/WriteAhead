@@ -72,6 +72,24 @@ async fn main() -> anyhow::Result<()> {
 
 Retention is opt-in via `RetentionOptions`: `max_total_size` deletes the oldest sealed files once total disk usage exceeds the bound, and `ttl` deletes sealed files whose seal timestamp is older than the window. The active file is never deleted; reads into deleted files return `LogfileNotFound`. For consumer-driven cleanup, use `trim_before` instead — see the patterns below.
 
+Active files are sparsely grown ahead of writes in 64 MiB allocation windows by
+default. This avoids making every durable append persist a new file length.
+Tune the window with
+`WriteAheadOptions::preallocation_chunk_size: Option<u64>`; set it to `None`
+to disable preallocation. Windows are clamped to `max_file_size`, and sealed
+files are truncated to their actual record end before their footer is written,
+so the sparse tail is only present on the active file. The physical file length
+shown by tools such as `ls` includes that sparse tail; allocated disk blocks
+remain small until records fill it.
+
+`max_file_size` is a soft limit on the logical record region. The writer
+rotates before a queued commit group would cross it, keeping every group and
+submitted batch contiguous in one file. If one group is larger than an empty
+file's capacity, it is written intact to one oversized file and that file is
+rotated immediately afterward. The limit includes the 12 KiB version 3 header;
+a smaller configured limit is valid, but every non-empty group is consequently
+treated as oversized.
+
 ## Patterns
 
 The WAL never decides on its own that a record is *done* — that knowledge lives with whatever consumes the log. `trim_before(file_id)` is the primitive that lets the consumer feed that knowledge back: it deletes every sealed file strictly below `file_id` (the active file is never touched) and returns how many files and bytes were reclaimed. Two common shapes, both runnable from `examples/`:
@@ -121,16 +139,33 @@ One dedicated writer thread owns the active file and the directory lifecycle: wr
 
 Readers use positional reads (`pread`) straight from the page cache — for WAL access patterns readers mostly want recently written data, which the page cache serves far better than direct-IO schemes like io_uring + O_DIRECT. Point reads speculatively fetch one small block so most records cost a single syscall; streams parse records out of 128 KiB readahead chunks.
 
-### File format (version 2)
+### File format (version 3)
 
 ```text
-| 8B magic | 1B version | records ... | 40B seal footer (sealed files only) |
+| 4 KiB format block | 4 KiB slot 0 block | 4 KiB slot 1 block | records ... | 40B seal footer (sealed files only) |
 
-record: | 16B murmur3_128(data) | 4B length (u32 LE) | data |
+format block: | 8B magic | 1B version | zero padding |
+committed-end slot: | 8B generation | 8B records-end offset | 16B murmur3_128 of the previous 16B |
+record: | 16B murmur3_128(data) | 4B bitwise-inverted length (u32 LE) | data |
 footer: | 8B magic | 8B seal timestamp (unix ms) | 8B records-end offset | 16B murmur3_128 of the previous 24B |
 ```
 
-Data is stored raw — no escaping. A file is sealed iff its trailing 40 bytes parse as a footer whose own hash verifies and whose records-end field equals the footer's position, so record payloads (which may contain the magic bytes) cannot be mistaken for a seal.
+The two committed-end slots alternate by generation and occupy distinct aligned
+filesystem blocks. Under the torn-write model, a damaged newest-slot write
+cannot damage the older slot's block; this does not claim recovery from
+arbitrary corruption spanning multiple blocks. A commit writes its record bytes
+and the alternate checksummed slot, then covers both with the same single
+`fdatasync` before acknowledging writers. Readers use this logical end instead
+of the active file's sparse physical length, so unused zero-filled space cannot
+be replayed as empty records. Inverting the stored length also makes an
+unwritten all-zero record header invalid while preserving support for real
+empty payloads. Data is stored raw — no escaping. A file is sealed iff its
+trailing 40 bytes parse as a footer whose own hash verifies and whose records-end
+field equals the footer's position, so record payloads (which may contain the
+magic bytes) cannot be mistaken for a seal.
+
+Version 3 is a format break: older version 2 files are rejected as unsupported
+rather than upgraded in place.
 
 The log directory is a sequence of `0000000000.log`, `0000000001.log`, … files. The highest id is the active file; rotation creates the next file first, then seals the previous one (the footer carries the seal timestamp used by ttl retention), so a crash mid-rotation always lands in a state recovery heals. Directory entries are fsync'd on file creation.
 
@@ -139,7 +174,7 @@ The log directory is a sequence of `0000000000.log`, `0000000001.log`, … files
 On `start()`:
 
 - Non-active files that aren't sealed (crash mid-rotation, torn footer) are healed: valid record prefix kept, garbage truncated, footer written.
-- The active file gets a tail scan; a torn last record is truncated away. Since writes are only acknowledged after fsync, nothing acknowledged is ever lost.
+- The active file scans only through the newest valid committed-end slot, never through its sparse allocation tail. A torn newest commit is shortened to its valid record prefix, but never below the end protected by the older valid slot.
 - If the active file turns out to be sealed (crash between seal and next-file creation), a fresh file is started rather than appending to it.
 - Non-log files in the directory are skipped.
 

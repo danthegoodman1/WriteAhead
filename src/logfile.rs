@@ -12,18 +12,18 @@ use crate::record::RecordID;
 
 /// Logfile represents a log file on disk.
 ///
-/// # Format (version 2)
+/// # Format (version 3)
 ///
 /// ## File layout
 ///
 /// ```text
-/// | 8 bytes - magic number | 1 byte - format version | N bytes - records | 40 bytes - seal footer (sealed files only) |
+/// | 4 KiB format block | 4 KiB slot 0 block | 4 KiB slot 1 block | N bytes - records | 40 bytes - seal footer (sealed files only) |
 /// ```
 ///
 /// ## Record layout
 ///
 /// ```text
-/// | 16 bytes (i64, i64 LE) - murmur3_128 of data | 4 bytes (u32 LE) - data length | N bytes - data (raw) |
+/// | 16 bytes (i64, i64 LE) - murmur3_128 of data | 4 bytes (u32 LE) - bitwise-inverted data length | N bytes - data (raw) |
 /// ```
 ///
 /// ## Seal footer layout
@@ -31,6 +31,19 @@ use crate::record::RecordID;
 /// ```text
 /// | 8 bytes - magic number | 8 bytes (u64 LE) - seal timestamp (unix ms) | 8 bytes (u64 LE) - records end offset | 16 bytes - murmur3_128 of the previous 24 bytes |
 /// ```
+///
+/// ## Committed-end slot layout
+///
+/// ```text
+/// | 8 bytes - generation | 8 bytes - committed records-end offset | 16 bytes - murmur3_128 of the previous 16 bytes |
+/// ```
+///
+/// The two slots live in distinct aligned filesystem blocks and alternate on
+/// commits. Under the WAL's torn-write model, damage to the block targeted by
+/// the newest slot write cannot damage the older slot's block. Record bytes
+/// and the new slot are covered by the same fdatasync, allowing the active
+/// file's physical length to be grown ahead of the logical record end without
+/// exposing the unused sparse tail to readers or recovery.
 ///
 /// # Corruption protection
 ///
@@ -57,9 +70,14 @@ pub struct Logfile<F: FileIo> {
 }
 
 pub const MAGIC_NUMBER: [u8; 8] = [0xff; 8];
-pub const FORMAT_VERSION: u8 = 2;
-/// Magic number + version byte.
-pub const FILE_HEADER_SIZE: u64 = 9;
+pub const FORMAT_VERSION: u8 = 3;
+/// Magic number + version byte, before the committed-end slots.
+const FILE_HEADER_PREFIX_SIZE: u64 = 9;
+const COMMIT_SLOT_SIZE: u64 = 32;
+const COMMIT_SLOT_COUNT: u64 = 2;
+const HEADER_BLOCK_SIZE: u64 = 4 * 1024;
+/// Current (v3) header: one format block plus one block per commit slot.
+pub const FILE_HEADER_SIZE: u64 = (1 + COMMIT_SLOT_COUNT) * HEADER_BLOCK_SIZE;
 /// Record hash + length prefix.
 pub const RECORD_HEADER_SIZE: u64 = 20;
 /// Magic + timestamp + records-end + footer hash.
@@ -90,6 +108,22 @@ pub enum LogfileError {
 
     #[error("Record is too large, must be less than {} bytes", u32::MAX)]
     RecordTooLarge,
+
+    #[error("No valid committed-end metadata in v3 logfile header")]
+    InvalidCommittedEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommitState {
+    pub generation: u64,
+    pub records_end: u64,
+    slot: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileHeader {
+    commit: CommitState,
+    commit_slots: [Option<CommitState>; COMMIT_SLOT_COUNT as usize],
 }
 
 /// The canonical path of a log file id inside a log directory.
@@ -142,7 +176,14 @@ fn read_record_at<F: FileIo>(fio: &F, offset: u64, records_end: u64) -> Result<(
         .context("Failed to read record header")?;
     let hash1 = i64::from_le_bytes(first[0..8].try_into().unwrap());
     let hash2 = i64::from_le_bytes(first[8..16].try_into().unwrap());
-    let length = u32::from_le_bytes(first[16..20].try_into().unwrap()) as u64;
+    let encoded_length = u32::from_le_bytes(first[16..20].try_into().unwrap());
+    // Lengths are stored inverted so an unwritten sparse region (all zeroes)
+    // cannot masquerade as a run of valid empty records. u32::MAX payloads
+    // are rejected on write, making encoded zero permanently invalid.
+    if encoded_length == 0 {
+        return Err(anyhow!(LogfileError::PartialWrite));
+    }
+    let length = (!encoded_length) as u64;
 
     // Bounds check before allocating: a corrupted length must not drive a
     // giant allocation or a read past the record region.
@@ -174,10 +215,10 @@ fn read_record_at<F: FileIo>(fio: &F, offset: u64, records_end: u64) -> Result<(
 
 /// Walks records from the start of the file and returns the end offset of
 /// the longest valid prefix. Only meaningful for unsealed files.
-fn scan_records_end<F: FileIo>(fio: &F, file_len: u64) -> u64 {
+fn scan_records_end<F: FileIo>(fio: &F, scan_limit: u64) -> u64 {
     let mut offset = FILE_HEADER_SIZE;
     loop {
-        match read_record_at(fio, offset, file_len) {
+        match read_record_at(fio, offset, scan_limit) {
             Ok((_, next)) => offset = next,
             Err(_) => return offset,
         }
@@ -211,30 +252,130 @@ fn parse_footer(buf: &[u8; FOOTER_SIZE as usize], file_len: u64) -> Option<u64> 
     Some(u64::from_le_bytes(buf[8..16].try_into().unwrap()))
 }
 
-fn validate_header<F: FileIo>(fio: &F) -> Result<()> {
-    let mut header = [0u8; FILE_HEADER_SIZE as usize];
-    fio.read_at(0, &mut header)
+fn commit_slot_offset(slot: usize) -> u64 {
+    (slot as u64 + 1) * HEADER_BLOCK_SIZE
+}
+
+fn build_commit_slot(generation: u64, records_end: u64) -> [u8; COMMIT_SLOT_SIZE as usize] {
+    let mut slot = [0u8; COMMIT_SLOT_SIZE as usize];
+    slot[0..8].copy_from_slice(&generation.to_le_bytes());
+    slot[8..16].copy_from_slice(&records_end.to_le_bytes());
+    let (h1, h2) = murmur3_128(&slot[0..16]);
+    slot[16..24].copy_from_slice(&h1.to_le_bytes());
+    slot[24..32].copy_from_slice(&h2.to_le_bytes());
+    slot
+}
+
+fn parse_commit_slot(buf: &[u8], slot: usize) -> Option<CommitState> {
+    let (h1, h2) = murmur3_128(&buf[0..16]);
+    if buf[16..24] != h1.to_le_bytes() || buf[24..32] != h2.to_le_bytes() {
+        return None;
+    }
+    Some(CommitState {
+        generation: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        records_end: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        slot,
+    })
+}
+
+fn read_header<F: FileIo>(fio: &F, file_len: u64) -> Result<FileHeader> {
+    if file_len < FILE_HEADER_SIZE {
+        return Err(anyhow!(LogfileError::InvalidHeader));
+    }
+    let mut base = [0u8; FILE_HEADER_PREFIX_SIZE as usize];
+    fio.read_at(0, &mut base)
         .context("Failed to read file header")?;
-    if header[0..8] != MAGIC_NUMBER {
+    if base[0..8] != MAGIC_NUMBER {
         return Err(anyhow!(LogfileError::InvalidMagicNumber));
     }
-    if header[8] != FORMAT_VERSION {
-        return Err(anyhow!(LogfileError::UnsupportedVersion(header[8])));
+    if base[8] != FORMAT_VERSION {
+        return Err(anyhow!(LogfileError::UnsupportedVersion(base[8])));
     }
-    Ok(())
+    let mut commit_slots = [None; COMMIT_SLOT_COUNT as usize];
+    for (slot, state) in commit_slots.iter_mut().enumerate() {
+        let mut buf = [0u8; COMMIT_SLOT_SIZE as usize];
+        fio.read_at(commit_slot_offset(slot), &mut buf)
+            .with_context(|| format!("Failed to read committed-end slot {slot}"))?;
+        *state =
+            parse_commit_slot(&buf, slot).filter(|state| state.records_end >= FILE_HEADER_SIZE);
+    }
+    let commit = commit_slots
+        .iter()
+        .flatten()
+        .copied()
+        .max_by_key(|state| state.generation)
+        .ok_or(LogfileError::InvalidCommittedEnd)?;
+    Ok(FileHeader {
+        commit,
+        commit_slots,
+    })
 }
 
 pub(crate) fn write_header<F: FileIo>(fio: &mut F) -> Result<()> {
     let mut header = [0u8; FILE_HEADER_SIZE as usize];
     header[0..8].copy_from_slice(&MAGIC_NUMBER);
     header[8] = FORMAT_VERSION;
+    let slot_offset = commit_slot_offset(0) as usize;
+    header[slot_offset..slot_offset + COMMIT_SLOT_SIZE as usize]
+        .copy_from_slice(&build_commit_slot(0, FILE_HEADER_SIZE));
     fio.write_at(0, &header).context("Failed to write header")?;
     Ok(())
+}
+
+/// Returns the newest valid v3 committed-end slot. The caller must have
+/// recovered the file first if record bytes may be torn.
+pub(crate) fn read_commit_state<F: FileIo>(fio: &F) -> Result<CommitState> {
+    let len = fio.len()?;
+    let header = read_header(fio, len)?;
+    Ok(header.commit)
+}
+
+/// Writes the alternate v3 committed-end slot without syncing. The caller
+/// writes record bytes first and covers both writes with one fdatasync.
+pub(crate) fn write_committed_end<F: FileIo>(
+    fio: &mut F,
+    previous: CommitState,
+    records_end: u64,
+) -> Result<CommitState> {
+    let generation = previous
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("committed-end generation exhausted"))?;
+    let slot = 1 - previous.slot;
+    fio.write_at(
+        commit_slot_offset(slot),
+        &build_commit_slot(generation, records_end),
+    )
+    .context("Failed to write committed-end metadata")?;
+    Ok(CommitState {
+        generation,
+        records_end,
+        slot,
+    })
+}
+
+/// Rewrites a torn newest commit's slot in place during recovery. Keeping the
+/// alternate slot untouched preserves the last fully committed end if recovery
+/// itself crashes before this repair is synced.
+fn repair_committed_end<F: FileIo>(
+    fio: &mut F,
+    previous: CommitState,
+    records_end: u64,
+) -> Result<()> {
+    fio.write_at(
+        commit_slot_offset(previous.slot),
+        &build_commit_slot(previous.generation, records_end),
+    )
+    .context("Failed to repair committed-end metadata")
 }
 
 /// Appends a seal footer at `records_end` and syncs. The caller must ensure
 /// the file's record region actually ends there.
 pub(crate) fn append_footer<F: FileIo>(fio: &mut F, records_end: u64, ts_ms: u64) -> Result<()> {
+    // Active v3 files may have a sparse allocation window beyond records_end.
+    // Remove it before placing the footer so sealed file length stays exact.
+    fio.set_len(records_end)
+        .context("Failed to truncate allocation tail before sealing")?;
     fio.write_at(records_end, &build_footer(records_end, ts_ms))
         .context("Failed to write footer")?;
     fio.sync().context("Failed to sync footer")?;
@@ -258,7 +399,7 @@ pub(crate) fn encode_records(
 
         buf.extend_from_slice(&hash1.to_le_bytes());
         buf.extend_from_slice(&hash2.to_le_bytes());
-        buf.extend_from_slice(&(record.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(!(record.len() as u32)).to_le_bytes());
         buf.extend_from_slice(record);
     }
     offsets
@@ -274,7 +415,7 @@ pub(crate) fn encode_records(
 pub fn recover_unsealed<F: FileIo>(path: &Path) -> Result<u64> {
     let mut fio = F::open_existing(path)?;
     let len = fio.len()?;
-    if len < FILE_HEADER_SIZE {
+    if len < FILE_HEADER_PREFIX_SIZE {
         if len > 0 {
             warn!(
                 "log file {} has a partial header ({} bytes), truncating to empty",
@@ -286,9 +427,85 @@ pub fn recover_unsealed<F: FileIo>(path: &Path) -> Result<u64> {
         }
         return Ok(0);
     }
-    validate_header(&fio)?;
-    let end = scan_records_end(&fio, len);
-    if end < len {
+
+    // A v3 header can tear while a newly-created rotation target is being
+    // initialized. It cannot contain acknowledged records until its complete
+    // header has been synced, so the active-file recovery path may safely
+    // reset this partial header and let the writer initialize it again.
+    let mut base = [0u8; FILE_HEADER_PREFIX_SIZE as usize];
+    fio.read_at(0, &mut base)?;
+    if base[0..8] != MAGIC_NUMBER {
+        return Err(anyhow!(LogfileError::InvalidMagicNumber));
+    }
+    if base[8] != FORMAT_VERSION {
+        return Err(anyhow!(LogfileError::UnsupportedVersion(base[8])));
+    }
+    if len < FILE_HEADER_SIZE {
+        warn!(
+            "log file {} has a partial v3 header ({} bytes), truncating to empty",
+            path.display(),
+            len
+        );
+        fio.set_len(0)?;
+        fio.sync()?;
+        return Ok(0);
+    }
+
+    let header = match read_header(&fio, len) {
+        Ok(header) => header,
+        Err(e)
+            if len == FILE_HEADER_SIZE
+                && matches!(
+                    e.downcast_ref::<LogfileError>(),
+                    Some(LogfileError::InvalidCommittedEnd)
+                ) =>
+        {
+            // Preallocation only begins after a complete header is synced.
+            // A header-sized active file with no valid slot therefore cannot
+            // contain acknowledged records and is safe to reinitialize.
+            warn!(
+                "log file {} has a full-length torn header with no valid slot; truncating to empty",
+                path.display()
+            );
+            fio.set_len(0)?;
+            fio.sync()?;
+            return Ok(0);
+        }
+        Err(e) => return Err(e),
+    };
+    let commit = header.commit;
+    // The older slot is an already-committed floor. A torn newest commit may
+    // be shortened to a valid record prefix, but recovery must never discard
+    // bytes covered by the previous successful fdatasync.
+    let committed_floor = header
+        .commit_slots
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|state| state.generation < commit.generation)
+        .max_by_key(|state| state.generation)
+        .map(|state| state.records_end)
+        .unwrap_or(FILE_HEADER_SIZE);
+    if committed_floor > len {
+        return Err(anyhow!(LogfileError::Corrupted));
+    }
+
+    // Never scan the sparse allocation tail: the checksummed newest slot is
+    // the upper bound. If a crash persisted the slot but only a prefix of its
+    // record bytes, retain that longest valid prefix.
+    let scan_limit = commit.records_end.min(len);
+    let end = scan_records_end(&fio, scan_limit);
+    if end < committed_floor {
+        return Err(anyhow!(LogfileError::Corrupted));
+    }
+    let repair_from = (end != commit.records_end).then_some(commit);
+
+    let mut changed = false;
+    if let Some(previous) = repair_from {
+        repair_committed_end(&mut fio, previous, end)?;
+        changed = true;
+    }
+    if end != len {
         warn!(
             "log file {} has a torn tail: truncating {} -> {}",
             path.display(),
@@ -296,6 +513,9 @@ pub fn recover_unsealed<F: FileIo>(path: &Path) -> Result<u64> {
             end
         );
         fio.set_len(end)?;
+        changed = true;
+    }
+    if changed {
         fio.sync()?;
     }
     Ok(end)
@@ -326,7 +546,7 @@ impl<F: FileIo> Logfile<F> {
         if len < FILE_HEADER_SIZE {
             return Err(anyhow!(LogfileError::InvalidHeader));
         }
-        validate_header(&fio)?;
+        read_header(&fio, len)?;
 
         let mut logfile = Self {
             id,
@@ -351,18 +571,34 @@ impl<F: FileIo> Logfile<F> {
         if self.sealed {
             return self.records_end();
         }
-        let len = self.fio.len()?;
-        if len >= FILE_HEADER_SIZE + FOOTER_SIZE {
+        let committed_end = read_commit_state(&self.fio)?.records_end;
+        let footer_end = committed_end
+            .checked_add(FOOTER_SIZE)
+            .ok_or(LogfileError::PartialWrite)?;
+        // Rotation first shrinks a sparse active file to committed_end, then
+        // writes the footer. Retry once if that shrink lands between our
+        // length observation and positional read; healthy rotation must not
+        // leak the transient EOF to readers.
+        for attempt in 0..2 {
+            let len = self.fio.len()?;
+            if len != footer_end {
+                return Ok(committed_end);
+            }
             let mut fbuf = [0u8; FOOTER_SIZE as usize];
-            self.fio.read_at(len - FOOTER_SIZE, &mut fbuf)?;
-            if let Some(ts) = parse_footer(&fbuf, len) {
-                self.sealed = true;
-                self.seal_timestamp_ms = Some(ts);
-                self.records_end = Some(len - FOOTER_SIZE);
-                return Ok(len - FOOTER_SIZE);
+            match self.fio.read_at(committed_end, &mut fbuf) {
+                Ok(()) => {
+                    if let Some(ts) = parse_footer(&fbuf, len) {
+                        self.sealed = true;
+                        self.seal_timestamp_ms = Some(ts);
+                        self.records_end = Some(committed_end);
+                    }
+                    return Ok(committed_end);
+                }
+                Err(_) if attempt == 0 => continue,
+                Err(e) => return Err(e),
             }
         }
-        Ok(len)
+        Ok(committed_end)
     }
 
     /// Reads and verifies the record at `offset`.
@@ -380,12 +616,12 @@ impl<F: FileIo> Logfile<F> {
         read_record_at(&self.fio, offset, self.records_end()?)
     }
 
-    /// End of the record region: fixed for sealed files, the live file
-    /// length for unsealed (actively written) files.
+    /// End of the record region: fixed for sealed files and read from the
+    /// committed-end metadata for active files.
     pub fn records_end(&self) -> Result<u64> {
         match self.records_end {
             Some(end) => Ok(end),
-            None => self.fio.len(),
+            None => Ok(read_commit_state(&self.fio)?.records_end),
         }
     }
 
@@ -405,9 +641,9 @@ impl<F: FileIo> Logfile<F> {
 
 /// Streams records from a single log file in order.
 ///
-/// For unsealed files the stream ends at the current end of file; records
-/// written after that are picked up on subsequent polls until the poll that
-/// observes no new data, which ends the stream.
+/// For unsealed files the stream ends at the current committed record end;
+/// records written after that are picked up on subsequent polls until the
+/// poll that observes no new data, which ends the stream.
 pub struct LogFileStream<F: FileIo> {
     logfile: Logfile<F>,
     offset: u64,
@@ -491,7 +727,11 @@ impl<F: FileIo> LogFileStream<F> {
         let base = (self.offset - self.buf_start) as usize;
         let hash1 = i64::from_le_bytes(self.buf[base..base + 8].try_into().unwrap());
         let hash2 = i64::from_le_bytes(self.buf[base + 8..base + 16].try_into().unwrap());
-        let length = u32::from_le_bytes(self.buf[base + 16..base + 20].try_into().unwrap()) as u64;
+        let encoded_length = u32::from_le_bytes(self.buf[base + 16..base + 20].try_into().unwrap());
+        if encoded_length == 0 {
+            return Err(anyhow!(LogfileError::PartialWrite));
+        }
+        let length = (!encoded_length) as u64;
 
         let data_end = self
             .offset
@@ -543,6 +783,64 @@ mod tests {
     use crate::fileio::simple_file::SimpleFile;
     use futures::stream::StreamExt;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static SHRINK_ON_FOOTER_READ: AtomicBool = AtomicBool::new(false);
+    static SHRINK_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    #[derive(Debug)]
+    struct ShrinkRaceFile {
+        fd: std::fs::File,
+    }
+
+    impl FileIo for ShrinkRaceFile {
+        fn open(path: &Path) -> Result<Self> {
+            let fd = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)?;
+            Ok(Self { fd })
+        }
+
+        fn open_existing(path: &Path) -> Result<Self> {
+            let fd = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?;
+            Ok(Self { fd })
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            if offset == SHRINK_OFFSET.load(Ordering::SeqCst)
+                && SHRINK_ON_FOOTER_READ.swap(false, Ordering::SeqCst)
+            {
+                self.fd.set_len(offset)?;
+            }
+            std::os::unix::fs::FileExt::read_exact_at(&self.fd, buf, offset)?;
+            Ok(())
+        }
+
+        fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+            std::os::unix::fs::FileExt::write_all_at(&self.fd, data, offset)?;
+            Ok(())
+        }
+
+        fn sync(&mut self) -> Result<()> {
+            self.fd.sync_data()?;
+            Ok(())
+        }
+
+        fn len(&self) -> Result<u64> {
+            Ok(self.fd.metadata()?.len())
+        }
+
+        fn set_len(&mut self, len: u64) -> Result<()> {
+            self.fd.set_len(len)?;
+            Ok(())
+        }
+    }
 
     fn temp_log(name: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -554,21 +852,22 @@ mod tests {
     /// actor does: header if empty, encoded batch, one write + sync.
     fn write_raw(path: &Path, records: &[Vec<u8>]) -> Vec<u64> {
         let mut fio = SimpleFile::open(path).unwrap();
-        let mut end = fio.len().unwrap();
-        if end == 0 {
+        if fio.len().unwrap() == 0 {
             write_header(&mut fio).unwrap();
-            end = FILE_HEADER_SIZE;
         }
+        let state = read_commit_state(&fio).unwrap();
+        let end = state.records_end;
         let mut buf = Vec::new();
         let offsets = encode_records(&mut buf, records, end);
         fio.write_at(end, &buf).unwrap();
+        write_committed_end(&mut fio, state, end + buf.len() as u64).unwrap();
         fio.sync().unwrap();
         offsets
     }
 
     fn seal_raw(path: &Path) {
         let fio = SimpleFile::open(path).unwrap();
-        let end = fio.len().unwrap();
+        let end = read_commit_state(&fio).unwrap().records_end;
         drop(fio);
         let mut fio = SimpleFile::open(path).unwrap();
         append_footer(&mut fio, end, now_ms()).unwrap();
@@ -583,6 +882,24 @@ mod tests {
         assert_eq!(logfile.id, 1);
         assert!(!logfile.sealed);
         assert_eq!(logfile.read_record(offsets[0]).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_refresh_seal_retries_sparse_shrink_race() {
+        let (_dir, path) = temp_log("0000000019.log");
+        let mut fio = SimpleFile::open(&path).unwrap();
+        write_header(&mut fio).unwrap();
+        // Make the active sparse length look exactly like a footer-bearing
+        // file, then truncate at the instant the footer probe starts.
+        fio.set_len(FILE_HEADER_SIZE + FOOTER_SIZE).unwrap();
+        fio.sync().unwrap();
+        drop(fio);
+
+        SHRINK_OFFSET.store(FILE_HEADER_SIZE, Ordering::SeqCst);
+        SHRINK_ON_FOOTER_READ.store(true, Ordering::SeqCst);
+        let logfile: Logfile<ShrinkRaceFile> = Logfile::open(&path).unwrap();
+        assert!(!logfile.sealed);
+        assert_eq!(logfile.records_end().unwrap(), FILE_HEADER_SIZE);
     }
 
     #[test]
@@ -626,10 +943,10 @@ mod tests {
         let offsets = write_raw(&path, &[b"hello".to_vec()]);
         seal_raw(&path);
 
-        // Blow up the length field to u32::MAX
+        // Encoded 1 decodes to u32::MAX - 1.
         let mut tmp = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         tmp.seek(std::io::SeekFrom::Start(offsets[0] + 16)).unwrap();
-        tmp.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        tmp.write_all(&1u32.to_le_bytes()).unwrap();
 
         let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
         let err = logfile.read_record(offsets[0]).unwrap_err();
@@ -756,6 +1073,105 @@ mod tests {
         let offsets = write_raw(&path, &[b"fresh".to_vec()]);
         let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
         assert_eq!(logfile.read_record(offsets[0]).unwrap(), b"fresh");
+    }
+
+    #[test]
+    fn test_recover_discards_tail_when_newest_end_slot_is_torn() {
+        use std::os::unix::fs::FileExt;
+
+        let (_dir, path) = temp_log("0000000015.log");
+        let first = write_raw(&path, &[b"committed".to_vec()])[0];
+        let first_end = first + RECORD_HEADER_SIZE + b"committed".len() as u64;
+        let second = write_raw(&path, &[b"slot-will-tear".to_vec()])[0];
+
+        // Commit 2 alternates back to slot 0. Corrupt its checksum so
+        // recovery must use slot 1 (commit 1) and discard commit 2's bytes.
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(&[0x7f], commit_slot_offset(0) + 16).unwrap();
+
+        assert_eq!(recover_unsealed::<SimpleFile>(&path).unwrap(), first_end);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), first_end);
+        let logfile: Logfile<SimpleFile> = Logfile::open(&path).unwrap();
+        assert_eq!(logfile.read_record(first).unwrap(), b"committed");
+        assert!(logfile.read_record(second).is_err());
+    }
+
+    #[test]
+    fn test_commit_slots_are_in_distinct_aligned_blocks() {
+        let first = commit_slot_offset(0);
+        let second = commit_slot_offset(1);
+        assert_eq!(first % HEADER_BLOCK_SIZE, 0);
+        assert_eq!(second % HEADER_BLOCK_SIZE, 0);
+        assert_ne!(first / HEADER_BLOCK_SIZE, second / HEADER_BLOCK_SIZE);
+        assert!(second + COMMIT_SLOT_SIZE <= FILE_HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_recovery_never_truncates_below_older_committed_slot() {
+        use std::os::unix::fs::FileExt;
+
+        let (_dir, path) = temp_log("0000000016.log");
+        let first = write_raw(&path, &[b"must-survive".to_vec()])[0];
+        write_raw(&path, &[b"newest".to_vec()]);
+        let original_len = std::fs::metadata(&path).unwrap().len();
+
+        // Damage data covered by the older valid slot. This is not a torn
+        // newest commit, so recovery must report corruption rather than
+        // silently roll back an already-committed record.
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(&[0x7f], first + RECORD_HEADER_SIZE).unwrap();
+
+        let err = recover_unsealed::<SimpleFile>(&path).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<LogfileError>(),
+            Some(LogfileError::Corrupted)
+        ));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), original_len);
+    }
+
+    #[test]
+    fn test_recovery_does_not_parse_sparse_zeroes_as_empty_records() {
+        let (_dir, path) = temp_log("0000000017.log");
+        let mut fio = SimpleFile::open(&path).unwrap();
+        write_header(&mut fio).unwrap();
+        let state = read_commit_state(&fio).unwrap();
+        let sparse_end = FILE_HEADER_SIZE + 2 * RECORD_HEADER_SIZE;
+        fio.set_len(sparse_end).unwrap();
+        // Simulate a committed-end slot reaching disk while the corresponding
+        // record pages remain unwritten sparse zeroes.
+        write_committed_end(&mut fio, state, sparse_end).unwrap();
+        fio.sync().unwrap();
+        drop(fio);
+
+        assert_eq!(
+            recover_unsealed::<SimpleFile>(&path).unwrap(),
+            FILE_HEADER_SIZE
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), FILE_HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_recovery_repair_keeps_previous_commit_as_floor() {
+        use std::os::unix::fs::FileExt;
+
+        let (_dir, path) = temp_log("0000000018.log");
+        let first = write_raw(&path, &[b"older".to_vec()])[0];
+        let first_end = first + RECORD_HEADER_SIZE + b"older".len() as u64;
+        let second = write_raw(&path, &[b"torn-newest".to_vec()])[0];
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(second + RECORD_HEADER_SIZE + 2).unwrap();
+
+        assert_eq!(recover_unsealed::<SimpleFile>(&path).unwrap(), first_end);
+
+        // If recovery had overwritten the alternate (older) slot, this
+        // corruption could be mistaken for another recoverable newest tail.
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(&[0x7f], first + RECORD_HEADER_SIZE).unwrap();
+        let err = recover_unsealed::<SimpleFile>(&path).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<LogfileError>(),
+            Some(LogfileError::Corrupted)
+        ));
     }
 
     #[test]

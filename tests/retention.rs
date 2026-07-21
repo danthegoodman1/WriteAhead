@@ -3,17 +3,20 @@
 //! `start()` returns) and after each rotation.
 
 use std::time::Duration;
-use writeahead::logfile::{now_ms, recover_and_seal};
+use writeahead::logfile::{now_ms, recover_and_seal, FILE_HEADER_SIZE, FOOTER_SIZE};
 use writeahead::{RetentionOptions, SimpleFile, WriteAhead, WriteAheadOptions};
 
 #[tokio::test]
 async fn size_retention_deletes_oldest_sealed_files() {
     let dir = tempfile::tempdir().unwrap();
+    let max_file_size = FILE_HEADER_SIZE + 128;
+    let max_total_size = 3 * (max_file_size + FOOTER_SIZE);
     let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
         log_dir: dir.path().to_path_buf(),
-        max_file_size: 128,
+        max_file_size,
+        preallocation_chunk_size: Some(4_096),
         retention: RetentionOptions {
-            max_total_size: 400,
+            max_total_size,
             ..Default::default()
         },
     });
@@ -39,7 +42,7 @@ async fn size_retention_deletes_oldest_sealed_files() {
         .map(|e| e.unwrap().metadata().unwrap().len())
         .sum();
     assert!(
-        total <= 400 + 128 + 64,
+        total <= max_total_size + max_file_size + FOOTER_SIZE,
         "disk usage {} not bounded by retention",
         total
     );
@@ -101,7 +104,7 @@ async fn retention_disabled_deletes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let mut wal = WriteAhead::<SimpleFile>::with_options(WriteAheadOptions {
         log_dir: dir.path().to_path_buf(),
-        max_file_size: 64,
+        max_file_size: FILE_HEADER_SIZE + 64,
         ..Default::default()
     });
     wal.start().unwrap();
