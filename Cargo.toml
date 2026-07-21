@@ -1,6 +1,6 @@
 [package]
 name = "writeahead"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 description = "A partitioned write-ahead log (WAL) for building append-only, high-throughput durability systems"
 license = "MIT OR Apache-2.0"
