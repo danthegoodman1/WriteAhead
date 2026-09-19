@@ -2,6 +2,7 @@
 name = "writeahead"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.89"
 description = "A partitioned write-ahead log (WAL) for building append-only, high-throughput durability systems"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/danthegoodman1/WriteAhead"

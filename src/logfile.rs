@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use futures::Stream;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{trace, warn};
@@ -63,10 +64,10 @@ pub struct Logfile<F: FileIo> {
     pub sealed: bool,
     /// Unix ms timestamp from the seal footer, when sealed.
     pub seal_timestamp_ms: Option<u64>,
-    /// End of the record region. `Some` iff sealed; unsealed files grow.
+    /// Fixed end for sealed files or a manager-created durable snapshot.
     records_end: Option<u64>,
     path: PathBuf,
-    fio: F,
+    fio: Arc<F>,
 }
 
 pub const MAGIC_NUMBER: [u8; 8] = [0xff; 8];
@@ -171,28 +172,12 @@ fn read_record_at<F: FileIo>(fio: &F, offset: u64, records_end: u64) -> Result<(
 
     // One speculative pread covers the header plus (usually) the whole record
     let first_len = (records_end - offset).min(SPECULATIVE_READ.max(RECORD_HEADER_SIZE));
-    let mut first = vec![0u8; first_len as usize];
-    fio.read_at(offset, &mut first)
+    let mut block = [0u8; SPECULATIVE_READ as usize];
+    let first = &mut block[..first_len as usize];
+    fio.read_at(offset, first)
         .context("Failed to read record header")?;
-    let hash1 = i64::from_le_bytes(first[0..8].try_into().unwrap());
-    let hash2 = i64::from_le_bytes(first[8..16].try_into().unwrap());
-    let encoded_length = u32::from_le_bytes(first[16..20].try_into().unwrap());
-    // Lengths are stored inverted so an unwritten sparse region (all zeroes)
-    // cannot masquerade as a run of valid empty records. u32::MAX payloads
-    // are rejected on write, making encoded zero permanently invalid.
-    if encoded_length == 0 {
-        return Err(anyhow!(LogfileError::PartialWrite));
-    }
-    let length = (!encoded_length) as u64;
-
-    // Bounds check before allocating: a corrupted length must not drive a
-    // giant allocation or a read past the record region.
-    let data_end = data_start
-        .checked_add(length)
-        .ok_or(LogfileError::PartialWrite)?;
-    if data_end > records_end {
-        return Err(anyhow!(LogfileError::PartialWrite));
-    }
+    let header = RecordHeader::decode(first, offset, records_end)?;
+    let length = header.length as u64;
 
     let data = if RECORD_HEADER_SIZE + length <= first_len {
         first[RECORD_HEADER_SIZE as usize..(RECORD_HEADER_SIZE + length) as usize].to_vec()
@@ -205,24 +190,25 @@ fn read_record_at<F: FileIo>(fio: &F, offset: u64, records_end: u64) -> Result<(
         data
     };
 
-    let (computed1, computed2) = murmur3_128(&data);
-    if computed1 != hash1 || computed2 != hash2 {
-        return Err(anyhow!(LogfileError::Corrupted));
-    }
-
-    Ok((data, data_end))
+    header.verify(&data)?;
+    Ok((data, header.end))
 }
 
-/// Walks records from the start of the file and returns the end offset of
-/// the longest valid prefix. Only meaningful for unsealed files.
-fn scan_records_end<F: FileIo>(fio: &F, scan_limit: u64) -> u64 {
+/// Walk the valid prefix, but never turn an underlying read failure into
+/// permission to truncate. Streaming and recovery share the same decoder.
+fn scan_records_end<F: FileIo>(fio: &F, scan_limit: u64) -> Result<u64> {
+    let mut buffer = RecordBuffer::default();
     let mut offset = FILE_HEADER_SIZE;
-    loop {
-        match read_record_at(fio, offset, scan_limit) {
+    while offset < scan_limit {
+        match buffer.read(fio, offset, scan_limit) {
             Ok((_, next)) => offset = next,
-            Err(_) => return offset,
+            Err(e) => match e.downcast_ref::<LogfileError>() {
+                Some(LogfileError::PartialWrite | LogfileError::Corrupted) => return Ok(offset),
+                _ => return Err(e),
+            },
         }
     }
+    Ok(offset)
 }
 
 fn build_footer(records_end: u64, ts_ms: u64) -> [u8; FOOTER_SIZE as usize] {
@@ -494,7 +480,7 @@ pub fn recover_unsealed<F: FileIo>(path: &Path) -> Result<u64> {
     // the upper bound. If a crash persisted the slot but only a prefix of its
     // record bytes, retain that longest valid prefix.
     let scan_limit = commit.records_end.min(len);
-    let end = scan_records_end(&fio, scan_limit);
+    let end = scan_records_end(&fio, scan_limit)?;
     if end < committed_floor {
         return Err(anyhow!(LogfileError::Corrupted));
     }
@@ -554,7 +540,7 @@ impl<F: FileIo> Logfile<F> {
             seal_timestamp_ms: None,
             records_end: None,
             path: path.to_path_buf(),
-            fio,
+            fio: Arc::new(fio),
         };
         logfile.refresh_seal()?;
         Ok(logfile)
@@ -568,10 +554,10 @@ impl<F: FileIo> Logfile<F> {
     /// returned end (not a fresh `len()`) — a second length observation
     /// could already include a footer this probe never saw.
     pub(crate) fn refresh_seal(&mut self) -> Result<u64> {
-        if self.sealed {
+        if self.records_end.is_some() {
             return self.records_end();
         }
-        let committed_end = read_commit_state(&self.fio)?.records_end;
+        let committed_end = read_commit_state(self.fio.as_ref())?.records_end;
         let footer_end = committed_end
             .checked_add(FOOTER_SIZE)
             .ok_or(LogfileError::PartialWrite)?;
@@ -613,7 +599,24 @@ impl<F: FileIo> Logfile<F> {
             offset,
             self.sealed
         );
-        read_record_at(&self.fio, offset, self.records_end()?)
+        read_record_at(self.fio.as_ref(), offset, self.records_end()?)
+    }
+
+    pub(crate) fn read_record_until(&self, offset: u64, end: u64) -> Result<Vec<u8>> {
+        read_record_at(self.fio.as_ref(), offset, end).map(|(data, _)| data)
+    }
+
+    /// A fixed boundary and a shared open descriptor; no path reopen can
+    /// race retention, and later writes cannot extend this view.
+    pub(crate) fn snapshot(&self, end: u64) -> Self {
+        Self {
+            id: self.id,
+            sealed: self.sealed,
+            seal_timestamp_ms: self.seal_timestamp_ms,
+            records_end: Some(end),
+            path: self.path.clone(),
+            fio: Arc::clone(&self.fio),
+        }
     }
 
     /// End of the record region: fixed for sealed files and read from the
@@ -621,7 +624,7 @@ impl<F: FileIo> Logfile<F> {
     pub fn records_end(&self) -> Result<u64> {
         match self.records_end {
             Some(end) => Ok(end),
-            None => Ok(read_commit_state(&self.fio)?.records_end),
+            None => Ok(read_commit_state(self.fio.as_ref())?.records_end),
         }
     }
 
@@ -631,11 +634,6 @@ impl<F: FileIo> Logfile<F> {
 
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Raw positional read within the file, for buffered streaming.
-    pub(crate) fn read_into(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        self.fio.read_at(offset, buf)
     }
 }
 
@@ -647,9 +645,7 @@ impl<F: FileIo> Logfile<F> {
 pub struct LogFileStream<F: FileIo> {
     logfile: Logfile<F>,
     offset: u64,
-    buf: Vec<u8>,
-    /// Absolute file offset of `buf[0]`.
-    buf_start: u64,
+    buffer: RecordBuffer,
     /// Last observed record-region end for unsealed files (see records_end).
     known_end: u64,
 }
@@ -667,8 +663,7 @@ impl<F: FileIo> LogFileStream<F> {
         Self {
             logfile,
             offset: offset.max(FILE_HEADER_SIZE),
-            buf: Vec::new(),
-            buf_start: 0,
+            buffer: RecordBuffer::default(),
             known_end: 0,
         }
     }
@@ -700,61 +695,106 @@ impl<F: FileIo> LogFileStream<F> {
         Ok(self.known_end)
     }
 
-    /// Makes `buf` cover `[start, start + need)`. The caller must have
-    /// checked that the range lies within the record region.
-    fn ensure_buffered(&mut self, start: u64, need: u64, records_end: u64) -> Result<()> {
-        let have_end = self.buf_start + self.buf.len() as u64;
-        if start >= self.buf_start && start + need <= have_end {
+    fn next_record(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
+        let end = self.records_end()?;
+        if self.offset >= end {
+            return Ok(None);
+        }
+        let (data, next) = self
+            .buffer
+            .read(self.logfile.fio.as_ref(), self.offset, end)?;
+        let record = (self.offset, data.to_vec());
+        self.offset = next;
+        Ok(Some(record))
+    }
+}
+
+/// Reusable readahead and decoding. Recovery borrows verified payloads;
+/// only public stream delivery needs to allocate an owned record.
+#[derive(Default)]
+struct RecordBuffer {
+    buf: Vec<u8>,
+    start: u64,
+}
+
+impl RecordBuffer {
+    #[inline]
+    fn ensure<F: FileIo>(&mut self, fio: &F, start: u64, need: u64, end: u64) -> Result<()> {
+        if start >= self.start && start + need <= self.start + self.buf.len() as u64 {
             return Ok(());
         }
-        let read_len = need.max((records_end - start).min(STREAM_CHUNK));
-        self.buf.resize(read_len as usize, 0);
-        self.logfile.read_into(start, &mut self.buf)?;
-        self.buf_start = start;
+        let length = need.max((end - start).min(STREAM_CHUNK));
+        self.buf.resize(length as usize, 0);
+        // A failed read may have overwritten some bytes. Never reuse them.
+        if let Err(e) = fio.read_at(start, &mut self.buf) {
+            self.buf.clear();
+            return Err(e);
+        }
+        self.start = start;
         Ok(())
     }
 
-    fn next_record(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
-        let records_end = self.records_end()?;
-        if self.offset >= records_end {
-            return Ok(None);
+    #[inline]
+    fn read<F: FileIo>(&mut self, fio: &F, offset: u64, end: u64) -> Result<(&[u8], u64)> {
+        if offset < FILE_HEADER_SIZE {
+            return Err(LogfileError::InvalidOffset(offset).into());
         }
-        if self.offset + RECORD_HEADER_SIZE > records_end {
-            return Err(anyhow!(LogfileError::PartialWrite));
+        if offset
+            .checked_add(RECORD_HEADER_SIZE)
+            .is_none_or(|start| start > end)
+        {
+            return Err(LogfileError::PartialWrite.into());
         }
+        self.ensure(fio, offset, RECORD_HEADER_SIZE, end)?;
+        let base = (offset - self.start) as usize;
+        let header = RecordHeader::decode(
+            &self.buf[base..base + RECORD_HEADER_SIZE as usize],
+            offset,
+            end,
+        )?;
+        self.ensure(fio, offset, header.end - offset, end)?;
+        let base = (offset - self.start) as usize + RECORD_HEADER_SIZE as usize;
+        let data = &self.buf[base..base + header.length];
+        header.verify(data)?;
+        Ok((data, header.end))
+    }
+}
 
-        self.ensure_buffered(self.offset, RECORD_HEADER_SIZE, records_end)?;
-        let base = (self.offset - self.buf_start) as usize;
-        let hash1 = i64::from_le_bytes(self.buf[base..base + 8].try_into().unwrap());
-        let hash2 = i64::from_le_bytes(self.buf[base + 8..base + 16].try_into().unwrap());
-        let encoded_length = u32::from_le_bytes(self.buf[base + 16..base + 20].try_into().unwrap());
-        if encoded_length == 0 {
-            return Err(anyhow!(LogfileError::PartialWrite));
-        }
-        let length = (!encoded_length) as u64;
+struct RecordHeader {
+    hash: (i64, i64),
+    length: usize,
+    end: u64,
+}
 
-        let data_end = self
-            .offset
-            .checked_add(RECORD_HEADER_SIZE + length)
+impl RecordHeader {
+    #[inline]
+    fn decode(bytes: &[u8], offset: u64, end: u64) -> Result<Self> {
+        let encoded = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        if encoded == 0 {
+            return Err(LogfileError::PartialWrite.into());
+        }
+        let length = !encoded as usize;
+        let data_end = offset
+            .checked_add(RECORD_HEADER_SIZE)
+            .and_then(|start| start.checked_add(length as u64))
+            .filter(|data_end| *data_end <= end)
             .ok_or(LogfileError::PartialWrite)?;
-        if data_end > records_end {
-            return Err(anyhow!(LogfileError::PartialWrite));
+        Ok(Self {
+            hash: (
+                i64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+                i64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            ),
+            length,
+            end: data_end,
+        })
+    }
+
+    #[inline]
+    fn verify(&self, data: &[u8]) -> Result<()> {
+        if murmur3_128(data) != self.hash {
+            return Err(LogfileError::Corrupted.into());
         }
-
-        // May refill (and move) the buffer, so recompute the base offset
-        self.ensure_buffered(self.offset, RECORD_HEADER_SIZE + length, records_end)?;
-        let base = (self.offset - self.buf_start) as usize;
-        let data_base = base + RECORD_HEADER_SIZE as usize;
-        let data = self.buf[data_base..data_base + length as usize].to_vec();
-
-        let (computed1, computed2) = murmur3_128(&data);
-        if computed1 != hash1 || computed2 != hash2 {
-            return Err(anyhow!(LogfileError::Corrupted));
-        }
-
-        let record_offset = self.offset;
-        self.offset = data_end;
-        Ok(Some((record_offset, data)))
+        Ok(())
     }
 }
 

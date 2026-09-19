@@ -12,6 +12,10 @@ const BATCH_SIZE: usize = 1_000;
 const CONCURRENT_THREADS: usize = 8;
 const CONCURRENT_WRITES_PER_THREAD: usize = 250;
 const PAYLOAD_LEN: usize = 64;
+// Longer warm-cache samples reduce CPU frequency/scheduling noise compared
+// with a single 2-3 ms replay. Use the identical harness for baseline/current.
+const POINT_READ_PASSES: usize = 10;
+const STREAM_PASSES: usize = 20;
 
 fn payload(i: usize) -> Vec<u8> {
     let mut p = format!("record payload number {i:012} ").into_bytes();
@@ -81,15 +85,17 @@ async fn bench_batch_write(
 /// Point reads of every record written by bench_batch_write.
 fn bench_read_by_id(wal: &WriteAhead<SimpleFile>, ids: &[writeahead::RecordID]) {
     let start = Instant::now();
-    for id in ids {
-        let rec = wal.read(id.file_id, id.file_offset).unwrap();
-        assert_eq!(rec.len(), PAYLOAD_LEN);
+    for _ in 0..POINT_READ_PASSES {
+        for id in ids {
+            let rec = wal.read(id.file_id, id.file_offset).unwrap();
+            assert_eq!(rec.len(), PAYLOAD_LEN);
+        }
     }
     report(
         "read_by_id",
         start.elapsed(),
-        ids.len(),
-        ids.len() * PAYLOAD_LEN,
+        ids.len() * POINT_READ_PASSES,
+        ids.len() * POINT_READ_PASSES * PAYLOAD_LEN,
     );
 }
 
@@ -97,17 +103,19 @@ fn bench_read_by_id(wal: &WriteAhead<SimpleFile>, ids: &[writeahead::RecordID]) 
 async fn bench_stream_replay(wal: &WriteAhead<SimpleFile>, expected: usize) {
     use futures::StreamExt;
     let start = Instant::now();
-    let mut stream = wal.create_stream().unwrap();
     let mut n = 0usize;
-    while let Some(r) = stream.next().await {
-        n += r.unwrap().1.len();
+    for _ in 0..STREAM_PASSES {
+        let mut stream = wal.create_stream().unwrap();
+        while let Some(r) = stream.next().await {
+            n += r.unwrap().1.len();
+        }
     }
-    assert_eq!(n, expected * PAYLOAD_LEN);
+    assert_eq!(n, expected * STREAM_PASSES * PAYLOAD_LEN);
     report(
         "stream_replay",
         start.elapsed(),
-        expected,
-        expected * PAYLOAD_LEN,
+        expected * STREAM_PASSES,
+        expected * STREAM_PASSES * PAYLOAD_LEN,
     );
 }
 
@@ -141,6 +149,15 @@ fn bench_handle_concurrent(dir: &std::path::Path) {
     );
 }
 
+/// Scan the same active record region on restart, with warm page-cache data.
+fn bench_recovery(dir: &std::path::Path, wal: WriteAhead<SimpleFile>, records: usize) {
+    drop(wal);
+    let start = Instant::now();
+    let mut reopened = wal_in(dir);
+    reopened.start().unwrap();
+    report("recovery", start.elapsed(), records, records * PAYLOAD_LEN);
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     println!(
@@ -162,6 +179,7 @@ async fn main() {
     let (wal, ids) = bench_batch_write(&batch_dir).await;
     bench_read_by_id(&wal, &ids);
     bench_stream_replay(&wal, BATCHES * BATCH_SIZE).await;
+    bench_recovery(&batch_dir, wal, BATCHES * BATCH_SIZE);
 
     bench_handle_concurrent(&dir.path().join("handle"));
 }

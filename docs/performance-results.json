@@ -1,0 +1,142 @@
+{
+  "baseline_commit": "6bc7aed2d4870e124c0cb10553685145ca39d635",
+  "measured_at_utc": "2026-09-19T14:44:41.150547+00:00",
+  "platform": "Linux-7.0.0-30-generic-x86_64-with-glibc2.43",
+  "compiler": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+  "filesystem": "ext4 /dev/nvme0n1p2[/home/dangoodman/projects/WriteAhead]",
+  "cpu": "Intel(R) Core(TM) Ultra 9 285",
+  "method": "Five alternating pairs, release build, identical current examples/bench.rs in baseline and current trees, WAL files on repository filesystem. Read-by-ID: 10 passes; replay: 20 passes; other scenarios: one pass per run.",
+  "runs": [
+    {
+      "pair": 1,
+      "build": "baseline",
+      "rates_per_second": {
+        "seq_write_1rec": 456.0,
+        "batch_write": 233460.0,
+        "read_by_id": 708982.0,
+        "stream_replay": 43270308.0,
+        "recovery": 3569907.0,
+        "handle_concurrent_8w": 1789.0
+      },
+      "stdout": "writeahead bench: 2000 seq writes, 100x1000 batch, 8 threads x 250 concurrent, 64B payloads\nseq_write_1rec           total=      4.384s ops=   2000 per_op=  2191.76us rate=         456/s throughput=    0.03MB/s\nbatch_write              total=   428.340ms ops= 100000 per_op=     4.28us rate=      233460/s throughput=   14.25MB/s\nread_by_id               total=      1.410s ops=1000000 per_op=     1.41us rate=      708982/s throughput=   43.27MB/s\nstream_replay            total=    46.221ms ops=2000000 per_op=     0.02us rate=    43270308/s throughput= 2641.01MB/s\nrecovery                 total=    28.012ms ops= 100000 per_op=     0.28us rate=     3569907/s throughput=  217.89MB/s\nhandle_concurrent_8w     total=      1.118s ops=   2000 per_op=   559.04us rate=        1789/s throughput=    0.11MB/s\n"
+    },
+    {
+      "pair": 1,
+      "build": "current",
+      "rates_per_second": {
+        "seq_write_1rec": 459.0,
+        "batch_write": 212426.0,
+        "read_by_id": 4384111.0,
+        "stream_replay": 49879434.0,
+        "recovery": 5281263.0,
+        "handle_concurrent_8w": 1815.0
+      },
+      "stdout": "writeahead bench: 2000 seq writes, 100x1000 batch, 8 threads x 250 concurrent, 64B payloads\nseq_write_1rec           total=      4.358s ops=   2000 per_op=  2179.06us rate=         459/s throughput=    0.03MB/s\nbatch_write              total=   470.752ms ops= 100000 per_op=     4.71us rate=      212426/s throughput=   12.97MB/s\nread_by_id               total=   228.096ms ops=1000000 per_op=     0.23us rate=     4384111/s throughput=  267.58MB/s\nstream_replay            total=    40.097ms ops=2000000 per_op=     0.02us rate=    49879434/s throughput= 3044.40MB/s\nrecovery                 total=    18.935ms ops= 100000 per_op=     0.19us rate=     5281263/s throughput=  322.34MB/s\nhandle_concurrent_8w     total=      1.102s ops=   2000 per_op=   551.10us rate=        1815/s throughput=    0.11MB/s\n"
+    },
+    {
+      "pair": 2,
+      "build": "current",
+      "rates_per_second": {
+        "seq_write_1rec": 456.0,
+        "batch_write": 219549.0,
+        "read_by_id": 4968859.0,
+        "stream_replay": 50659553.0,
+        "recovery": 6867890.0,
+        "handle_concurrent_8w": 1809.0
+      },
+      "stdout": "writeahead bench: 2000 seq writes, 100x1000 batch, 8 threads x 250 concurrent, 64B payloads\nseq_write_1rec           total=      4.384s ops=   2000 per_op=  2191.88us rate=         456/s throughput=    0.03MB/s\nbatch_write              total=   455.479ms ops= 100000 per_op=     4.55us rate=      219549/s throughput=   13.40MB/s\nread_by_id               total=   201.253ms ops=1000000 per_op=     0.20us rate=     4968859/s throughput=  303.28MB/s\nstream_replay            total=    39.479ms ops=2000000 per_op=     0.02us rate=    50659553/s throughput= 3092.01MB/s\nrecovery                 total=    14.561ms ops= 100000 per_op=     0.15us rate=     6867890/s throughput=  419.18MB/s\nhandle_concurrent_8w     total=      1.105s ops=   2000 per_op=   552.65us rate=        1809/s throughput=    0.11MB/s\n"
+    },
+    {
+      "pair": 2,
+      "build": "baseline",
+      "rates_per_second": {
+        "seq_write_1rec": 466.0,
+        "batch_write": 220017.0,
+        "read_by_id": 730549.0,
+        "stream_replay": 44283643.0,
+        "recovery": 3745860.0,
+        "handle_concurrent_8w": 1828.0
+      },
+      "stdout": "writeahead bench: 2000 seq writes, 100x1000 batch, 8 threads x 250 concurrent, 64B payloads\nseq_write_1rec           total=      4.294s ops=   2000 per_op=  2146.97us rate=         466/s throughput=    0.03MB/s\nbatch_write              total=   454.510ms ops= 100000 per_op=     4.55us rate=      220017/s throughput=   13.43MB/s\nread_by_id               total=      1.369s ops=1000000 per_op=     1.37us rate=      730549/s throughput=   44.59MB/s\nstream_replay            total=    45.163ms ops=2000000 per_op=     0.02us rate=    44283643/s throughput= 2702.86MB/s\nrecovery                 total=    26.696ms ops= 100000 per_op=     0.27us rate=     3745860/s throughput=  228.63MB/s\nhandle_concurrent_8w     total=      1.094s ops=   2000 per_op=   547.03us rate=        1828/s throughput=    0.11MB/s\n"
+    },
+    {
+      "pair": 3,
+      "build": "baseline",
+      "rates_per_second": {
+        "seq_write_1rec": 461.0,
+        "batch_write": 211631.0,
+        "read_by_id": 719035.0,
+        "stream_replay": 44885688.0,
+        "recovery": 3770879.0,
+        "handle_concurrent_8w": 1536.0
+      },
+      "stdout": "writeahead bench: 2000 seq writes, 100x1000 batch, 8 threads x 250 concurrent, 64B payloads\nseq_write_1rec           total=      4.342s ops=   2000 per_op=  2171.00us rate=         461/s throughput=    0.03MB/s\nbatch_write              total=   472.520ms ops= 100000 per_op=     4.73us rate=      211631/s throughput=   12.92MB/s\nread_by_id               total=      1.391s ops=1000000 per_op=     1.39us rate=      719035/s throughput=   43.89MB/s\nstream_replay            total=    44.558ms ops=2000000 per_op=     0.02us rate=    44885688/s throughput= 2739.60MB/s\nrecovery                 total=    26.519ms ops= 100000 per_op=     0.27us rate=     3770879/s throughput=  230.16MB/s\nhandle_concurrent_8w     total=      1.302s ops=   2000 per_op=   651.02us rate=        1536/s throughput=    0.09MB/s\n"
+    },
+    {
+      "pair": 3,
+      "build": "current",
+      "rates_per_second": {
+        "seq_write_1rec": 463.0,
+        "batch_write": 221389.0,
+        "read_by_id": 5034767.0,
+        "stream_replay": 50455370.0,
+        "recovery": 5376895.0,
+        "handle_concurrent_8w": 1796.0
+      },
+      "stdout": "writeahead bench: 2000 seq writes, 100x1000 batch, 8 threads x 250 concurrent, 64B payloads\nseq_write_1rec           total=      4.319s ops=   2000 per_op=  2159.25us rate=         463/s throughput=    0.03MB/s\nbatch_write              total=   451.694ms ops= 100000 per_op=     4.52us rate=      221389/s throughput=   13.51MB/s\nread_by_id               total=   198.619ms ops=1000000 per_op=     0.20us rate=     5034767/s throughput=  307.30MB/s\nstream_replay            total=    39.639ms ops=2000000 per_op=     0.02us rate=    50455370/s throughput= 3079.55MB/s\nrecovery                 total=    18.598ms ops= 100000 per_op=     0.19us rate=     5376895/s throughput=  328.18MB/s\nhandle_concurrent_8w     total=      1.114s ops=   2000 per_op=   556.88us rate=        1796/s throughput=    0.11MB/s\n"
+    },
+    {
+      "pair": 4,
+      "build": "current",
+      "rates_per_second": {
+        "seq_write_1rec": 462.0,
+        "batch_write": 217604.0,
+        "read_by_id": 4990764.0,
+        "stream_replay": 52035358.0,
+        "recovery": 5118871.0,
+        "handle_concurrent_8w": 1781.0
+      },
+      "stdout": "writeahead bench: 2000 seq writes, 100x1000 batch, 8 threads x 250 concurrent, 64B payloads\nseq_write_1rec           total=      4.326s ops=   2000 per_op=  2163.24us rate=         462/s throughput=    0.03MB/s\nbatch_write              total=   459.550ms ops= 100000 per_op=     4.60us rate=      217604/s throughput=   13.28MB/s\nread_by_id               total=   200.370ms ops=1000000 per_op=     0.20us rate=     4990764/s throughput=  304.61MB/s\nstream_replay            total=    38.435ms ops=2000000 per_op=     0.02us rate=    52035358/s throughput= 3175.99MB/s\nrecovery                 total=    19.536ms ops= 100000 per_op=     0.20us rate=     5118871/s throughput=  312.43MB/s\nhandle_concurrent_8w     total=      1.123s ops=   2000 per_op=   561.46us rate=        1781/s throughput=    0.11MB/s\n"
+    },
+    {
+      "pair": 4,
+      "build": "baseline",
+      "rates_per_second": {
+        "seq_write_1rec": 464.0,
+        "batch_write": 196056.0,
+        "read_by_id": 730185.0,
+        "stream_replay": 44636174.0,
+        "recovery": 4127041.0,
+        "handle_concurrent_8w": 1336.0
+      },
+      "stdout": "writeahead bench: 2000 seq writes, 100x1000 batch, 8 threads x 250 concurrent, 64B payloads\nseq_write_1rec           total=      4.306s ops=   2000 per_op=  2152.94us rate=         464/s throughput=    0.03MB/s\nbatch_write              total=   510.058ms ops= 100000 per_op=     5.10us rate=      196056/s throughput=   11.97MB/s\nread_by_id               total=      1.370s ops=1000000 per_op=     1.37us rate=      730185/s throughput=   44.57MB/s\nstream_replay            total=    44.807ms ops=2000000 per_op=     0.02us rate=    44636174/s throughput= 2724.38MB/s\nrecovery                 total=    24.230ms ops= 100000 per_op=     0.24us rate=     4127041/s throughput=  251.89MB/s\nhandle_concurrent_8w     total=      1.497s ops=   2000 per_op=   748.63us rate=        1336/s throughput=    0.08MB/s\n"
+    },
+    {
+      "pair": 5,
+      "build": "baseline",
+      "rates_per_second": {
+        "seq_write_1rec": 454.0,
+        "batch_write": 223358.0,
+        "read_by_id": 727866.0,
+        "stream_replay": 45209290.0,
+        "recovery": 3819583.0,
+        "handle_concurrent_8w": 1815.0
+      },
+      "stdout": "writeahead bench: 2000 seq writes, 100x1000 batch, 8 threads x 250 concurrent, 64B payloads\nseq_write_1rec           total=      4.407s ops=   2000 per_op=  2203.40us rate=         454/s throughput=    0.03MB/s\nbatch_write              total=   447.712ms ops= 100000 per_op=     4.48us rate=      223358/s throughput=   13.63MB/s\nread_by_id               total=      1.374s ops=1000000 per_op=     1.37us rate=      727866/s throughput=   44.43MB/s\nstream_replay            total=    44.239ms ops=2000000 per_op=     0.02us rate=    45209290/s throughput= 2759.36MB/s\nrecovery                 total=    26.181ms ops= 100000 per_op=     0.26us rate=     3819583/s throughput=  233.13MB/s\nhandle_concurrent_8w     total=      1.102s ops=   2000 per_op=   551.11us rate=        1815/s throughput=    0.11MB/s\n"
+    },
+    {
+      "pair": 5,
+      "build": "current",
+      "rates_per_second": {
+        "seq_write_1rec": 464.0,
+        "batch_write": 216870.0,
+        "read_by_id": 4621643.0,
+        "stream_replay": 51256648.0,
+        "recovery": 5115745.0,
+        "handle_concurrent_8w": 1818.0
+      },
+      "stdout": "writeahead bench: 2000 seq writes, 100x1000 batch, 8 threads x 250 concurrent, 64B payloads\nseq_write_1rec           total=      4.310s ops=   2000 per_op=  2155.15us rate=         464/s throughput=    0.03MB/s\nbatch_write              total=   461.107ms ops= 100000 per_op=     4.61us rate=      216870/s throughput=   13.24MB/s\nread_by_id               total=   216.373ms ops=1000000 per_op=     0.22us rate=     4621643/s throughput=  282.08MB/s\nstream_replay            total=    39.019ms ops=2000000 per_op=     0.02us rate=    51256648/s throughput= 3128.46MB/s\nrecovery                 total=    19.547ms ops= 100000 per_op=     0.20us rate=     5115745/s throughput=  312.24MB/s\nhandle_concurrent_8w     total=      1.100s ops=   2000 per_op=   550.20us rate=        1818/s throughput=    0.11MB/s\n"
+    }
+  ],
+  "benchmark_harness_sha256": "9ecac8ec422624e98b2c2a961fac27c28fd7d736190a2ded7ac8b1684dc7fe04"
+}

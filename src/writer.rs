@@ -11,16 +11,18 @@
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock, Weak};
 use std::thread;
 use tracing::{debug, error, trace, warn};
 
 use crate::fileio::{sync_dir, FileIo};
 use crate::logfile::{
     append_footer, encode_records, log_file_path, now_ms, read_commit_state, write_committed_end,
-    write_header, CommitState, LogfileError, FILE_HEADER_SIZE, FOOTER_SIZE, RECORD_HEADER_SIZE,
+    write_header, CommitState, Logfile, LogfileError, FILE_HEADER_SIZE, FOOTER_SIZE,
+    RECORD_HEADER_SIZE,
 };
 use crate::record::RecordID;
-use crate::write_ahead::{WriteAheadError, WriteAheadOptions};
+use crate::write_ahead::{ReaderMap, SharedReaders, WriteAheadError, WriteAheadOptions};
 
 pub(crate) enum WriterCommand {
     Write(flume::Sender<Result<WriteAck>>, Vec<Vec<u8>>),
@@ -31,6 +33,7 @@ pub(crate) enum WriterCommand {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TrimStats {
     pub files_deleted: u64,
+    /// Lengths of unlinked files. Storage may remain pinned by open streams.
     pub bytes_reclaimed: u64,
 }
 
@@ -40,14 +43,6 @@ pub(crate) struct WriteAck {
     /// and commit, so this is part of the ack).
     pub file_id: u64,
     pub offsets: Vec<u64>,
-}
-
-/// Lifecycle notifications for the read side's file cache.
-#[derive(Debug, Clone)]
-pub(crate) enum WriterEvent {
-    Created(u64, PathBuf),
-    Sealed(u64),
-    Deleted(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -65,9 +60,28 @@ pub(crate) struct FileMeta {
 /// Handles stay valid across log rotations (each ack names the file the
 /// records landed in) and keep the writer alive even if the owning
 /// [crate::WriteAhead] is dropped.
+/// Dropping the last handle waits for accepted commands and thread exit.
 #[derive(Debug, Clone)]
 pub struct WriteHandle {
-    pub(crate) tx: flume::Sender<WriterCommand>,
+    runtime: Arc<WriterRuntime>,
+}
+
+#[derive(Debug)]
+struct WriterRuntime {
+    tx: Option<flume::Sender<WriterCommand>>,
+    thread: Option<thread::JoinHandle<()>>,
+    max_batch_bytes: usize,
+}
+
+impl Drop for WriterRuntime {
+    fn drop(&mut self) {
+        // Last handle: close admission, drain accepted commands, then release
+        // the writer's directory lock. No actor retains this runtime Arc.
+        drop(self.tx.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl WriteHandle {
@@ -78,11 +92,19 @@ impl WriteHandle {
     }
 
     /// Writes a batch of records durably (contiguous, all in one file) and
-    /// returns their addresses.
+    /// returns their addresses. Admission waits asynchronously when the queue
+    /// is full. Cancellation after admission does not roll back the write.
     pub async fn write_batch(&self, records: Vec<Vec<u8>>) -> Result<Vec<RecordID>> {
+        if batch_bytes(&records)? > self.runtime.max_batch_bytes {
+            return Err(WriteAheadError::BatchTooLarge(self.runtime.max_batch_bytes).into());
+        }
         let (tx, rx) = flume::bounded(1);
-        self.tx
-            .send(WriterCommand::Write(tx, records))
+        self.runtime
+            .tx
+            .as_ref()
+            .expect("live runtime")
+            .send_async(WriterCommand::Write(tx, records))
+            .await
             .map_err(|_| WriteAheadError::WriterClosed)?;
         let ack = rx
             .recv_async()
@@ -107,8 +129,12 @@ impl WriteHandle {
     /// into trimmed files return `LogfileNotFound`.
     pub async fn trim_before(&self, file_id: u64) -> Result<TrimStats> {
         let (tx, rx) = flume::bounded(1);
-        self.tx
-            .send(WriterCommand::Trim(tx, file_id))
+        self.runtime
+            .tx
+            .as_ref()
+            .expect("live runtime")
+            .send_async(WriterCommand::Trim(tx, file_id))
+            .await
             .map_err(|_| WriteAheadError::WriterClosed)?;
         Ok(rx
             .recv_async()
@@ -122,12 +148,53 @@ type ReplyTx = flume::Sender<Result<WriteAck>>;
 /// Stop draining a group-commit round once this many payload bytes are
 /// queued, so latency stays bounded under a firehose of writers.
 const MAX_GROUP_COMMIT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GROUP_COMMIT_COMMANDS: usize = 64;
 
-fn batch_bytes(records: &[Vec<u8>]) -> usize {
-    records
-        .iter()
-        .map(|r| RECORD_HEADER_SIZE as usize + r.len())
-        .sum()
+pub(crate) fn validate_options(options: &WriteAheadOptions) -> Result<()> {
+    if options.queue_capacity == 0
+        || options.max_batch_bytes == 0
+        || options
+            .max_batch_bytes
+            .checked_add(MAX_GROUP_COMMIT_BYTES)
+            .is_none()
+    {
+        return Err(WriteAheadError::InvalidQueueOptions.into());
+    }
+    Ok(())
+}
+
+fn batch_bytes(records: &[Vec<u8>]) -> Result<usize> {
+    records.iter().try_fold(0usize, |total, record| {
+        if record.len() >= u32::MAX as usize {
+            return Err(LogfileError::RecordTooLarge.into());
+        }
+        total
+            .checked_add(RECORD_HEADER_SIZE as usize)
+            .and_then(|size| size.checked_add(record.len()))
+            .ok_or_else(|| WriteAheadError::BatchTooLarge(usize::MAX).into())
+    })
+}
+
+/// Check both limits before receiving another command, so ending a round
+/// never consumes a command that belongs to the next one.
+fn command_group(
+    first: WriterCommand,
+    recv: &flume::Receiver<WriterCommand>,
+) -> impl Iterator<Item = WriterCommand> + '_ {
+    let mut first = Some(first);
+    let mut bytes = 0usize;
+    let mut commands = 0usize;
+    std::iter::from_fn(move || {
+        if commands == MAX_GROUP_COMMIT_COMMANDS || bytes >= MAX_GROUP_COMMIT_BYTES {
+            return None;
+        }
+        let command = first.take().or_else(|| recv.try_recv().ok())?;
+        commands += 1;
+        if let WriterCommand::Write(_, data) = &command {
+            bytes += batch_bytes(data).expect("validated batch");
+        }
+        Some(command)
+    })
 }
 
 pub(crate) struct WalWriter<F: FileIo> {
@@ -142,9 +209,8 @@ pub(crate) struct WalWriter<F: FileIo> {
     /// Every live log file (including the active one), for retention.
     files: BTreeMap<u64, FileMeta>,
     recv: flume::Receiver<WriterCommand>,
-    /// Read side may be gone (manager dropped, handles alive) — send errors
-    /// are ignored throughout.
-    events: flume::Sender<WriterEvent>,
+    readers: Weak<RwLock<ReaderMap<F>>>,
+    _directory_lock: std::fs::File,
 }
 
 impl<F: FileIo + 'static> WalWriter<F> {
@@ -156,16 +222,16 @@ impl<F: FileIo + 'static> WalWriter<F> {
         active_id: u64,
         active_path: PathBuf,
         mut files: BTreeMap<u64, FileMeta>,
-    ) -> Result<(flume::Sender<WriterCommand>, flume::Receiver<WriterEvent>)> {
-        let (tx, rx) = flume::unbounded();
-        let (event_tx, event_rx) = flume::unbounded();
+        directory_lock: std::fs::File,
+    ) -> Result<(WriteHandle, SharedReaders<F>)> {
+        let (tx, rx) = flume::bounded(options.queue_capacity);
+        let max_batch_bytes = options.max_batch_bytes;
 
         let mut fio = F::open(&active_path)?;
         let len = fio.len()?;
         let (records_end, commit_state) = if len == 0 {
             write_header(&mut fio)?;
             fio.sync()?;
-            sync_dir(&options.log_dir)?;
             (FILE_HEADER_SIZE, read_commit_state(&fio)?)
         } else if len < FILE_HEADER_SIZE {
             // The manager recovers files before launching the writer, so a
@@ -175,6 +241,9 @@ impl<F: FileIo + 'static> WalWriter<F> {
             let state = read_commit_state(&fio)?;
             (state.records_end, state)
         };
+        // Also required on retry when a previous header sync succeeded but
+        // its directory sync failed. Visibility alone is not durability.
+        sync_dir(&options.log_dir)?;
         let allocated_end = len.max(records_end);
         files.insert(
             active_id,
@@ -194,7 +263,8 @@ impl<F: FileIo + 'static> WalWriter<F> {
             commit_state,
             files,
             recv: rx,
-            events: event_tx,
+            readers: Weak::new(),
+            _directory_lock: directory_lock,
         };
         // Grow the active file after its header is durable. The allocation
         // itself is covered by the next record sync and is never used as a
@@ -203,11 +273,30 @@ impl<F: FileIo + 'static> WalWriter<F> {
         // Synchronous so `start()` returns with retention already applied
         writer.apply_retention();
 
-        thread::Builder::new()
+        // Finish every fallible reader open before starting the actor. Failed
+        // startup drops all handles and the lock without a hidden writer.
+        let mut cache = BTreeMap::new();
+        for (id, meta) in &writer.files {
+            let logfile = Logfile::<F>::open(&meta.path)?;
+            let end = logfile.records_end()?;
+            cache.insert(*id, (Arc::new(logfile), end));
+        }
+        let readers = Arc::new(RwLock::new(cache));
+        writer.readers = Arc::downgrade(&readers);
+        let thread = thread::Builder::new()
             .name("wal-writer".into())
             .spawn(move || writer.actor_loop())
             .context("Failed to spawn writer thread")?;
-        Ok((tx, event_rx))
+        Ok((
+            WriteHandle {
+                runtime: Arc::new(WriterRuntime {
+                    tx: Some(tx),
+                    thread: Some(thread),
+                    max_batch_bytes,
+                }),
+            },
+            readers,
+        ))
     }
 
     fn actor_loop(mut self) {
@@ -216,26 +305,10 @@ impl<F: FileIo + 'static> WalWriter<F> {
             // Trims drained alongside writes run after the commit, so a trim
             // submitted after a write never races that write's file.
             let mut trims: Vec<(flume::Sender<TrimStats>, u64)> = Vec::new();
-            let mut queued_bytes = 0usize;
-
-            match first {
-                WriterCommand::Write(reply, data) => {
-                    queued_bytes += batch_bytes(&data);
-                    writes.push((reply, data));
-                }
-                WriterCommand::Trim(reply, upto) => trims.push((reply, upto)),
-            }
-
-            // Group commit: drain whatever else is already queued so all
-            // pending writes share a single write+fsync.
-            while queued_bytes < MAX_GROUP_COMMIT_BYTES {
-                match self.recv.try_recv() {
-                    Ok(WriterCommand::Write(reply, data)) => {
-                        queued_bytes += batch_bytes(&data);
-                        writes.push((reply, data));
-                    }
-                    Ok(WriterCommand::Trim(reply, upto)) => trims.push((reply, upto)),
-                    Err(_) => break,
+            for command in command_group(first, &self.recv) {
+                match command {
+                    WriterCommand::Write(reply, data) => writes.push((reply, data)),
+                    WriterCommand::Trim(reply, upto) => trims.push((reply, upto)),
                 }
             }
 
@@ -260,22 +333,15 @@ impl<F: FileIo + 'static> WalWriter<F> {
     fn commit_group(&mut self, group: Vec<(ReplyTx, Vec<Vec<u8>>)>) {
         // A dropped reply receiver is the caller's business, not our error:
         // send results are ignored throughout.
-        let mut valid: Vec<(ReplyTx, Vec<Vec<u8>>)> = Vec::with_capacity(group.len());
-        let mut total = 0usize;
-        for (reply, records) in group {
-            if records.iter().any(|r| r.len() >= u32::MAX as usize) {
-                let _ = reply.send(Err(anyhow!(LogfileError::RecordTooLarge)));
-                continue;
-            }
-            total += batch_bytes(&records);
-            valid.push((reply, records));
-        }
-        if valid.is_empty() {
-            return;
-        }
+        // Admission already checked every record and batch. The drain limits
+        // bound this sum, so no second validation/copy of the group is needed.
+        let total: usize = group
+            .iter()
+            .map(|(_, records)| batch_bytes(records).expect("validated batch"))
+            .sum();
         if total == 0 {
             // Nothing to persist (all batches empty): ack without an fsync
-            for (reply, _) in valid {
+            for (reply, _) in group {
                 let _ = reply.send(Ok(WriteAck {
                     file_id: self.file_id,
                     offsets: Vec::new(),
@@ -296,8 +362,8 @@ impl<F: FileIo + 'static> WalWriter<F> {
         if would_exceed && self.records_end > FILE_HEADER_SIZE {
             if let Err(e) = self.rotate() {
                 let msg = format!("Failed to rotate before commit: {e:#}");
-                for (reply, _) in valid {
-                    let _ = reply.send(Err(anyhow!("{}", msg.clone())));
+                for (reply, _) in group {
+                    let _ = reply.send(Err(anyhow!("{msg}")));
                 }
                 return;
             }
@@ -305,10 +371,10 @@ impl<F: FileIo + 'static> WalWriter<F> {
 
         let mut buf = Vec::with_capacity(total);
         let mut current_offset = self.records_end;
-        let mut per_caller_offsets: Vec<Vec<u64>> = Vec::with_capacity(valid.len());
-        for (_, records) in &valid {
+        let mut per_caller_offsets: Vec<Vec<u64>> = Vec::with_capacity(group.len());
+        for (_, records) in &group {
             let offsets = encode_records(&mut buf, records, current_offset);
-            current_offset += batch_bytes(records) as u64;
+            current_offset += batch_bytes(records).expect("validated batch") as u64;
             per_caller_offsets.push(offsets);
         }
 
@@ -331,7 +397,15 @@ impl<F: FileIo + 'static> WalWriter<F> {
                 if let Some(meta) = self.files.get_mut(&self.file_id) {
                     meta.size = current_offset;
                 }
-                for ((reply, _), offsets) in valid.into_iter().zip(per_caller_offsets) {
+                if let Some(readers) = self.readers.upgrade() {
+                    readers
+                        .write()
+                        .expect("reader cache poisoned")
+                        .get_mut(&self.file_id)
+                        .expect("active reader")
+                        .1 = current_offset;
+                }
+                for ((reply, _), offsets) in group.into_iter().zip(per_caller_offsets) {
                     let _ = reply.send(Ok(WriteAck {
                         file_id: self.file_id,
                         offsets,
@@ -340,12 +414,12 @@ impl<F: FileIo + 'static> WalWriter<F> {
             }
             Err(e) => {
                 // Nothing was acknowledged: records_end and commit_state stay
-                // put. Any partial bytes are beyond the committed boundary and
-                // are discarded by recovery. anyhow::Error isn't Clone, so
-                // each caller gets its own copy of the message.
+                // put. Failed writes stay invisible to live readers, but may
+                // survive recovery if their bytes reached disk. anyhow::Error
+                // isn't Clone, so each caller gets its own copy of the message.
                 let msg = format!("{e:#}");
-                for (reply, _) in valid {
-                    let _ = reply.send(Err(anyhow!("{}", msg.clone())));
+                for (reply, _) in group {
+                    let _ = reply.send(Err(anyhow!("{msg}")));
                 }
             }
         }
@@ -373,6 +447,11 @@ impl<F: FileIo + 'static> WalWriter<F> {
         fio.sync()?;
         sync_dir(&self.options.log_dir)?;
         let commit_state = read_commit_state(&fio)?;
+        let readers = self.readers.upgrade();
+        let reader = readers
+            .as_ref()
+            .map(|_| Logfile::<F>::open(&path))
+            .transpose()?;
         self.files.insert(
             next_id,
             FileMeta {
@@ -381,7 +460,12 @@ impl<F: FileIo + 'static> WalWriter<F> {
                 seal_timestamp_ms: None,
             },
         );
-        let _ = self.events.send(WriterEvent::Created(next_id, path));
+        if let (Some(readers), Some(reader)) = (readers, reader) {
+            readers
+                .write()
+                .expect("reader cache poisoned")
+                .insert(next_id, (Arc::new(reader), FILE_HEADER_SIZE));
+        }
 
         // Seal the old file. On failure it stays unsealed and recovery
         // heals it at the next start; new writes still go to the new file.
@@ -392,7 +476,6 @@ impl<F: FileIo + 'static> WalWriter<F> {
                     meta.size = self.records_end + FOOTER_SIZE;
                     meta.seal_timestamp_ms = Some(ts);
                 }
-                let _ = self.events.send(WriterEvent::Sealed(self.file_id));
                 debug!("sealed log file {}", self.file_id);
             }
             Err(e) => warn!("failed to seal log file {}: {e:#}", self.file_id),
@@ -520,12 +603,54 @@ impl<F: FileIo + 'static> WalWriter<F> {
                 }
                 stats.files_deleted += 1;
                 stats.bytes_reclaimed += meta.size;
-                let _ = self.events.send(WriterEvent::Deleted(id));
+                if let Some(readers) = self.readers.upgrade() {
+                    readers.write().expect("reader cache poisoned").remove(&id);
+                }
             }
         }
         if let Err(e) = sync_dir(&self.options.log_dir) {
             warn!("{}: failed to sync log dir: {e:#}", why);
         }
         stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_byte_commands_have_bounded_rounds_without_dropping_work() {
+        let (tx, rx) = flume::bounded(3 * MAX_GROUP_COMMIT_COMMANDS);
+        for i in 0..3 * MAX_GROUP_COMMIT_COMMANDS {
+            if i % 2 == 0 {
+                tx.send(WriterCommand::Trim(flume::bounded(1).0, i as u64))
+                    .unwrap();
+            } else {
+                tx.send(WriterCommand::Write(flume::bounded(1).0, Vec::new()))
+                    .unwrap();
+            }
+        }
+        for remaining in (0..3).rev() {
+            let group: Vec<_> = command_group(rx.recv().unwrap(), &rx).collect();
+            assert_eq!(group.len(), MAX_GROUP_COMMIT_COMMANDS);
+            assert_eq!(rx.len(), remaining * MAX_GROUP_COMMIT_COMMANDS);
+        }
+    }
+
+    #[test]
+    fn byte_limit_does_not_consume_the_next_command() {
+        let (tx, rx) = flume::bounded(2);
+        tx.send(WriterCommand::Trim(flume::bounded(1).0, 7))
+            .unwrap();
+        let first = WriterCommand::Write(
+            flume::bounded(1).0,
+            vec![vec![
+                0;
+                MAX_GROUP_COMMIT_BYTES - RECORD_HEADER_SIZE as usize
+            ]],
+        );
+        assert_eq!(command_group(first, &rx).count(), 1);
+        assert!(matches!(rx.try_recv().unwrap(), WriterCommand::Trim(_, 7)));
     }
 }
