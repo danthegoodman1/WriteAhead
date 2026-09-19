@@ -6,6 +6,8 @@
 
 A partitioned WAL crate for building append-only, high-throughput durability systems.
 
+Requires Rust 1.89 or later (uses standard-library file locking on Unix).
+
 A great component for a (distributed) data store. For distributed usage, consider FDB's model (you may want a custom in-memory index in front for custom ID→offset mappings).
 
 ## Guarantees
@@ -20,7 +22,7 @@ A great component for a (distributed) data store. For distributed usage, conside
 
 ```toml
 [dependencies]
-writeahead = "0.2"
+writeahead = "0.3"
 anyhow = "1"
 futures = "0.3"
 tokio = { version = "1", features = ["rt", "macros"] }
@@ -72,6 +74,28 @@ async fn main() -> anyhow::Result<()> {
 
 Retention is opt-in via `RetentionOptions`: `max_total_size` deletes the oldest sealed files once total disk usage exceeds the bound, and `ttl` deletes sealed files whose seal timestamp is older than the window. The active file is never deleted; reads into deleted files return `LogfileNotFound`. For consumer-driven cleanup, use `trim_before` instead — see the patterns below.
 
+`start()` exclusively locks the log directory before recovery. Repeated starts
+return `AlreadyStarted`; another manager or process using the same directory
+gets `DirectoryLocked`. WriteHandles keep ownership after the manager is dropped.
+Dropping the last handle waits for accepted commands and the writer thread to
+finish, then releases the lock so the directory can be reopened.
+
+Submission uses a bounded async queue: `queue_capacity` defaults to 64 commands,
+and `max_batch_bytes` defaults to 4 MiB of encoded records (payloads plus 20 bytes
+per record). A full queue suspends submission without blocking the executor;
+larger batches return `BatchTooLarge`. Both options must be positive. Existing
+complete `WriteAheadOptions` struct literals need these fields or
+`..Default::default()`.
+
+Queued encoded bytes are bounded by `queue_capacity * max_batch_bytes`.
+A drain round takes at most 64 commands and stops after reaching 4 MiB; its last
+batch may cross that target, so its encoded size is less than
+`4 MiB + max_batch_bytes`. The in-flight round holds the original payloads and
+an encoded copy, plus record/command bookkeeping. Caller-owned futures waiting
+for admission and spare Vec capacity are outside these encoded-byte bounds.
+Cancelling a request before admission prevents its write; after admission,
+cancellation or an error does not imply the record is absent after recovery.
+
 Active files are sparsely grown ahead of writes in 64 MiB allocation windows by
 default. This avoids making every durable append persist a new file length.
 Tune the window with
@@ -119,6 +143,11 @@ while let Some(entry) = stream.next().await {
 
 Checkpoint the mark durably (wherever your consumer state lives), and a restart resumes with `create_stream_from(hwm.file_id, hwm.file_offset)` instead of replaying from the beginning. Trim only *after* the checkpoint is durable — the trim is what makes the pre-mark log unrecoverable. Streams created before a trim are undisturbed (they hold their own open file handles); new reads into trimmed files return `LogfileNotFound`.
 
+Resume is inclusive: skip the checkpointed record if it was already applied.
+Trim evicts idle cached readers immediately. `TrimStats::bytes_reclaimed` counts
+the lengths of unlinked files; their storage remains occupied while an existing
+stream holds them open. Streams release exhausted files as replay advances.
+
 ### Explicit compaction
 
 `cargo run --example compaction` ([examples/compaction.rs](examples/compaction.rs))
@@ -135,7 +164,7 @@ The rewrite goes through the normal durable write path, so a crash at any point 
 
 ### Single writer, page-cache readers
 
-One dedicated writer thread owns the active file and the directory lifecycle: writes, rotation, and retention all happen there, so nothing ever contends on the write path. Any number of tasks submit through cloned `WriteHandle`s and await their acks without blocking the async executor. Writes queued while an fsync is in flight are **group-committed**: the writer drains them into a single pwrite + fdatasync and fans replies back out, so concurrent producers coalesce automatically (see `handle_concurrent_8w` in the benchmarks). Each ack names the file the records landed in, so handles stay valid across rotations.
+One dedicated writer thread owns the active file and the directory lifecycle: writes, rotation, and retention all happen there. It publishes durable end offsets to the reader cache under a short shared lock after sync succeeds and before replying. Any number of tasks submit through cloned `WriteHandle`s and await their acks without blocking the async executor. Writes queued while an fsync is in flight are **group-committed**: the writer drains them into a single record write + fdatasync and fans replies back out, so concurrent producers coalesce automatically (see `handle_concurrent_8w` in the benchmarks). Each ack names the file the records landed in, so handles stay valid across rotations.
 
 Readers use positional reads (`pread`) straight from the page cache — for WAL access patterns readers mostly want recently written data, which the page cache serves far better than direct-IO schemes like io_uring + O_DIRECT. Point reads speculatively fetch one small block so most records cost a single syscall; streams parse records out of 128 KiB readahead chunks.
 
@@ -155,7 +184,9 @@ filesystem blocks. Under the torn-write model, a damaged newest-slot write
 cannot damage the older slot's block; this does not claim recovery from
 arbitrary corruption spanning multiple blocks. A commit writes its record bytes
 and the alternate checksummed slot, then covers both with the same single
-`fdatasync` before acknowledging writers. Readers use this logical end instead
+`fdatasync` before acknowledging writers. Live manager readers use the end
+published after successful sync; recovery reads the slots from disk. Both use
+the logical end instead
 of the active file's sparse physical length, so unused zero-filled space cannot
 be replayed as empty records. Inverting the stored length also makes an
 unwritten all-zero record header invalid while preserving support for real
@@ -169,6 +200,9 @@ rather than upgraded in place.
 
 The log directory is a sequence of `0000000000.log`, `0000000001.log`, … files. The highest id is the active file; rotation creates the next file first, then seals the previous one (the footer carries the seal timestamp used by ttl retention), so a crash mid-rotation always lands in a state recovery heals. Directory entries are fsync'd on file creation.
 
+Startup syncs ancestor directories and repeats the WAL-directory barrier even
+when its header already exists, covering retries after interrupted creation.
+
 ### Recovery
 
 On `start()`:
@@ -177,10 +211,18 @@ On `start()`:
 - The active file scans only through the newest valid committed-end slot, never through its sparse allocation tail. A torn newest commit is shortened to its valid record prefix, but never below the end protected by the older valid slot.
 - If the active file turns out to be sealed (crash between seal and next-file creation), a fresh file is started rather than appending to it.
 - Non-log files in the directory are skipped.
+- Underlying read errors abort recovery without repairing slots or truncating
+  that file. Buffered recovery verifies payload slices without allocating a
+  separate payload per record.
 
 ## Benchmarks
 
 `cargo run --release --example bench` (writes to the current directory — don't run it on tmpfs, where fsync is free and write numbers become fiction).
+
+The harness also times active-file recovery. Current before/after measurements,
+including storage details and raw results, are in [PERFORMANCE.md](PERFORMANCE.md).
+The desktop measurements below are historical and predate bounded admission;
+the new 64-command drain limit bounds group size at high concurrency.
 
 Snapshot from a desktop NVMe/ext4 box, 64-byte payloads:
 
@@ -213,4 +255,9 @@ Put the started `WriteAhead` in an `Arc` and share it — it's `Sync`. Clone a `
 
 `WriteAheadStream` is `Send` and owns its file handles, so you can create a stream and hand it to a response body directly (see `test_write_ahead_stream_is_send`). Use a bounded channel if you bridge it manually so you don't bloat memory.
 
-Note: streams snapshot the set of log files at creation time and replay records acknowledged before that point; readers tailing the unsealed active file are best-effort and may surface transient errors if they race an in-flight write.
+Streams capture both file membership and successfully synced end offsets at
+creation. Later appends do not extend a stream, and an in-flight sync cannot
+expose tentative records through the manager's read/stream APIs. These APIs
+perform synchronous page-cache reads; implementing `Stream` does not offload
+cold disk I/O from an async executor. Direct low-level `Logfile::open` access
+reads on-disk metadata and does not share the manager's publication boundary.

@@ -19,6 +19,7 @@ async fn size_retention_deletes_oldest_sealed_files() {
             max_total_size,
             ..Default::default()
         },
+        ..Default::default()
     });
     wal.start().unwrap();
 
