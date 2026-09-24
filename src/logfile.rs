@@ -44,7 +44,7 @@ use crate::record::RecordID;
 /// the newest slot write cannot damage the older slot's block. Record bytes
 /// and the new slot are covered by the same fdatasync, allowing the active
 /// file's physical length to be grown ahead of the logical record end without
-/// exposing the unused sparse tail to readers or recovery.
+/// exposing the unused tail to readers or recovery.
 ///
 /// # Corruption protection
 ///
@@ -358,7 +358,7 @@ fn repair_committed_end<F: FileIo>(
 /// Appends a seal footer at `records_end` and syncs. The caller must ensure
 /// the file's record region actually ends there.
 pub(crate) fn append_footer<F: FileIo>(fio: &mut F, records_end: u64, ts_ms: u64) -> Result<()> {
-    // Active v3 files may have a sparse allocation window beyond records_end.
+    // Active v3 files may have an allocation window beyond records_end.
     // Remove it before placing the footer so sealed file length stays exact.
     fio.set_len(records_end)
         .context("Failed to truncate allocation tail before sealing")?;
@@ -476,7 +476,7 @@ pub fn recover_unsealed<F: FileIo>(path: &Path) -> Result<u64> {
         return Err(anyhow!(LogfileError::Corrupted));
     }
 
-    // Never scan the sparse allocation tail: the checksummed newest slot is
+    // Never scan the allocation tail: the checksummed newest slot is
     // the upper bound. If a crash persisted the slot but only a prefix of its
     // record bytes, retain that longest valid prefix.
     let scan_limit = commit.records_end.min(len);
@@ -561,7 +561,7 @@ impl<F: FileIo> Logfile<F> {
         let footer_end = committed_end
             .checked_add(FOOTER_SIZE)
             .ok_or(LogfileError::PartialWrite)?;
-        // Rotation first shrinks a sparse active file to committed_end, then
+        // Rotation first shrinks the active file to committed_end, then
         // writes the footer. Retry once if that shrink lands between our
         // length observation and positional read; healthy rotation must not
         // leak the transient EOF to readers.
@@ -925,12 +925,13 @@ mod tests {
     }
 
     #[test]
-    fn test_refresh_seal_retries_sparse_shrink_race() {
+    fn test_refresh_seal_retries_tail_shrink_race() {
         let (_dir, path) = temp_log("0000000019.log");
         let mut fio = SimpleFile::open(&path).unwrap();
         write_header(&mut fio).unwrap();
-        // Make the active sparse length look exactly like a footer-bearing
-        // file, then truncate at the instant the footer probe starts.
+        // Give the active file an allocation tail whose length looks exactly
+        // like a footer-bearing file, then truncate it at the instant the
+        // footer probe starts.
         fio.set_len(FILE_HEADER_SIZE + FOOTER_SIZE).unwrap();
         fio.sync().unwrap();
         drop(fio);

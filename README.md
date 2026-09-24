@@ -96,15 +96,18 @@ for admission and spare Vec capacity are outside these encoded-byte bounds.
 Cancelling a request before admission prevents its write; after admission,
 cancellation or an error does not imply the record is absent after recovery.
 
-Active files are sparsely grown ahead of writes in 64 MiB allocation windows by
-default. This avoids making every durable append persist a new file length.
-Tune the window with
-`WriteAheadOptions::preallocation_chunk_size: Option<u64>`; set it to `None`
-to disable preallocation. Windows are clamped to `max_file_size`, and sealed
-files are truncated to their actual record end before their footer is written,
-so the sparse tail is only present on the active file. The physical file length
-shown by tools such as `ls` includes that sparse tail; allocated disk blocks
-remain small until records fill it.
+Active files are zero-filled ahead of writes in 256 KiB allocation windows by
+default, so commits overwrite blocks that are already allocated and written. On
+ext4 and XFS, an fdatasync that allocates blocks must also commit the filesystem
+journal; overwriting written blocks skips that commit, which roughly halves
+commit latency (see [PERFORMANCE.md](PERFORMANCE.md#allocation-windows)). The
+commit that crosses into a new window also writes its zeros, so larger windows
+mean rarer but longer stalls. Tune the window with
+`WriteAheadOptions::preallocation_chunk_size: Option<u64>`. Set it to `None` on
+copy-on-write filesystems (btrfs, ZFS, bcachefs, APFS): they allocate new
+blocks on every write, so the zeros only add write traffic. Windows are clamped
+to `max_file_size`, and sealed files are truncated to their record end before
+their footer is written, so only the active file carries an allocation tail.
 
 `max_file_size` is a soft limit on the logical record region. The writer
 rotates before a queued commit group would cross it, keeping every group and
@@ -187,7 +190,7 @@ and the alternate checksummed slot, then covers both with the same single
 `fdatasync` before acknowledging writers. Live manager readers use the end
 published after successful sync; recovery reads the slots from disk. Both use
 the logical end instead
-of the active file's sparse physical length, so unused zero-filled space cannot
+of the active file's physical length, so the zero-filled allocation tail cannot
 be replayed as empty records. Inverting the stored length also makes an
 unwritten all-zero record header invalid while preserving support for real
 empty payloads. Data is stored raw — no escaping. A file is sealed iff its
@@ -208,7 +211,7 @@ when its header already exists, covering retries after interrupted creation.
 On `start()`:
 
 - Non-active files that aren't sealed (crash mid-rotation, torn footer) are healed: valid record prefix kept, garbage truncated, footer written.
-- The active file scans only through the newest valid committed-end slot, never through its sparse allocation tail. A torn newest commit is shortened to its valid record prefix, but never below the end protected by the older valid slot.
+- The active file scans only through the newest valid committed-end slot, never through its allocation tail. A torn newest commit is shortened to its valid record prefix, but never below the end protected by the older valid slot.
 - If the active file turns out to be sealed (crash between seal and next-file creation), a fresh file is started rather than appending to it.
 - Non-log files in the directory are skipped.
 - Underlying read errors abort recovery without repairing slots or truncating

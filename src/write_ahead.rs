@@ -49,10 +49,18 @@ pub struct WriteAheadOptions {
     /// includes the format header; values below FILE_HEADER_SIZE therefore
     /// treat every non-empty group as oversized without truncating the header.
     pub max_file_size: u64,
-    /// Sparse allocation-window size for active files. Ahead-of-time growth
-    /// avoids persisting an EOF change on every fdatasync while committed-end
-    /// metadata keeps the unused tail invisible to readers and recovery.
-    /// None disables preallocation; Some(0) is also treated as disabled.
+    /// Allocation-window size for active files. The writer zero-fills this
+    /// much space ahead of the record end, so commits overwrite blocks that
+    /// are already allocated and written. On ext4 and XFS, fdatasync then
+    /// skips the journal commit that allocating blocks would require. The
+    /// commit that crosses into a new window also carries its zeros, so larger
+    /// windows mean rarer but longer stalls. Committed-end metadata keeps the
+    /// unused tail invisible to readers and recovery.
+    ///
+    /// Copy-on-write filesystems (btrfs, ZFS, bcachefs, APFS) allocate new
+    /// blocks on every write, so the zeros only add write traffic there; set
+    /// None on them. None disables preallocation; Some(0) is also treated as
+    /// disabled.
     pub preallocation_chunk_size: Option<u64>,
     /// Maximum queued commands, excluding the writer's current drain round.
     /// A full queue suspends async submission; must be greater than zero.
@@ -67,8 +75,8 @@ impl Default for WriteAheadOptions {
     fn default() -> Self {
         Self {
             log_dir: PathBuf::from("./write_ahead"),
-            max_file_size: 1024 * 1024 * 1024,                // 1GB
-            preallocation_chunk_size: Some(64 * 1024 * 1024), // 64MiB
+            max_file_size: 1024 * 1024 * 1024,          // 1GB
+            preallocation_chunk_size: Some(256 * 1024), // 256KiB
             queue_capacity: 64,
             max_batch_bytes: 4 * 1024 * 1024,
             retention: RetentionOptions::default(),

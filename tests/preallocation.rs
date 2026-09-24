@@ -1,4 +1,4 @@
-//! Allocation-window, early-rotation, and sparse-active-file behavior.
+//! Allocation-window, early-rotation, and active-file tail behavior.
 
 use futures::StreamExt;
 use std::path::Path;
@@ -6,12 +6,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use writeahead::logfile::{Logfile, FILE_HEADER_SIZE, FOOTER_SIZE, RECORD_HEADER_SIZE};
 use writeahead::{FileIo, SimpleFile, WriteAhead, WriteAheadOptions};
 
-static DATA_SYNCS: AtomicUsize = AtomicUsize::new(0);
+/// Per-test sync counters, indexed by `CountingFile`'s ID so tests running in
+/// parallel never see each other's syncs.
+static DATA_SYNCS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
 
+/// Counts data syncs and rejects growth through `set_len`: allocation windows
+/// must be written so commits overwrite allocated blocks. Writes that would
+/// end past `DISK` bytes fail as a full disk.
 #[derive(Debug)]
-struct CountingFile(SimpleFile);
+struct CountingFile<const ID: usize, const DISK: u64 = { u64::MAX }>(SimpleFile);
 
-impl FileIo for CountingFile {
+impl<const ID: usize, const DISK: u64> FileIo for CountingFile<ID, DISK> {
     fn open(path: &Path) -> anyhow::Result<Self> {
         Ok(Self(<SimpleFile as FileIo>::open(path)?))
     }
@@ -25,11 +30,14 @@ impl FileIo for CountingFile {
     }
 
     fn write_at(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+        if offset + data.len() as u64 > DISK {
+            return Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into());
+        }
         self.0.write_at(offset, data)
     }
 
     fn sync(&mut self) -> anyhow::Result<()> {
-        DATA_SYNCS.fetch_add(1, Ordering::SeqCst);
+        DATA_SYNCS[ID].fetch_add(1, Ordering::SeqCst);
         self.0.sync()
     }
 
@@ -38,6 +46,7 @@ impl FileIo for CountingFile {
     }
 
     fn set_len(&mut self, len: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(len <= self.0.len()?, "sparse growth to {len} bytes");
         self.0.set_len(len)
     }
 }
@@ -67,7 +76,7 @@ async fn default_configured_and_disabled_allocation_windows() {
         std::fs::metadata(default_dir.path().join("0000000000.log"))
             .unwrap()
             .len(),
-        64 * 1024 * 1024
+        256 * 1024
     );
 
     let configured_dir = tempfile::tempdir().unwrap();
@@ -133,16 +142,70 @@ async fn default_configured_and_disabled_allocation_windows() {
 
 #[tokio::test]
 async fn steady_state_commit_uses_one_data_sync() {
-    DATA_SYNCS.store(0, Ordering::SeqCst);
     let dir = tempfile::tempdir().unwrap();
     let mut wal =
-        WriteAhead::<CountingFile>::with_options(options(dir.path(), 65_536, Some(16_384)));
+        WriteAhead::<CountingFile<0>>::with_options(options(dir.path(), 65_536, Some(16_384)));
     wal.start().unwrap();
-    let before = DATA_SYNCS.load(Ordering::SeqCst);
+    let before = DATA_SYNCS[0].load(Ordering::SeqCst);
 
     wal.write_batch(vec![b"one sync".to_vec()]).await.unwrap();
 
-    assert_eq!(DATA_SYNCS.load(Ordering::SeqCst) - before, 1);
+    assert_eq!(DATA_SYNCS[0].load(Ordering::SeqCst) - before, 1);
+}
+
+#[tokio::test]
+async fn windows_are_zero_filled_across_growth_and_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let max_file_size = 40_000;
+    let mut wal = WriteAhead::<CountingFile<1>>::with_options(options(
+        dir.path(),
+        max_file_size,
+        Some(16_384),
+    ));
+    wal.start().unwrap();
+    let active_len = |id: u64| {
+        std::fs::metadata(dir.path().join(format!("{id:010}.log")))
+            .unwrap()
+            .len()
+    };
+    assert_eq!(active_len(0), 16_384);
+
+    // Cross into the second window, then into the clamped third.
+    let mut ids = Vec::new();
+    for fill in 1..=3u8 {
+        ids.extend(wal.write_batch(vec![vec![fill; 9_000]]).await.unwrap());
+    }
+    assert!(ids.iter().all(|id| id.file_id == 0));
+    assert_eq!(active_len(0), max_file_size);
+
+    // The rotated file gets its own windows: this record ends in its second.
+    let rotated = wal.write_batch(vec![vec![4; 9_000]]).await.unwrap()[0];
+    assert_eq!(rotated.file_id, 1);
+    assert_eq!(active_len(1), 32_768);
+
+    for (fill, id) in (1..=4u8).zip(ids.iter().chain([&rotated])) {
+        assert_eq!(
+            wal.read(id.file_id, id.file_offset).unwrap(),
+            vec![fill; 9_000]
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_disk_leaves_window_unfilled_without_failing_writes() {
+    // Room for the header and one small record, but not the window.
+    type NearlyFull = CountingFile<2, { FILE_HEADER_SIZE + 1_000 }>;
+    let dir = tempfile::tempdir().unwrap();
+    let opts = options(dir.path(), 65_536, Some(16_384));
+    let id = {
+        let mut wal = WriteAhead::<NearlyFull>::with_options(opts.clone());
+        wal.start().unwrap();
+        wal.write_batch(vec![b"fits".to_vec()]).await.unwrap()[0]
+    };
+
+    let mut wal = WriteAhead::<NearlyFull>::with_options(opts);
+    wal.start().unwrap();
+    assert_eq!(wal.read(id.file_id, id.file_offset).unwrap(), b"fits");
 }
 
 #[tokio::test]
@@ -171,7 +234,7 @@ async fn rotates_before_overflow_and_truncates_sealed_allocation_tail() {
 }
 
 #[tokio::test]
-async fn sparse_restart_preserves_empty_records_and_ignores_unused_tail() {
+async fn restart_preserves_empty_records_and_ignores_unused_tail() {
     let dir = tempfile::tempdir().unwrap();
     let opts = options(dir.path(), 65_536, Some(16_384));
     let ids = {
