@@ -150,6 +150,9 @@ type ReplyTx = flume::Sender<Result<WriteAck>>;
 const MAX_GROUP_COMMIT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_GROUP_COMMIT_COMMANDS: usize = 64;
 
+/// Source buffer for zero-filling allocation windows.
+static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
+
 pub(crate) fn validate_options(options: &WriteAheadOptions) -> Result<()> {
     if options.queue_capacity == 0
         || options.max_batch_bytes == 0
@@ -202,8 +205,9 @@ pub(crate) struct WalWriter<F: FileIo> {
     fio: F,
     file_id: u64,
     /// Logical end of committed records. Physical file length may be ahead
-    /// because the active file is sparsely grown in allocation windows.
+    /// because the active file is zero-filled in allocation windows.
     records_end: u64,
+    /// End of the zero-filled allocation window.
     allocated_end: u64,
     commit_state: CommitState,
     /// Every live log file (including the active one), for retention.
@@ -244,7 +248,9 @@ impl<F: FileIo + 'static> WalWriter<F> {
         // Also required on retry when a previous header sync succeeded but
         // its directory sync failed. Visibility alone is not durability.
         sync_dir(&options.log_dir)?;
-        let allocated_end = len.max(records_end);
+        // Only bytes this writer filled count as allocated. Recovery has
+        // already trimmed the active file to its committed end.
+        let allocated_end = records_end;
         files.insert(
             active_id,
             FileMeta {
@@ -266,10 +272,10 @@ impl<F: FileIo + 'static> WalWriter<F> {
             readers: Weak::new(),
             _directory_lock: directory_lock,
         };
-        // Grow the active file after its header is durable. The allocation
-        // itself is covered by the next record sync and is never used as a
-        // logical record boundary.
-        writer.ensure_preallocated(records_end)?;
+        // Fill the active file's first window after its header is durable.
+        // The next record sync persists the fill, and its end is never used
+        // as a logical record boundary.
+        writer.ensure_preallocated(records_end);
         // Synchronous so `start()` returns with retention already applied
         writer.apply_retention();
 
@@ -379,7 +385,7 @@ impl<F: FileIo + 'static> WalWriter<F> {
         }
 
         let result = (|| -> Result<CommitState> {
-            self.ensure_preallocated(current_offset)?;
+            self.ensure_preallocated(current_offset);
             self.fio
                 .write_at(self.records_end, &buf)
                 .context("Failed to write records")?;
@@ -486,23 +492,29 @@ impl<F: FileIo + 'static> WalWriter<F> {
         self.records_end = FILE_HEADER_SIZE;
         self.allocated_end = FILE_HEADER_SIZE;
         self.commit_state = commit_state;
-        self.ensure_preallocated(FILE_HEADER_SIZE)?;
+        self.ensure_preallocated(FILE_HEADER_SIZE);
 
         self.apply_retention();
         Ok(())
     }
 
-    /// Grows the active file to the allocation window covering required_end.
+    /// Zero-fills the active file through the allocation window covering
+    /// required_end, so commits overwrite blocks that are already allocated
+    /// and written. The fill starts at required_end because the caller's
+    /// records cover the space before it; the next commit's fdatasync
+    /// persists both. The fill is best-effort: on failure (such as ENOSPC) it
+    /// logs and leaves the rest of the window unfilled, so commits and
+    /// retention proceed and the next window retries.
     /// None (and defensively Some(0)) leaves normal EOF-extending writes in
     /// place. Windows never extend beyond max_file_size unless a single
     /// oversized group is already past that soft cap.
-    fn ensure_preallocated(&mut self, required_end: u64) -> Result<()> {
+    fn ensure_preallocated(&mut self, required_end: u64) {
         let Some(chunk) = self
             .options
             .preallocation_chunk_size
             .filter(|size| *size > 0)
         else {
-            return Ok(());
+            return;
         };
         let rounded = required_end
             .checked_add(chunk - 1)
@@ -516,13 +528,21 @@ impl<F: FileIo + 'static> WalWriter<F> {
             required_end
         };
         if target <= self.allocated_end {
-            return Ok(());
+            return;
         }
-        self.fio
-            .set_len(target)
-            .with_context(|| format!("Failed to preallocate active logfile to {target} bytes"))?;
+        let mut offset = self.allocated_end.max(required_end);
+        while offset < target {
+            let len = (target - offset).min(ZEROS.len() as u64);
+            if let Err(e) = self.fio.write_at(offset, &ZEROS[..len as usize]) {
+                warn!(
+                    "failed to zero-fill log file {} to {target} bytes; leaving the window unfilled: {e:#}",
+                    self.file_id
+                );
+                break;
+            }
+            offset += len;
+        }
         self.allocated_end = target;
-        Ok(())
     }
 
     /// Deletes sealed files per `RetentionOptions`. The active file is never

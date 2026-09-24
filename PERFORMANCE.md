@@ -3,7 +3,8 @@
 The focused fixes improve cached point reads, replay, and recovery while retaining
 one data sync per steady-state commit group. Durable-write throughput is essentially
 unchanged in this workload. The v3 format, record hashes, and sync-before-success
-guarantee remain intact.
+guarantee remain intact. Durable writes of larger records gain from zero-filled
+allocation windows; see [Allocation windows](#allocation-windows).
 
 ## Measurements
 
@@ -34,7 +35,7 @@ of 1,000 records, ten point-read passes over those 100,000 records, twenty repla
 passes, one full restart of that active file, and eight threads each issuing 250
 single-record writes. Recovery includes opening/recovering/restarting the manager,
 including its new directory barriers; it excludes dropping the old manager.
-Defaults enable sparse preallocation in both builds.
+Both builds used 64 MiB sparse preallocation, the default at the time.
 
 Read and recovery data are warm in the page cache. Repeated read/replay passes
 reduce the scheduling and CPU-frequency noise of the original few-millisecond
@@ -55,6 +56,43 @@ The baseline operation counts were recorded during the review; the allocation
 description is from the baseline decoder. Current counts were rerun after the
 simplification pass. Recovery shares the stream buffer and verifies borrowed
 payload slices; public reads/streams still return owned record data.
+
+## Allocation windows
+
+Measured 2026-09-24 on the same machine and filesystem (Linux 7.0, ext4 with
+`data=ordered`). A script repeated the writer's commit: an 8 KiB record write at
+the record end, a committed-end slot write, then `fdatasync`. Journal commits
+come from `/proc/fs/jbd2/<device>/info`. 1,500 commits per row:
+
+| Space past the record end | Commits/s | p50 | p99 | Journal commits per commit |
+| --- | ---: | ---: | ---: | ---: |
+| None (each write extends the file) | 234 | 4.19 ms | 6.06 ms | 1.00 |
+| Sparse (`set_len`) | 234 | 4.17 ms | 5.92 ms | 1.00 |
+| `fallocate` | 236 | 4.15 ms | 5.99 ms | 1.00 |
+| Zero-filled in advance | 494 | 1.99 ms | 2.39 ms | 0.00 |
+
+A write into a hole allocates blocks, and a write into a `fallocate`d range
+converts unwritten extents; either way `fdatasync` must commit the journal to
+make the change durable. Only blocks that already hold data avoid the commit.
+
+The writer zero-fills inline: the commit that crosses into a new window writes
+its zeros first, and that commit's `fdatasync` persists both. 3,000 commits per
+row:
+
+| Window | Commits/s | p99 | p99.9 | Max | Journal commits per commit |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 64 KiB | 421 | 4.97 ms | 6.63 ms | 16.27 ms | 0.126 |
+| 256 KiB | 472 | 4.72 ms | 6.22 ms | 8.01 ms | 0.032 |
+| 1 MiB | 484 | 3.93 ms | 6.05 ms | 9.41 ms | 0.009 |
+| 4 MiB | 481 | 2.49 ms | 7.27 ms | 15.20 ms | 0.002 |
+
+Through the crate with default options, 3,000 sequential 8 KiB writes ran at
+441–446 writes/s (p50 2.14 ms, 0.03 journal commits per write), against 233
+writes/s (p50 4.28 ms, 1.00) with 64 MiB sparse windows.
+
+On an idle disk, 256 KiB and 1 MiB windows perform alike. A downstream consumer
+running several writers on one filesystem saw 1 MiB windows raise maximum
+latency to about 60 ms while 256 KiB windows held, which sets the default.
 
 ## Reproduce
 
